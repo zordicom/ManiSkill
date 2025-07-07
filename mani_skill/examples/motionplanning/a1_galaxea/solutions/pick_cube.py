@@ -1,0 +1,90 @@
+import numpy as np
+import sapien
+from mani_skill.envs.tasks import PickCubeEnv
+from mani_skill.examples.motionplanning.a1_galaxea.motionplanner import (
+    A1GalaxeaMotionPlanningSolver,
+)
+from mani_skill.examples.motionplanning.panda.utils import (
+    compute_grasp_info_by_obb,
+    get_actor_obb,
+)
+
+
+def solve(env: PickCubeEnv, seed=None, debug: bool = False, vis: bool = False):
+    """Solve *PickCube-v1* for an **A1 Galaxea** arm via classic motion planning.
+
+    The high-level strategy mirrors the official Panda/XArm6 examples:
+
+    1. Move to a *pre-grasp* pose 5 cm above the computed grasp.
+    2. Descend to the grasp pose and close the fingers.
+    3. Lift and carry the cube to the green goal site.
+
+    Args:
+        env: A ManiSkill ``PickCube-v1`` environment initialised with
+            ``robot_uids="a1_galaxea"``.
+        seed: Optional environment seed.
+        debug: Enable extra printouts and wait-for-key pauses.
+        vis: Render a GUI while planning/executing.
+
+    Returns:
+        The last tuple returned by :py:meth:`env.step`, making it consistent
+        with other official examples. If motion planning fails, *-1* is
+        returned.
+    """
+    env.reset(seed=seed)
+
+    if env.unwrapped.robot_uids != "a1_galaxea":
+        raise ValueError(
+            f"This solver only supports 'a1_galaxea', but got {env.unwrapped.robot_uids}."
+        )
+
+    planner = A1GalaxeaMotionPlanningSolver(
+        env,
+        debug=debug,
+        vis=vis,
+        base_pose=env.unwrapped.agent.robot.pose,
+        visualize_target_grasp_pose=vis,
+        print_env_info=False,
+    )
+
+    FINGER_LENGTH = 0.025  # 2.5 cm effective finger depth
+    env_unwrapped = env.unwrapped
+
+    # ------------------------------------------------------------------
+    # 1) Compute grasp pose
+    # ------------------------------------------------------------------
+    obb = get_actor_obb(env_unwrapped.cube)
+    approaching = np.array([0, 0, -1])  # approach from +Z world direction
+    target_closing = (
+        env.agent.tcp.pose.to_transformation_matrix()[0, :3, 1].cpu().numpy()
+    )
+
+    grasp_info = compute_grasp_info_by_obb(
+        obb,
+        approaching=approaching,
+        target_closing=target_closing,
+        depth=FINGER_LENGTH,
+    )
+    closing, _ = grasp_info["closing"], grasp_info["center"]
+    grasp_pose = env.agent.build_grasp_pose(approaching, closing, env.cube.pose.sp.p)
+
+    # ------------------------------------------------------------------
+    # 2) Reach pre-grasp (5 cm above)
+    # ------------------------------------------------------------------
+    reach_pose = grasp_pose * sapien.Pose([0, 0, -0.05])
+    planner.move_to_pose_with_screw(reach_pose)
+
+    # ------------------------------------------------------------------
+    # 3) Descend and grasp
+    # ------------------------------------------------------------------
+    planner.move_to_pose_with_screw(grasp_pose)
+    planner.close_gripper()
+
+    # ------------------------------------------------------------------
+    # 4) Transport to goal
+    # ------------------------------------------------------------------
+    goal_pose = sapien.Pose(env.goal_site.pose.sp.p, grasp_pose.q)
+    res = planner.move_to_pose_with_screw(goal_pose)
+
+    planner.close()
+    return res
