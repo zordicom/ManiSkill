@@ -40,7 +40,7 @@ from mani_skill.utils.structs.pose import Pose
 __all__ = ["PickBoxEnv"]
 
 
-@register_env("PickBox-v1", max_episode_steps=50)
+@register_env("PickBox-v1", max_episode_steps=100)
 class PickBoxEnv(BaseEnv):
     """Single-arm pick-and-place task using b5box and basket assets."""
 
@@ -57,7 +57,7 @@ class PickBoxEnv(BaseEnv):
     # original half-size was 5 cm; after an 80 % scale-down the new half-size
     # becomes 4 cm.
     b5box_half_size = (
-        0.012  # 4 cm half-extent after scaling (will be overridden by config)
+        0.02  # 4 cm half-extent after scaling (will be overridden by config)
     )
     goal_thresh = 0.015  # success threshold (metres) (will be overridden by config)
 
@@ -66,6 +66,37 @@ class PickBoxEnv(BaseEnv):
     base_dynamic_friction = 1.0
     base_density = 1000.0  # kg/m³
     base_linear_damping = 0.1  # Base linear damping coefficient
+
+    # Visual variation parameters
+    box_color_ranges = {
+        "red": (0.6, 1.0),  # Red channel range (higher values)
+        "green": (0.0, 0.5),  # Green channel range (lower max)
+        "blue": (0.0, 0.5),  # Blue channel range (lower max)
+        "alpha": (1.0, 1.0),  # Alpha channel (keep opaque)
+    }
+
+    table_color_ranges = {
+        "red": (0.4, 0.9),  # Brownish to light wood tones
+        "green": (0.3, 0.7),
+        "blue": (0.2, 0.6),
+        "alpha": (1.0, 1.0),  # Alpha channel (keep opaque)
+    }
+
+    # Lighting variation parameters
+    ambient_light_ranges = {
+        "min_intensity": (0.2, 0.5),  # Ambient light intensity range
+        "max_intensity": (0.8, 1.2),  # Maximum ambient light
+    }
+
+    directional_light_ranges = {
+        "intensity": (2.0, 4.0),  # Directional light intensity
+        "direction_x": (-0.5, 0.5),  # X component of light direction
+        "direction_y": (0.3, 0.7),  # Y component of light direction
+        "direction_z": (-1.0, -0.5),  # Z component (always downward)
+    }
+
+    # Class variable to track total environments created across all instances
+    _total_environments_created = 0
 
     def __init__(
         self, *args, robot_uids="a1_galaxea", obs_mode="state", verbose=False, **kwargs
@@ -85,15 +116,13 @@ class PickBoxEnv(BaseEnv):
             # Fallback to default values
             cfg = PICK_BOX_CONFIGS["panda"]
             self.goal_thresh = cfg["goal_thresh"]
-            self.b5box_half_size = cfg["cube_half_size"]
-            self.cube_half_size = cfg["cube_half_size"]
 
         # Initialize box_half_sizes early to avoid observation space generation errors
         # This will be updated later in _load_b5box based on the actual box configuration
         self.box_half_sizes = [
-            self.cube_half_size,
-            self.cube_half_size,
-            self.cube_half_size,
+            self.b5box_half_size,
+            self.b5box_half_size,
+            self.b5box_half_size,
         ]
 
         # Assets directory (same as bimanual task)
@@ -111,12 +140,41 @@ class PickBoxEnv(BaseEnv):
 
         if self.verbose:
             print("  ✓ PickBox Environment initialization complete!")
+            print("  Success criteria: object placed + released + stable")
+            print("    - Object within goal threshold of basket center")
+            print("    - Object released (not grasped)")
+            print("    - Object stable (low velocity)")
+            print("  Visual variations enabled:")
+            print("    - Box color randomization (red-dominant)")
+            print("    - Table color randomization (wood-like tones)")
+            print("    - Lighting condition variations (ambient + directional)")
             # Show observation space info
             expected_features = self._get_expected_features()
             total_features = sum(expected_features.values())
             print(f"  Expected observation features: {total_features} total")
             for name, count in expected_features.items():
                 print(f"    {name}: {count} features")
+
+        # Print box dimension summary after initialization
+        if hasattr(self, "_env_creation_count") and self._env_creation_count > 0:
+            print("\n=== Box Dimension Summary ===")
+            print(
+                f"Total environments created so far: {PickBoxEnv._total_environments_created}"
+            )
+            print("Box dimensions should vary by ±30% per environment")
+            print(f"Base box half-size: {self.b5box_half_size}")
+            print(
+                f"Expected range: [{self.b5box_half_size * 0.7:.4f}, {self.b5box_half_size * 1.3:.4f}]"
+            )
+            print(f"Current environment box half-sizes: {self.box_half_sizes}")
+
+            # Print milestone messages
+            if PickBoxEnv._total_environments_created in [100, 500, 1000, 2500, 5000]:
+                print(
+                    f"*** MILESTONE: {PickBoxEnv._total_environments_created} environments created with randomized box dimensions! ***"
+                )
+
+            print("============================\n")
 
     # ---------------------------------------------------------------------
     # Camera configuration (static top & human render) --------------------
@@ -169,6 +227,9 @@ class PickBoxEnv(BaseEnv):
         self.basket = self._load_basket()
         self.goal_site = self._create_goal_site()
 
+        # Apply lighting variation
+        self._setup_lighting_variation()
+
     # ------------------------------------------------------------------
     # Asset builders ----------------------------------------------------
     # ------------------------------------------------------------------
@@ -185,12 +246,26 @@ class PickBoxEnv(BaseEnv):
             restitution=0.0,
         )
 
+        # Generate random table color
+        table_color = [
+            np.random.uniform(*self.table_color_ranges["red"]),
+            np.random.uniform(*self.table_color_ranges["green"]),
+            np.random.uniform(*self.table_color_ranges["blue"]),
+            np.random.uniform(*self.table_color_ranges["alpha"]),
+        ]
+
         builder.add_box_collision(
             half_size=cfg["size"],
             material=table_fric_mat,
         )
-        builder.add_box_visual(half_size=cfg["size"])
+        builder.add_box_visual(half_size=cfg["size"], material=table_color)
         builder.set_initial_pose(cfg["pose"].sp)
+
+        if self.verbose:
+            print(
+                f"    Table color: RGBA({table_color[0]:.3f}, {table_color[1]:.3f}, {table_color[2]:.3f}, {table_color[3]:.3f})"
+            )
+
         return builder.build_static(name="table")
 
     def _load_b5box(self):
@@ -199,27 +274,17 @@ class PickBoxEnv(BaseEnv):
         For simplicity we keep the original variable name (b5box) so that the
         rest of the task logic remains unchanged.
         """
-        # Option 1: Uniform cube (previous implementation)
-        # cube = actors.build_cube(
-        #     self.scene,
-        #     half_size=self.b5box_half_size,
-        #     color=[1, 0, 0, 1],
-        #     name="cube",
-        #     initial_pose=sapien.Pose(p=[0, 0, self.cube_half_size]),
-        # )
+        # Apply uniform sampling for 10% +/- variability on each dimension
+        x_multiplier = np.random.uniform(0.9, 1.5)
+        y_multiplier = np.random.uniform(0.9, 1.5)
+        z_multiplier = np.random.uniform(0.9, 1.5)
 
-        # Update box_half_sizes for uniform cube
-        # self.box_half_sizes = [
-        #     self.b5box_half_size,
-        #     self.b5box_half_size,
-        #     self.b5box_half_size,
-        # ]
-
-        # Option 2: Non-uniform box (longer in x-axis)
         self.box_half_sizes = [
-            3 * self.b5box_half_size,  # x-axis: 3x longer
-            self.b5box_half_size,  # y-axis: same as original
-            self.b5box_half_size,  # z-axis: same as original
+            3 * self.b5box_half_size * x_multiplier,  # x-axis: 3x longer with variation
+            self.b5box_half_size
+            * y_multiplier,  # y-axis: same as original with variation
+            self.b5box_half_size
+            * z_multiplier,  # z-axis: same as original with variation
         ]  # [width, depth, height] half-sizes - longer in x
 
         # Create box with base physical material (friction will be randomized per episode)
@@ -238,16 +303,48 @@ class PickBoxEnv(BaseEnv):
             restitution=0.1,
         )
 
+        # Always print dimension info for first few environments to verify randomization
+        PickBoxEnv._total_environments_created += 1
+        self._env_creation_count = PickBoxEnv._total_environments_created
+
+        if self._env_creation_count <= 10:
+            print(f"Environment {self._env_creation_count} box dimensions:")
+            print(
+                f"  Multipliers - X: {x_multiplier:.3f}, Y: {y_multiplier:.3f}, Z: {z_multiplier:.3f}"
+            )
+            print(
+                f"  Final half-sizes: [{self.box_half_sizes[0]:.4f}, {self.box_half_sizes[1]:.4f}, {self.box_half_sizes[2]:.4f}]"
+            )
+
         if self.verbose:
             print(
                 f"    Scene-level friction multiplier: {scene_friction_multiplier:.3f}"
             )
             print(f"    Scene static friction: {randomized_static_friction:.3f}")
             print(f"    Scene dynamic friction: {randomized_dynamic_friction:.3f}")
+            if self._env_creation_count > 10:  # Avoid duplicate output
+                print("    Dimensional variation multipliers:")
+                print(f"      X-axis (length): {x_multiplier:.3f}")
+                print(f"      Y-axis (width): {y_multiplier:.3f}")
+                print(f"      Z-axis (height): {z_multiplier:.3f}")
+                print(f"    Final box half-sizes: {self.box_half_sizes}")
 
         # Apply mass/density randomization at creation time (±50% variation)
         mass_multiplier = 0.5 + np.random.random()  # [0.5, 1.5]
         randomized_density = self.base_density * mass_multiplier
+
+        # Generate random box color
+        box_color = [
+            np.random.uniform(*self.box_color_ranges["red"]),
+            np.random.uniform(*self.box_color_ranges["green"]),
+            np.random.uniform(*self.box_color_ranges["blue"]),
+            np.random.uniform(*self.box_color_ranges["alpha"]),
+        ]
+
+        if self.verbose:
+            print(
+                f"    Box color: RGBA({box_color[0]:.3f}, {box_color[1]:.3f}, {box_color[2]:.3f}, {box_color[3]:.3f})"
+            )
 
         builder = self.scene.create_actor_builder()
         builder.add_box_collision(
@@ -257,7 +354,7 @@ class PickBoxEnv(BaseEnv):
         )
         builder.add_box_visual(
             half_size=self.box_half_sizes,
-            material=[1, 0, 0, 1],  # Red color
+            material=box_color,  # Use random color instead of hardcoded red
         )
         builder.set_initial_pose(sapien.Pose(p=[0, 0, self.box_half_sizes[2]]))
         cube = builder.build(name="cube")
@@ -387,6 +484,13 @@ class PickBoxEnv(BaseEnv):
                 print(f"    Box position (first env): {box_xyz[0]}")
                 print(f"    Basket position (first env): {basket_xyz[0]}")
                 print(f"    Goal position (first env): {goal_xyz[0]}")
+                print(f"    Box half-sizes for this env: {self.box_half_sizes}")
+                print(
+                    f"    Box z-placement: {box_xyz[0][2]:.4f} (should be table + box height)"
+                )
+                print(
+                    f"    Expected box z-placement: {(table_surface_z + self.b5box_half_size).item():.4f}"
+                )
 
     # ------------------------------------------------------------------
     # Observation extras -----------------------------------------------
@@ -437,6 +541,7 @@ class PickBoxEnv(BaseEnv):
             box_x_axis_in_world=self._get_box_axes_in_world(),
             gripper_x_axis=gripper_x_axis,
             angle_between_axes=angle_between_axes,
+            is_obj_stable=info["is_obj_stable"],
         )
         return obs
 
@@ -470,11 +575,25 @@ class PickBoxEnv(BaseEnv):
         )
         is_grasped = self.agent.is_grasping(self.b5box)
         is_robot_static = self.agent.is_static(0.2)
+
+        # Check if object is stable (not moving much)
+        obj_velocity = self.b5box.linear_velocity
+        obj_angular_velocity = self.b5box.angular_velocity
+        obj_linear_speed = torch.linalg.norm(obj_velocity, axis=1)
+        obj_angular_speed = torch.linalg.norm(obj_angular_velocity, axis=1)
+
+        # Object is stable if both linear and angular velocities are low
+        is_obj_stable = (obj_linear_speed <= 0.1) & (
+            obj_angular_speed <= 0.5
+        )  # 0.1 m/s, 0.5 rad/s
+
+        # Success: object is placed, released, and stable
         return {
-            "success": is_obj_placed & is_robot_static,
+            "success": is_obj_placed & ~is_grasped & is_obj_stable,
             "is_obj_placed": is_obj_placed,
-            "is_robot_static": is_robot_static,
+            "is_robot_static": is_robot_static,  # Keep for debugging/analysis
             "is_grasped": is_grasped,
+            "is_obj_stable": is_obj_stable,
         }
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
@@ -514,13 +633,24 @@ class PickBoxEnv(BaseEnv):
         # Check if box is lifted above 3cm threshold
         is_lifted_above_threshold = box_height_above_table >= 0.03  # 3cm threshold
 
-        # Transport / place reward ONLY when grasped AND lifted above 3cm
+        # Transport / place reward
         obj_to_goal_dist = torch.linalg.norm(
             self.goal_site.pose.p - self.b5box.pose.p, axis=1
         )
         place_reward = 1 - torch.tanh(5 * obj_to_goal_dist)
-        # Goal-related reward only kicks in after lifting above 3cm
-        reward += place_reward * is_grasped.float() * is_lifted_above_threshold.float()
+
+        # During transport phase: reward only when grasped AND lifted above 3cm
+        transport_reward = (
+            place_reward * is_grasped.float() * is_lifted_above_threshold.float()
+        )
+        reward += transport_reward
+
+        # After release phase: continue rewarding good placement even when not grasped
+        # This ensures the robot doesn't lose reward for releasing the object in the right place
+        post_release_reward = (
+            place_reward * (~is_grasped).float() * is_lifted_above_threshold.float()
+        )
+        reward += post_release_reward * 0.5  # Lower weight than transport reward
 
         # X-axis alignment reward: reward alignment of box and gripper x-axes
         # Calculate gripper x-axis in world frame
@@ -558,8 +688,9 @@ class PickBoxEnv(BaseEnv):
             # For A1 Galaxea, gripper joints are the last 2 joints
             gripper_qpos = robot_qpos[..., -2:]  # [left_finger, right_finger]
             # Gripper openness is the sum of finger positions (more open = higher values)
-            gripper_openness = torch.sum(gripper_qpos, dim=-1)
-            max_gripper_openness = -0.03  # A1 gripper max opening
+            # Note: A1 gripper has negative values, so we need to negate for proper openness calculation
+            gripper_openness = torch.sum(-1 * gripper_qpos, dim=-1)
+            max_gripper_openness = -0.01  # A1 gripper max opening
         else:
             # Fallback for other robots
             gripper_qpos = robot_qpos[..., -2:]
@@ -571,25 +702,68 @@ class PickBoxEnv(BaseEnv):
             gripper_openness / max_gripper_openness, 0.0, 1.0
         )
 
-        # Only reward open gripper when NOT grasping and when far from object
-        should_reward_open_gripper = ~is_grasped  # NOT grasping
+        # Gripper reward logic based on context
+        # Check if object is near goal and at good height (ready for release)
+        is_near_goal = obj_to_goal_dist < (self.goal_thresh * 2.0)  # 2x goal threshold
+        is_at_good_height = box_height_above_table >= 0.05  # 5cm above table
+        ready_for_release = is_near_goal & is_at_good_height
 
-        # Reward for keeping gripper open when appropriate
-        open_gripper_reward = normalized_gripper_openness * 0.01  # Weight of 0.5
+        # RELEASE REWARD: Encourage releasing when object is well-positioned
+        # This is the key addition - reward for opening gripper when near goal
+        release_reward = 2.0 * normalized_gripper_openness * ready_for_release.float()
+        reward += release_reward
+
+        # CONTINUED GRASP PENALTY: Penalize keeping gripper closed when ready for release
+        continued_grasp_penalty = (1.0 - normalized_gripper_openness) * 0.5
+        reward -= continued_grasp_penalty * ready_for_release.float()
+
+        # STANDARD GRIPPER REWARDS (when not ready for release)
+        not_ready_for_release = ~ready_for_release
+
+        # Reward open gripper when NOT grasping and NOT ready for release
+        should_reward_open_gripper = ~is_grasped & not_ready_for_release
+        open_gripper_reward = normalized_gripper_openness * 0.01
         reward += open_gripper_reward * should_reward_open_gripper.float()
 
-        # Small penalty for closing gripper when far from object and not grasping
-        premature_close_penalty = (
-            1.0 - normalized_gripper_openness
-        ) * 0.3  # Weight of 0.3
-        reward -= premature_close_penalty * should_reward_open_gripper.float()
+        # Penalty for closing gripper when far from object and not grasping
+        should_penalize_close_gripper = ~is_grasped & not_ready_for_release
+        premature_close_penalty = (1.0 - normalized_gripper_openness) * 0.3
+        reward -= premature_close_penalty * should_penalize_close_gripper.float()
 
-        # Static bonus when placed
-        qvel = self.agent.robot.get_qvel()
-        if self.robot_uids in ["panda", "panda_wristcam", "a1_galaxea"]:
-            qvel = qvel[..., :-2]  # strip gripper joints if present
-        static_reward = 1 - torch.tanh(5 * torch.linalg.norm(qvel, axis=1))
-        reward += static_reward * info["is_obj_placed"].float()
+        # Object stability bonus when placed and released
+        # Reward when object is stable (not moving much) in the goal location
+        stability_reward = 1 - torch.tanh(
+            5 * torch.linalg.norm(self.b5box.linear_velocity, axis=1)
+        )
+        reward += (
+            stability_reward * info["is_obj_placed"].float() * (~is_grasped).float()
+        )
+
+        # Debug output for release reward (if verbose)
+        if self.verbose and hasattr(self, "_release_debug_count"):
+            self._release_debug_count += 1
+            if self._release_debug_count % 100 == 1:  # Print every 100 steps
+                env_0_ready = ready_for_release[0].item()
+                env_0_near_goal = is_near_goal[0].item()
+                env_0_good_height = is_at_good_height[0].item()
+                env_0_gripper_open = normalized_gripper_openness[0].item()
+                env_0_release_reward = release_reward[0].item()
+                env_0_obj_vel = torch.linalg.norm(self.b5box.linear_velocity[0]).item()
+                env_0_stability_reward = stability_reward[0].item()
+                print(f"\nRelease Debug (step {self._release_debug_count}):")
+                print(f"  Ready for release: {env_0_ready}")
+                print(
+                    f"  Near goal: {env_0_near_goal} (dist: {obj_to_goal_dist[0].item():.3f})"
+                )
+                print(
+                    f"  Good height: {env_0_good_height} (height: {box_height_above_table[0].item():.3f})"
+                )
+                print(f"  Gripper openness: {env_0_gripper_open:.3f}")
+                print(f"  Release reward: {env_0_release_reward:.3f}")
+                print(f"  Object velocity: {env_0_obj_vel:.3f} m/s")
+                print(f"  Stability reward: {env_0_stability_reward:.3f}")
+        elif self.verbose:
+            self._release_debug_count = 1
 
         # Success bonus
         reward[info["success"]] = 5.0
@@ -598,7 +772,18 @@ class PickBoxEnv(BaseEnv):
     def compute_normalized_dense_reward(
         self, obs: Any, action: torch.Tensor, info: Dict
     ):
-        return self.compute_dense_reward(obs, action, info) / 8.8
+        # Updated max reward calculation with new release reward components:
+        # - reaching_reward: 1.0 (when approaching object)
+        # - is_grasped: 1.0 (grasp bonus)
+        # - lifting_reward: 2.0 (when grasped and lifted)
+        # - transport_reward: 1.0 (when grasped and lifted)
+        # - post_release_reward: 0.5 (when not grasped and lifted)
+        # - alignment_reward: 0.1 (when should_reward_tcp_proximity)
+        # - release_reward: 2.0 (when ready for release)
+        # - stability_reward: 1.0 (when object is stable and placed after release)
+        # - success_bonus: 5.0
+        # Total max positive reward: 1.0 + 1.0 + 2.0 + 1.0 + 0.5 + 0.1 + 2.0 + 1.0 + 5.0 = 13.6
+        return self.compute_dense_reward(obs, action, info) / 13.6
 
     def inspect_observation_space(self, verbose=True):
         """Inspect the observation space structure and validate all features are present.
@@ -775,6 +960,7 @@ class PickBoxEnv(BaseEnv):
             "box_x_axis_in_world": 3,
             "gripper_x_axis": 3,
             "angle_between_axes": 1,
+            "is_obj_stable": 1,
         }
 
     def print_observation_details(self, obs=None):
@@ -826,3 +1012,70 @@ class PickBoxEnv(BaseEnv):
                     print(f"  First 5 values: {value.flatten()[:5]}")
             else:
                 print(f"  Value: {value}")
+
+    def _setup_lighting_variation(self):
+        """Apply randomized ambient and directional lighting to the scene."""
+        # Generate random ambient light intensity
+        ambient_intensity = np.random.uniform(
+            *self.ambient_light_ranges["min_intensity"]
+        )
+        ambient_color = [ambient_intensity, ambient_intensity, ambient_intensity]
+
+        # Set ambient light
+        self.scene.set_ambient_light(ambient_color)
+
+        # Generate random directional light parameters
+        directional_intensity = np.random.uniform(
+            *self.directional_light_ranges["intensity"]
+        )
+        directional_color = [
+            directional_intensity,
+            directional_intensity,
+            directional_intensity,
+        ]
+
+        # Generate random direction (ensure it's always pointing somewhat downward)
+        direction = [
+            np.random.uniform(*self.directional_light_ranges["direction_x"]),
+            np.random.uniform(*self.directional_light_ranges["direction_y"]),
+            np.random.uniform(*self.directional_light_ranges["direction_z"]),
+        ]
+
+        # Add primary directional light with randomized parameters
+        self.scene.add_directional_light(
+            direction=direction,
+            color=directional_color,
+            shadow=self.enable_shadow,
+            shadow_scale=5,
+            shadow_map_size=2048,
+        )
+
+        # Add secondary directional light with different parameters for more realistic lighting
+        secondary_intensity = directional_intensity * 0.6  # 60% of primary intensity
+        secondary_color = [
+            secondary_intensity,
+            secondary_intensity,
+            secondary_intensity,
+        ]
+        secondary_direction = [
+            -direction[0] * 0.5,  # Opposite-ish direction
+            -direction[1] * 0.3,
+            np.random.uniform(-0.8, -0.3),  # Still downward
+        ]
+
+        self.scene.add_directional_light(
+            direction=secondary_direction,
+            color=secondary_color,
+            shadow=False,  # Secondary light doesn't cast shadows
+        )
+
+        if self.verbose:
+            print("    Lighting variation applied:")
+            print(f"      Ambient light: {ambient_color}")
+            print(
+                f"      Primary directional light: {directional_color}, direction: {direction}"
+            )
+            print(
+                f"      Secondary directional light: {secondary_color}, direction: {secondary_direction}"
+            )
+            print(f"      Shadows enabled: {self.enable_shadow}")
