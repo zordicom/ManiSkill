@@ -23,7 +23,7 @@ import torch
 import torch.random
 from transforms3d.euler import euler2quat
 
-from mani_skill.agents.robots import Fetch, Panda
+from mani_skill.agents.robots import A1Galaxea, Fetch, Panda
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common, sapien_utils
@@ -50,18 +50,49 @@ class PushCubeEnv(BaseEnv):
 
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/PushCube-v1_rt.mp4"
 
-    SUPPORTED_ROBOTS = ["panda", "fetch"]
+    SUPPORTED_ROBOTS = ["panda", "fetch", "a1_galaxea"]
 
     # Specify some supported robot types
-    agent: Union[Panda, Fetch]
+    agent: Union[Panda, Fetch, A1Galaxea]
 
-    # set some commonly used values
-    goal_radius = 0.1
-    cube_half_size = 0.02
+    # Robot-specific configurations for different reach capabilities
+    ROBOT_CONFIGS = {
+        "panda": {
+            "goal_radius": 0.1,
+            "cube_half_size": 0.02,
+            "cube_spawn_range": 0.2,  # [-0.1, 0.1] range
+            "goal_distance": 0.2,  # cube position + 0.1 + goal_radius
+        },
+        "fetch": {
+            "goal_radius": 0.1,
+            "cube_half_size": 0.02,
+            "cube_spawn_range": 0.2,
+            "goal_distance": 0.2,
+        },
+        "a1_galaxea": {
+            # Adjusted for A1 Galaxea's shorter reach (600mm vs Panda's 850mm)
+            "goal_radius": 0.08,  # Smaller goal radius
+            "cube_half_size": 0.016,  # Smaller cube (75% of Panda's)
+            "cube_spawn_range": 0.16,  # Smaller spawn range [-0.08, 0.08]
+            "goal_distance": 0.16,  # Shorter push distance (0.08 + 0.08)
+        },
+    }
 
     def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.02, **kwargs):
         # specifying robot_uids="panda" as the default means gym.make("PushCube-v1") will default to using the panda arm.
         self.robot_init_qpos_noise = robot_init_qpos_noise
+
+        # Set robot-specific configurations
+        if robot_uids in self.ROBOT_CONFIGS:
+            config = self.ROBOT_CONFIGS[robot_uids]
+        else:
+            config = self.ROBOT_CONFIGS["panda"]  # Default to panda config
+
+        self.goal_radius = config["goal_radius"]
+        self.cube_half_size = config["cube_half_size"]
+        self.cube_spawn_range = config["cube_spawn_range"]
+        self.goal_distance = config["goal_distance"]
+
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     # Specify default simulation/gpu memory configurations to override any default values
@@ -77,7 +108,14 @@ class PushCubeEnv(BaseEnv):
     def _default_sensor_configs(self):
         # registers one 128x128 camera looking at the robot, cube, and target
         # a smaller sized camera will be lower quality, but render faster
-        pose = sapien_utils.look_at(eye=[0.3, 0, 0.6], target=[-0.1, 0, 0.1])
+        # Adjust camera position based on robot type for better workspace view
+        if hasattr(self, "robot_uids") and self.robot_uids == "a1_galaxea":
+            # Closer camera for A1 Galaxea's smaller workspace
+            pose = sapien_utils.look_at(eye=[0.25, 0, 0.5], target=[-0.08, 0, 0.08])
+        else:
+            # Standard camera position for Panda/Fetch
+            pose = sapien_utils.look_at(eye=[0.3, 0, 0.6], target=[-0.1, 0, 0.1])
+
         return [
             CameraConfig(
                 "base_camera",
@@ -93,7 +131,14 @@ class PushCubeEnv(BaseEnv):
     @property
     def _default_human_render_camera_configs(self):
         # registers a more high-definition (512x512) camera used just for rendering when render_mode="rgb_array" or calling env.render_rgb_array()
-        pose = sapien_utils.look_at([0.6, 0.7, 0.6], [0.0, 0.0, 0.35])
+        # Adjust camera position based on robot type for better workspace view
+        if hasattr(self, "robot_uids") and self.robot_uids == "a1_galaxea":
+            # Closer camera for A1 Galaxea's smaller workspace
+            pose = sapien_utils.look_at([0.5, 0.6, 0.5], [0.0, 0.0, 0.3])
+        else:
+            # Standard camera position for Panda/Fetch
+            pose = sapien_utils.look_at([0.6, 0.7, 0.6], [0.0, 0.0, 0.35])
+
         return CameraConfig(
             "render_camera", pose=pose, width=512, height=512, fov=1, near=0.01, far=100
         )
@@ -151,9 +196,10 @@ class PushCubeEnv(BaseEnv):
             # note that the table scene is built such that z=0 is the surface of the table.
             self.table_scene.initialize(env_idx)
 
-            # here we write some randomization code that randomizes the x, y position of the cube we are pushing in the range [-0.1, -0.1] to [0.1, 0.1]
+            # here we write some randomization code that randomizes the x, y position of the cube we are pushing using robot-specific spawn range
             xyz = torch.zeros((b, 3))
-            xyz[..., :2] = torch.rand((b, 2)) * 0.2 - 0.1
+            spawn_half_range = self.cube_spawn_range / 2
+            xyz[..., :2] = torch.rand((b, 2)) * self.cube_spawn_range - spawn_half_range
             xyz[..., 2] = self.cube_half_size
             q = [1, 0, 0, 0]
             # we can then create a pose object using Pose.create_from_pq to then set the cube pose with. Note that even though our quaternion
@@ -165,8 +211,8 @@ class PushCubeEnv(BaseEnv):
             self.obj.set_pose(obj_pose)
 
             # here we set the location of that red/white target (the goal region). In particular here, we set the position to be in front of the cube
-            # and we further rotate 90 degrees on the y-axis to make the target object face up
-            target_region_xyz = xyz + torch.tensor([0.1 + self.goal_radius, 0, 0])
+            # and we further rotate 90 degrees on the y-axis to make the target object face up using robot-specific goal distance
+            target_region_xyz = xyz + torch.tensor([self.goal_distance, 0, 0])
             # set a little bit above 0 so the target is sitting on the table
             target_region_xyz[..., 2] = 1e-3
             self.goal_region.set_pose(
@@ -226,13 +272,13 @@ class PushCubeEnv(BaseEnv):
         )
         place_reward = 1 - torch.tanh(5 * obj_to_goal_dist)
         reward += place_reward * reached
-        
+
         # Compute a z reward to encourage the robot to keep the cube on the table
         desired_obj_z = self.cube_half_size
         current_obj_z = self.obj.pose.p[..., 2]
         z_deviation = torch.abs(current_obj_z - desired_obj_z)
         z_reward = 1 - torch.tanh(5 * z_deviation)
-        # We multiply the z reward by the place_reward and reached mask so that 
+        # We multiply the z reward by the place_reward and reached mask so that
         #   we only add the z reward if the robot has reached the desired push pose
         #   and the z reward becomes more important as the robot gets closer to the goal.
         reward += place_reward * z_reward * reached

@@ -5,7 +5,7 @@ import sapien
 import torch
 from transforms3d.euler import euler2quat
 
-from mani_skill.agents.robots import Fetch, Panda
+from mani_skill.agents.robots import A1Galaxea, Fetch, Panda
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
@@ -35,16 +35,50 @@ class PokeCubeEnv(BaseEnv):
     """
 
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/PokeCube-v1_rt.mp4"
-    SUPPORTED_ROBOTS = ["panda", "fetch"]
-    agent: Union[Panda, Fetch]
+    SUPPORTED_ROBOTS = ["panda", "fetch", "a1_galaxea"]
+    agent: Union[Panda, Fetch, A1Galaxea]
 
-    cube_half_size = 0.02
-    peg_half_width = 0.025
-    peg_half_length = 0.12
-    goal_radius = 0.05
+    # Robot-specific configurations for different reach capabilities
+    ROBOT_CONFIGS = {
+        "panda": {
+            "cube_half_size": 0.02,
+            "peg_half_width": 0.025,
+            "peg_half_length": 0.12,
+            "goal_radius": 0.05,
+            "cube_spawn_range": 0.2,  # [-0.1, 0.1] range
+        },
+        "fetch": {
+            "cube_half_size": 0.02,
+            "peg_half_width": 0.025,
+            "peg_half_length": 0.12,
+            "goal_radius": 0.05,
+            "cube_spawn_range": 0.2,
+        },
+        "a1_galaxea": {
+            # Adjusted for A1 Galaxea's shorter reach (600mm vs Panda's 850mm)
+            "cube_half_size": 0.016,  # Smaller cube (75% of Panda's)
+            "peg_half_width": 0.020,  # Smaller peg width (80% of Panda's)
+            "peg_half_length": 0.10,  # Shorter peg (83% of Panda's)
+            "goal_radius": 0.04,  # Smaller goal radius (80% of Panda's)
+            "cube_spawn_range": 0.16,  # Smaller spawn range [-0.08, 0.08]
+        },
+    }
 
     def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.02, **kwargs):
         self.robot_init_qpos_noise = robot_init_qpos_noise
+
+        # Set robot-specific configurations
+        if robot_uids in self.ROBOT_CONFIGS:
+            config = self.ROBOT_CONFIGS[robot_uids]
+        else:
+            config = self.ROBOT_CONFIGS["panda"]  # Default to panda config
+
+        self.cube_half_size = config["cube_half_size"]
+        self.peg_half_width = config["peg_half_width"]
+        self.peg_half_length = config["peg_half_length"]
+        self.goal_radius = config["goal_radius"]
+        self.cube_spawn_range = config["cube_spawn_range"]
+
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     @property
@@ -114,14 +148,19 @@ class PokeCubeEnv(BaseEnv):
             self.table_scene.initialize(env_idx)
             # initialize the peg
             peg_xyz = torch.zeros((b, 3))
-            peg_xyz = torch.rand((b, 3)) * 0.2 - 0.1
+            spawn_half_range = self.cube_spawn_range / 2
+            peg_xyz[..., :2] = (
+                torch.rand((b, 2)) * self.cube_spawn_range - spawn_half_range
+            )
             peg_xyz[..., 2] = self.peg_half_width
             peg_q = [1, 0, 0, 0]
             peg_pose = Pose.create_from_pq(p=peg_xyz, q=peg_q)
             self.peg.set_pose(peg_pose)
             # initialize the cube
             cube_xyz = torch.zeros((b, 3))
-            cube_xyz = torch.rand((b, 3)) * 0.2 - 0.1
+            cube_xyz[..., :2] = (
+                torch.rand((b, 2)) * self.cube_spawn_range - spawn_half_range
+            )
             cube_xyz[..., 0] = peg_xyz[..., 0] + self.peg_half_length + 0.1
             cube_xyz[..., 2] = self.cube_half_size
             cube_q = randomization.random_quaternions(
@@ -133,8 +172,9 @@ class PokeCubeEnv(BaseEnv):
             )
             cube_pose = Pose.create_from_pq(p=cube_xyz, q=cube_q)
             self.cube.set_pose(cube_pose)
-            # initialize the goal region
-            goal_region_xyz = cube_xyz + torch.tensor([0.05 + self.goal_radius, 0, 0])
+            # initialize the goal region - use robot-specific goal offset
+            goal_offset = self.goal_radius + 0.01  # Small fixed offset plus goal radius
+            goal_region_xyz = cube_xyz + torch.tensor([goal_offset, 0, 0])
             goal_region_xyz[..., 2] = 1e-3
             goal_region_q = euler2quat(0, np.pi / 2, 0)
             goal_region_pose = Pose.create_from_pq(p=goal_region_xyz, q=goal_region_q)

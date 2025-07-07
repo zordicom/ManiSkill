@@ -1,3 +1,4 @@
+from .a1_galaxea import A1Galaxea
 from .allegro_hand import *
 from .anymal import ANYmalC
 from .dclaw import DClaw

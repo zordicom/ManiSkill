@@ -1,0 +1,22 @@
+# Blender 4.4.3 MTL File: 'basket.blend'
+# www.blender.org
+
+newmtl Material_1.001
+Ns 0.000000
+Ka 1.000000 1.000000 1.000000
+Ks 0.000000 0.000000 0.000000
+Ke 0.000000 0.000000 0.000000
+Ni 1.500000
+d 1.000000
+illum 1
+map_Kd textures/9d95eb18366df9c152599b68f6ed8e84.jpg
+
+newmtl Material_2.001
+Ns 0.000000
+Ka 1.000000 1.000000 1.000000
+Ks 0.000000 0.000000 0.000000
+Ke 0.000000 0.000000 0.000000
+Ni 1.500000
+d 1.000000
+illum 1
+map_Kd textures/20e50c694215c97230ea08390409e4b2.jpg

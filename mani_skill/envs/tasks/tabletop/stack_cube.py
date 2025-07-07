@@ -4,7 +4,7 @@ import numpy as np
 import sapien
 import torch
 
-from mani_skill.agents.robots import Fetch, Panda
+from mani_skill.agents.robots import A1Galaxea, Fetch, Panda
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
@@ -32,13 +32,44 @@ class StackCubeEnv(BaseEnv):
     """
 
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/StackCube-v1_rt.mp4"
-    SUPPORTED_ROBOTS = ["panda_wristcam", "panda", "fetch"]
-    agent: Union[Panda, Fetch]
+    SUPPORTED_ROBOTS = ["panda_wristcam", "panda", "fetch", "a1_galaxea"]
+    agent: Union[Panda, Fetch, A1Galaxea]
+
+    # Robot-specific configurations for different reach capabilities
+    ROBOT_CONFIGS = {
+        "panda": {
+            "cube_half_size": 0.02,
+            "cube_spawn_range": 0.2,  # [-0.1, 0.1] range
+        },
+        "panda_wristcam": {
+            "cube_half_size": 0.02,
+            "cube_spawn_range": 0.2,
+        },
+        "fetch": {
+            "cube_half_size": 0.02,
+            "cube_spawn_range": 0.2,
+        },
+        "a1_galaxea": {
+            # Adjusted for A1 Galaxea's shorter reach (600mm vs Panda's 850mm)
+            "cube_half_size": 0.016,  # Smaller cubes (75% of Panda's)
+            "cube_spawn_range": 0.16,  # Smaller spawn range [-0.08, 0.08]
+        },
+    }
 
     def __init__(
         self, *args, robot_uids="panda_wristcam", robot_init_qpos_noise=0.02, **kwargs
     ):
         self.robot_init_qpos_noise = robot_init_qpos_noise
+
+        # Set robot-specific configurations
+        if robot_uids in self.ROBOT_CONFIGS:
+            config = self.ROBOT_CONFIGS[robot_uids]
+        else:
+            config = self.ROBOT_CONFIGS["panda"]  # Default to panda config
+
+        self.cube_half_size = config["cube_half_size"]
+        self.cube_spawn_range = config["cube_spawn_range"]
+
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     @property
@@ -55,21 +86,23 @@ class StackCubeEnv(BaseEnv):
         super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
 
     def _load_scene(self, options: dict):
-        self.cube_half_size = common.to_tensor([0.02] * 3, device=self.device)
+        self.cube_half_size_tensor = common.to_tensor(
+            [self.cube_half_size] * 3, device=self.device
+        )
         self.table_scene = TableSceneBuilder(
             env=self, robot_init_qpos_noise=self.robot_init_qpos_noise
         )
         self.table_scene.build()
         self.cubeA = actors.build_cube(
             self.scene,
-            half_size=0.02,
+            half_size=self.cube_half_size,
             color=[1, 0, 0, 1],
             name="cubeA",
             initial_pose=sapien.Pose(p=[0, 0, 0.1]),
         )
         self.cubeB = actors.build_cube(
             self.scene,
-            half_size=0.02,
+            half_size=self.cube_half_size,
             color=[0, 1, 0, 1],
             name="cubeB",
             initial_pose=sapien.Pose(p=[1, 0, 0.1]),
@@ -81,13 +114,22 @@ class StackCubeEnv(BaseEnv):
             self.table_scene.initialize(env_idx)
 
             xyz = torch.zeros((b, 3))
-            xyz[:, 2] = 0.02
-            xy = torch.rand((b, 2)) * 0.2 - 0.1
-            region = [[-0.1, -0.2], [0.1, 0.2]]
+            xyz[:, 2] = self.cube_half_size
+            spawn_half_range = self.cube_spawn_range / 2
+            xy = torch.rand((b, 2)) * self.cube_spawn_range - spawn_half_range
+            region = [
+                [-spawn_half_range, -self.cube_spawn_range],
+                [spawn_half_range, self.cube_spawn_range],
+            ]
             sampler = randomization.UniformPlacementSampler(
                 bounds=region, batch_size=b, device=self.device
             )
-            radius = torch.linalg.norm(torch.tensor([0.02, 0.02])) + 0.001
+            radius = (
+                torch.linalg.norm(
+                    torch.tensor([self.cube_half_size, self.cube_half_size])
+                )
+                + 0.001
+            )
             cubeA_xy = xy + sampler.sample(radius, 100)
             cubeB_xy = xy + sampler.sample(radius, 100, verbose=False)
 
@@ -115,9 +157,11 @@ class StackCubeEnv(BaseEnv):
         offset = pos_A - pos_B
         xy_flag = (
             torch.linalg.norm(offset[..., :2], axis=1)
-            <= torch.linalg.norm(self.cube_half_size[:2]) + 0.005
+            <= torch.linalg.norm(self.cube_half_size_tensor[:2]) + 0.005
         )
-        z_flag = torch.abs(offset[..., 2] - self.cube_half_size[..., 2] * 2) <= 0.005
+        z_flag = (
+            torch.abs(offset[..., 2] - self.cube_half_size_tensor[..., 2] * 2) <= 0.005
+        )
         is_cubeA_on_cubeB = torch.logical_and(xy_flag, z_flag)
         # NOTE (stao): GPU sim can be fast but unstable. Angular velocity is rather high despite it not really rotating
         is_cubeA_static = self.cubeA.is_static(lin_thresh=1e-2, ang_thresh=0.5)
@@ -152,9 +196,10 @@ class StackCubeEnv(BaseEnv):
         # grasp and place reward
         cubeA_pos = self.cubeA.pose.p
         cubeB_pos = self.cubeB.pose.p
-        goal_xyz = torch.hstack(
-            [cubeB_pos[:, 0:2], (cubeB_pos[:, 2] + self.cube_half_size[2] * 2)[:, None]]
-        )
+        goal_xyz = torch.hstack([
+            cubeB_pos[:, 0:2],
+            (cubeB_pos[:, 2] + self.cube_half_size_tensor[2] * 2)[:, None],
+        ])
         cubeA_to_goal_dist = torch.linalg.norm(goal_xyz - cubeA_pos, axis=1)
         place_reward = 1 - torch.tanh(5.0 * cubeA_to_goal_dist)
 

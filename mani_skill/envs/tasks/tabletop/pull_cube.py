@@ -6,7 +6,7 @@ import torch
 import torch.random
 from transforms3d.euler import euler2quat
 
-from mani_skill.agents.robots import Fetch, Panda
+from mani_skill.agents.robots import A1Galaxea, Fetch, Panda
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils.building import actors
@@ -32,18 +32,51 @@ class PullCubeEnv(BaseEnv):
     """
 
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/PullCube-v1_rt.mp4"
-    SUPPORTED_ROBOTS = ["panda", "fetch"]
-    agent: Union[Panda, Fetch]
-    goal_radius = 0.1
-    cube_half_size = 0.02
+    SUPPORTED_ROBOTS = ["panda", "fetch", "a1_galaxea"]
+    agent: Union[Panda, Fetch, A1Galaxea]
+
+    # Robot-specific configurations for different reach capabilities
+    ROBOT_CONFIGS = {
+        "panda": {
+            "goal_radius": 0.1,
+            "cube_half_size": 0.02,
+            "cube_spawn_range": 0.2,  # [-0.1, 0.1] range
+            "goal_distance": 0.2,  # cube position - (0.1 + goal_radius)
+        },
+        "fetch": {
+            "goal_radius": 0.1,
+            "cube_half_size": 0.02,
+            "cube_spawn_range": 0.2,
+            "goal_distance": 0.2,
+        },
+        "a1_galaxea": {
+            # Adjusted for A1 Galaxea's shorter reach (600mm vs Panda's 850mm)
+            "goal_radius": 0.08,  # Smaller goal radius
+            "cube_half_size": 0.016,  # Smaller cube (75% of Panda's)
+            "cube_spawn_range": 0.16,  # Smaller spawn range [-0.08, 0.08]
+            "goal_distance": 0.16,  # Shorter pull distance (0.08 + 0.08)
+        },
+    }
 
     def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.02, **kwargs):
         self.robot_init_qpos_noise = robot_init_qpos_noise
+
+        # Set robot-specific configurations
+        if robot_uids in self.ROBOT_CONFIGS:
+            config = self.ROBOT_CONFIGS[robot_uids]
+        else:
+            config = self.ROBOT_CONFIGS["panda"]  # Default to panda config
+
+        self.goal_radius = config["goal_radius"]
+        self.cube_half_size = config["cube_half_size"]
+        self.cube_spawn_range = config["cube_spawn_range"]
+        self.goal_distance = config["goal_distance"]
+
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     @property
     def _default_sensor_configs(self):
-        pose = look_at(eye=[-0.5,0.0,0.25], target=[0.2,0.0,-0.5])
+        pose = look_at(eye=[-0.5, 0.0, 0.25], target=[0.2, 0.0, -0.5])
         return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
 
     @property
@@ -85,14 +118,15 @@ class PullCubeEnv(BaseEnv):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
             xyz = torch.zeros((b, 3))
-            xyz[..., :2] = torch.rand((b, 2)) * 0.2 - 0.1
+            spawn_half_range = self.cube_spawn_range / 2
+            xyz[..., :2] = torch.rand((b, 2)) * self.cube_spawn_range - spawn_half_range
             xyz[..., 2] = self.cube_half_size
             q = [1, 0, 0, 0]
 
             obj_pose = Pose.create_from_pq(p=xyz, q=q)
             self.obj.set_pose(obj_pose)
 
-            target_region_xyz = xyz - torch.tensor([0.1 + self.goal_radius, 0, 0])
+            target_region_xyz = xyz - torch.tensor([self.goal_distance, 0, 0])
 
             target_region_xyz[..., 2] = 1e-3
             self.goal_region.set_pose(

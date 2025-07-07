@@ -16,7 +16,8 @@ from mani_skill.utils.scene_builder import SceneBuilder
 
 class TableSceneBuilder(SceneBuilder):
     """A simple scene builder that adds a table to the scene such that the height of the table is at 0, and
-    gives reasonable initial poses for robots."""
+    gives reasonable initial poses for robots.
+    """
 
     def build(self):
         builder = self.scene.create_actor_builder()
@@ -47,12 +48,10 @@ class TableSceneBuilder(SceneBuilder):
         #     .compute_global_aabb_tight()
         # )
         # value of the call above is saved below
-        aabb = np.array(
-            [
-                [-0.7402168, -1.2148621, -0.91964257],
-                [0.4688596, 1.2030163, 3.5762787e-07],
-            ]
-        )
+        aabb = np.array([
+            [-0.7402168, -1.2148621, -0.91964257],
+            [0.4688596, 1.2030163, 3.5762787e-07],
+        ])
         self.table_length = aabb[1, 0] - aabb[0, 0]
         self.table_width = aabb[1, 1] - aabb[0, 1]
         self.table_height = aabb[1, 2] - aabb[0, 2]
@@ -72,19 +71,17 @@ class TableSceneBuilder(SceneBuilder):
             sapien.Pose(p=[-0.12, 0, -0.9196429], q=euler2quat(0, 0, np.pi / 2))
         )
         if self.env.robot_uids == "panda":
-            qpos = np.array(
-                [
-                    0.0,
-                    np.pi / 8,
-                    0,
-                    -np.pi * 5 / 8,
-                    0,
-                    np.pi * 3 / 4,
-                    np.pi / 4,
-                    0.04,
-                    0.04,
-                ]
-            )
+            qpos = np.array([
+                0.0,
+                np.pi / 8,
+                0,
+                -np.pi * 5 / 8,
+                0,
+                np.pi * 3 / 4,
+                np.pi / 4,
+                0.04,
+                0.04,
+            ])
             if self.env._enhanced_determinism:
                 qpos = (
                     self.env._batched_episode_rng[env_idx].normal(
@@ -141,25 +138,23 @@ class TableSceneBuilder(SceneBuilder):
             self.env.agent.reset(qpos)
             self.env.agent.robot.set_pose(sapien.Pose([-0.522, 0, 0]))
         elif self.env.robot_uids == "fetch":
-            qpos = np.array(
-                [
-                    0,
-                    0,
-                    0,
-                    0.386,
-                    0,
-                    0,
-                    0,
-                    -np.pi / 4,
-                    0,
-                    np.pi / 4,
-                    0,
-                    np.pi / 3,
-                    0,
-                    0.015,
-                    0.015,
-                ]
-            )
+            qpos = np.array([
+                0,
+                0,
+                0,
+                0.386,
+                0,
+                0,
+                0,
+                -np.pi / 4,
+                0,
+                np.pi / 4,
+                0,
+                np.pi / 3,
+                0,
+                0.015,
+                0.015,
+            ])
             self.env.agent.reset(qpos)
             self.env.agent.robot.set_pose(sapien.Pose([-1.05, 0, -self.table_height]))
 
@@ -168,19 +163,17 @@ class TableSceneBuilder(SceneBuilder):
             )
         elif self.env.robot_uids == ("panda", "panda"):
             agent: MultiAgent = self.env.agent
-            qpos = np.array(
-                [
-                    0.0,
-                    np.pi / 8,
-                    0,
-                    -np.pi * 5 / 8,
-                    0,
-                    np.pi * 3 / 4,
-                    np.pi / 4,
-                    0.04,
-                    0.04,
-                ]
-            )
+            qpos = np.array([
+                0.0,
+                np.pi / 8,
+                0,
+                -np.pi * 5 / 8,
+                0,
+                np.pi * 3 / 4,
+                np.pi / 4,
+                0.04,
+                0.04,
+            ])
             if self.env._enhanced_determinism:
                 qpos = (
                     self.env._batched_episode_rng[env_idx].normal(
@@ -206,19 +199,17 @@ class TableSceneBuilder(SceneBuilder):
             )
         elif self.env.robot_uids == ("panda_wristcam", "panda_wristcam"):
             agent: MultiAgent = self.env.agent
-            qpos = np.array(
-                [
-                    0.0,
-                    np.pi / 8,
-                    0,
-                    -np.pi * 5 / 8,
-                    0,
-                    np.pi * 3 / 4,
-                    np.pi / 4,
-                    0.04,
-                    0.04,
-                ]
-            )
+            qpos = np.array([
+                0.0,
+                np.pi / 8,
+                0,
+                -np.pi * 5 / 8,
+                0,
+                np.pi * 3 / 4,
+                np.pi / 4,
+                0.04,
+                0.04,
+            ])
             if self.env._enhanced_determinism:
                 qpos = (
                     self.env._batched_episode_rng[env_idx].normal(
@@ -250,17 +241,15 @@ class TableSceneBuilder(SceneBuilder):
             # Need to specify the robot qpos for each sub-scenes using tensor api
             pass
         elif self.env.robot_uids == "panda_stick":
-            qpos = np.array(
-                [
-                    0.0,
-                    np.pi / 8,
-                    0,
-                    -np.pi * 5 / 8,
-                    0,
-                    np.pi * 3 / 4,
-                    np.pi / 4,
-                ]
-            )
+            qpos = np.array([
+                0.0,
+                np.pi / 8,
+                0,
+                -np.pi * 5 / 8,
+                0,
+                np.pi * 3 / 4,
+                np.pi / 4,
+            ])
             if self.env._enhanced_determinism:
                 qpos = (
                     self.env._batched_episode_rng[env_idx].normal(
@@ -292,3 +281,27 @@ class TableSceneBuilder(SceneBuilder):
             self.env.agent.robot.set_pose(
                 sapien.Pose([-0.725, 0, 0], q=euler2quat(0, 0, np.pi / 2))
             )
+        elif self.env.robot_uids == "a1_galaxea":
+            # Use the home keyframe which has proper joint angles from simple_task project
+            qpos = self.env.agent.keyframes["home"].qpos
+            if self.env._enhanced_determinism:
+                qpos = (
+                    self.env._batched_episode_rng[env_idx].normal(
+                        0, self.robot_init_qpos_noise, len(qpos)
+                    )
+                    + qpos
+                )
+            else:
+                qpos = (
+                    self.env._episode_rng.normal(
+                        0, self.robot_init_qpos_noise, (b, len(qpos))
+                    )
+                    + qpos
+                )
+            # Keep gripper fingers at their home position (open)
+            qpos[:, -2:] = self.env.agent.keyframes["home"].qpos[-2:]
+            self.env.agent.reset(qpos)
+            self.env.agent.robot.set_pose(sapien.Pose([-0.615, 0, 0]))
+        else:
+            # Default case - robot will use its default initialization
+            pass

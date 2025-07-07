@@ -2,8 +2,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Literal, Sequence, Union
 
 import numpy as np
-import sapien.physx as physx
 import torch
+from sapien import physx
 
 Array = Union[torch.Tensor, np.ndarray, Sequence]
 Device = Union[str, torch.device]

@@ -4,10 +4,17 @@ import numpy as np
 import sapien
 import torch
 
-import mani_skill.envs.utils.randomization as randomization
-from mani_skill.agents.robots import SO100, Fetch, Panda, WidowXAI, XArm6Robotiq
+from mani_skill.agents.robots import (
+    SO100,
+    A1Galaxea,
+    Fetch,
+    Panda,
+    WidowXAI,
+    XArm6Robotiq,
+)
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.tasks.tabletop.pick_cube_cfgs import PICK_CUBE_CONFIGS
+from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.building import actors
@@ -32,7 +39,6 @@ capabilities can be simulated and trained properly. Hence there is extra code fo
 
 @register_env("PickCube-v1", max_episode_steps=50)
 class PickCubeEnv(BaseEnv):
-
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/PickCube-v1_rt.mp4"
     SUPPORTED_ROBOTS = [
         "panda",
@@ -40,8 +46,9 @@ class PickCubeEnv(BaseEnv):
         "xarm6_robotiq",
         "so100",
         "widowxai",
+        "a1_galaxea",
     ]
-    agent: Union[Panda, Fetch, XArm6Robotiq, SO100, WidowXAI]
+    agent: Union[Panda, Fetch, XArm6Robotiq, SO100, WidowXAI, A1Galaxea]
     cube_half_size = 0.02
     goal_thresh = 0.025
     cube_spawn_half_size = 0.05
@@ -176,7 +183,7 @@ class PickCubeEnv(BaseEnv):
         reward += place_reward * is_grasped
 
         qvel = self.agent.robot.get_qvel()
-        if self.robot_uids in ["panda", "widowxai"]:
+        if self.robot_uids in ["panda", "widowxai", "a1_galaxea"]:
             qvel = qvel[..., :-2]
         elif self.robot_uids == "so100":
             qvel = qvel[..., :-1]
