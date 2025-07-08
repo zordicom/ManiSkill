@@ -60,7 +60,7 @@ class A1GalaxeaMotionPlanningSolver(PandaArmMotionPlanningSolver):
         print(
             "🔍 [A1 DEBUG] Initializing robot to home keyframe for proper gripper position"
         )
-        home_qpos = self.env_agent.keyframes["home"].qpos
+        home_qpos = self.env_agent.keyframes["home"].qpos[:7]
         print(f"🔍 [A1 DEBUG] Setting robot to home qpos: {home_qpos}")
 
         # The robot has 8 joints but keyframe only has 7 (master gripper joint)

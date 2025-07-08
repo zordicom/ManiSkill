@@ -85,21 +85,24 @@ class PickBoxEnv(BaseEnv):
         "alpha": (1.0, 1.0),  # Alpha channel (keep opaque)
     }
 
-    # Lighting variation parameters
+    # Lighting variation parameters - optimized for stronger shadows
     ambient_light_ranges = {  # noqa: RUF012
-        "min_intensity": (0.2, 0.5),  # Ambient light intensity range
-        "max_intensity": (0.8, 1.2),  # Maximum ambient light
+        "min_intensity": (0.1, 0.3),  # Reduced ambient light for stronger shadows
+        "max_intensity": (0.4, 0.6),  # Lower max ambient light for better contrast
     }
 
     directional_light_ranges = {  # noqa: RUF012
-        "intensity": (2.0, 4.0),  # Directional light intensity
-        "direction_x": (-1.0, 1.0),  # X component of light direction (expanded range)
-        "direction_y": (-1.0, 1.0),  # Y component of light direction (expanded range)
-        "direction_z": (
-            -1.0,
-            -0.3,
-        ),  # Z component (always downward, but more variation)
+        "intensity": (
+            2.5,
+            4.5,
+        ),  # Increased directional light intensity for stronger shadows
+        "direction_x": (-1.0, 1.0),  # X component of light direction
+        "direction_y": (-1.0, 1.0),  # Y component of light direction
+        "direction_z": (-1.0, -0.3),  # Z component (always downward)
     }
+
+    # Store per-environment lighting directions (set at environment creation)
+    _env_lighting_directions = None
 
     # Shadow box parameters for floating overhead obstacle
     shadow_box_ranges = {  # noqa: RUF012
@@ -131,7 +134,8 @@ class PickBoxEnv(BaseEnv):
         **kwargs,
     ):
         self.verbose = verbose
-        self.enable_shadow = enable_shadow
+        # Always enable shadows as requested
+        self.enable_shadow = True
         # Resolve to a canonical UID string
         self.robot_uids = robot_uids
         self.robot_type = robot_uids  # alias for config lookup
@@ -142,10 +146,19 @@ class PickBoxEnv(BaseEnv):
             self.goal_thresh = cfg["goal_thresh"]
             self.b5box_half_size = cfg["cube_half_size"]
             self.cube_half_size = cfg["cube_half_size"]
+            # Store camera configurations for sensor setup
+            self.sensor_cam_eye_pos = cfg["sensor_cam_eye_pos"]
+            self.sensor_cam_target_pos = cfg["sensor_cam_target_pos"]
+            self.human_cam_eye_pos = cfg["human_cam_eye_pos"]
+            self.human_cam_target_pos = cfg["human_cam_target_pos"]
         else:
             # Fallback to default values
             cfg = PICK_BOX_CONFIGS["panda"]
             self.goal_thresh = cfg["goal_thresh"]
+            self.sensor_cam_eye_pos = cfg["sensor_cam_eye_pos"]
+            self.sensor_cam_target_pos = cfg["sensor_cam_target_pos"]
+            self.human_cam_eye_pos = cfg["human_cam_eye_pos"]
+            self.human_cam_target_pos = cfg["human_cam_target_pos"]
 
         # Initialize box_half_sizes early to avoid observation space generation errors
         # This will be updated later in _load_b5box based on the actual box configuration per scene
@@ -232,31 +245,32 @@ class PickBoxEnv(BaseEnv):
 
     @property
     def _default_sensor_configs(self):
-        cam_cfg = BIMANUAL_PICK_PLACE_CONFIG["cameras"]["static_top"]
-        return [
-            # RGB camera (existing)
-            CameraConfig(
-                "base_camera",
-                cam_cfg["pose"].sp,
-                cam_cfg["width"],
-                cam_cfg["height"],
-                cam_cfg["fov"],
-                0.01,
-                100,
-            ),
-            # For depth, we would need to enable depth in the obs_mode
-            # The depth is handled by the shader system, not camera config
-        ]
+        # No additional sensor cameras - only use robot-mounted cameras
+        return []
 
     @property
     def _default_human_render_camera_configs(self):
-        cam_cfg = BIMANUAL_PICK_PLACE_CONFIG["cameras"]["human_render"]
+        # Use the same pose as static_top camera for A1 Galaxea, fallback for other robots
+        if self.robot_type == "a1_galaxea":
+            cfg = PICK_BOX_CONFIGS[self.robot_type]
+            pose = sapien.Pose(
+                p=cfg["static_top_cam_pos"],
+                q=cfg["static_top_cam_quat"],
+            )
+        else:
+            # Fallback for other robots
+            from mani_skill.utils import sapien_utils
+
+            pose = sapien_utils.look_at(
+                eye=self.human_cam_eye_pos, target=self.human_cam_target_pos
+            )
+
         return CameraConfig(
             "render_camera",
-            cam_cfg["pose"].sp,
-            cam_cfg["width"],
-            cam_cfg["height"],
-            cam_cfg["fov"],
+            pose,
+            512,
+            512,
+            1,
             0.01,
             100,
         )
@@ -352,12 +366,13 @@ class PickBoxEnv(BaseEnv):
         # Create floating shadow box for more interesting lighting
         self.shadow_box = self._create_shadow_box()
 
-        # Lighting variation will be applied per-episode in _initialize_episode
+        # Setup lighting at environment creation (not per episode)
+        self._setup_env_creation_lighting()
 
     def _load_lighting(self, options: dict):
-        """Override base lighting setup since we handle lighting in _setup_lighting_variation."""
+        """Override base lighting setup - we handle lighting in _setup_env_creation_lighting."""
         # Don't call super()._load_lighting() to avoid default directional lights
-        # Our lighting is set up in _setup_lighting_variation() which is called from _load_scene()
+        # Our lighting is set up in _setup_env_creation_lighting() which is called from _load_scene()
         pass
 
     # ------------------------------------------------------------------
@@ -837,8 +852,8 @@ class PickBoxEnv(BaseEnv):
             goal_xyz[:, 2] = table_surface_z + 0.25
             self.goal_site.set_pose(Pose.create_from_pq(goal_xyz))
 
-            # Apply per-episode lighting variation
-            self._setup_per_episode_lighting_variation()
+            # Lighting is now set up at environment creation, not per episode
+            # No need to call _setup_per_episode_lighting_variation()
 
             # Initialize transport timer for reward decay mechanism
             if not hasattr(self, "transport_timer"):
@@ -870,6 +885,9 @@ class PickBoxEnv(BaseEnv):
                 )
                 print(
                     f"    Expected box z-placement: {expected_z.item() if hasattr(expected_z, 'item') else expected_z:.4f}"
+                )
+                print(
+                    f"    Lighting direction (fixed): {self._env_lighting_directions}"
                 )
 
     # ------------------------------------------------------------------
@@ -1402,86 +1420,65 @@ class PickBoxEnv(BaseEnv):
             else:
                 print(f"  Value: {value}")
 
-    def _setup_per_episode_lighting_variation(self):
-        """Apply randomized ambient and directional lighting per episode using torch random functions."""
-        with torch.device(self.device):
-            # Generate random ambient light intensity using torch for GPU compatibility
-            ambient_intensity = (
-                torch.rand(1).item()
-                * (
-                    self.ambient_light_ranges["max_intensity"][1]
-                    - self.ambient_light_ranges["min_intensity"][0]
-                )
-                + self.ambient_light_ranges["min_intensity"][0]
+    def _setup_env_creation_lighting(self):
+        """Setup lighting at environment creation with randomized directions per environment."""
+        # Generate random ambient light intensity
+        ambient_intensity = np.random.uniform(
+            self.ambient_light_ranges["min_intensity"][0],
+            self.ambient_light_ranges["max_intensity"][1],
+        )
+
+        ambient_color = [ambient_intensity, ambient_intensity, ambient_intensity]
+
+        # Set ambient light
+        self.scene.set_ambient_light(ambient_color)
+
+        # Generate random directional light parameters (fixed per environment creation)
+        directional_intensity = np.random.uniform(
+            self.directional_light_ranges["intensity"][0],
+            self.directional_light_ranges["intensity"][1],
+        )
+
+        directional_color = [
+            directional_intensity,
+            directional_intensity,
+            directional_intensity,
+        ]
+
+        # Generate random direction (fixed per environment creation)
+        direction = [
+            np.random.uniform(
+                self.directional_light_ranges["direction_x"][0],
+                self.directional_light_ranges["direction_x"][1],
+            ),
+            np.random.uniform(
+                self.directional_light_ranges["direction_y"][0],
+                self.directional_light_ranges["direction_y"][1],
+            ),
+            np.random.uniform(
+                self.directional_light_ranges["direction_z"][0],
+                self.directional_light_ranges["direction_z"][1],
+            ),
+        ]
+
+        # Store the direction for this environment instance
+        self._env_lighting_directions = direction
+
+        # Add single directional light with enhanced shadow settings
+        self.scene.add_directional_light(
+            direction=direction,
+            color=directional_color,
+            shadow=True,  # Always enable shadows as requested
+            shadow_scale=15,  # Increased shadow coverage for stronger shadows
+            shadow_map_size=4096,  # High resolution shadows for crisp edges
+        )
+
+        if self.verbose:
+            print("    Environment creation lighting setup (enhanced shadows):")
+            print(f"      Ambient light: {ambient_color}")
+            print(
+                f"      Directional light: {directional_color}, direction: {direction}"
             )
-
-            ambient_color = [ambient_intensity, ambient_intensity, ambient_intensity]
-
-            # Clear existing lights and set new ambient light
-            self.scene.set_ambient_light(ambient_color)
-
-            # Remove existing directional lights
-            # Note: SAPIEN doesn't have a direct way to remove lights, so we'll replace them
-
-            # Generate random directional light parameters using torch
-            directional_intensity = (
-                torch.rand(1).item()
-                * (
-                    self.directional_light_ranges["intensity"][1]
-                    - self.directional_light_ranges["intensity"][0]
-                )
-                + self.directional_light_ranges["intensity"][0]
-            )
-
-            directional_color = [
-                directional_intensity,
-                directional_intensity,
-                directional_intensity,
-            ]
-
-            # Generate random direction (ensure it's always pointing somewhat downward)
-            direction = [
-                torch.rand(1).item()
-                * (
-                    self.directional_light_ranges["direction_x"][1]
-                    - self.directional_light_ranges["direction_x"][0]
-                )
-                + self.directional_light_ranges["direction_x"][0],
-                torch.rand(1).item()
-                * (
-                    self.directional_light_ranges["direction_y"][1]
-                    - self.directional_light_ranges["direction_y"][0]
-                )
-                + self.directional_light_ranges["direction_y"][0],
-                torch.rand(1).item()
-                * (
-                    self.directional_light_ranges["direction_z"][1]
-                    - self.directional_light_ranges["direction_z"][0]
-                )
-                + self.directional_light_ranges["direction_z"][0],
-            ]
-
-            # Add single directional light with randomized parameters
-            # Note: This replaces any existing directional lights
-            # COMMENTED OUT: Causes "too many directional lights that cast shadows" error
-            # self.scene.add_directional_light(
-            #     direction=direction,
-            #     color=directional_color,
-            #     shadow=self.enable_shadow,
-            #     shadow_scale=10,  # Larger shadow map coverage
-            #     shadow_map_size=4096,  # Higher resolution shadows
-            # )
-
-            if self.verbose:
-                print("    Per-episode lighting variation applied:")
-                print(f"      Ambient light: {ambient_color}")
-                print(
-                    f"      Directional light: {directional_color}, direction: {direction}"
-                )
-                print(f"      Shadows enabled: {self.enable_shadow}")
-                if self.enable_shadow:
-                    print("      Shadow quality: 4096x4096 map, scale=10")
-                    shadow_objects = "table, box, basket, robot"
-                    if hasattr(self, "shadow_box") and self.shadow_box is not None:
-                        shadow_objects += ", floating shadow box"
-                    print(f"      Shadow-casting objects: {shadow_objects}")
+            print("      Shadows: Always enabled with enhanced settings")
+            print("      Shadow quality: 4096x4096 map, scale=15 (stronger shadows)")
+            print("      Lighting direction: Fixed per environment creation")

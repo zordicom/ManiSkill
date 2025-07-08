@@ -39,16 +39,16 @@ class A1Galaxea(BaseAgent):
 
     keyframes = dict(  # noqa: RUF012
         rest=Keyframe(
-            qpos=np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            qpos=np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
             pose=sapien.Pose(),
         ),
         extended=Keyframe(
-            qpos=np.array([0.0, 0.5, -0.5, 0.0, 0.0, 0.0, 0.0]),
+            qpos=np.array([0.0, 0.5, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0]),
             pose=sapien.Pose(),
         ),
         home=Keyframe(
             # Home pose from simple_task project: [42.0, 45.0, -48.0, 80.0, -35.0, 15.0] degrees
-            # Convert to radians for the 6 arm joints + 1 gripper joint (master only)
+            # Convert to radians for the 6 arm joints + 2 gripper joints (gripper2_axis mimics gripper1_axis)
             qpos=np.array([
                 np.deg2rad(42.0),  # arm_joint1
                 np.deg2rad(45.0),  # arm_joint2
@@ -56,7 +56,8 @@ class A1Galaxea(BaseAgent):
                 np.deg2rad(80.0),  # arm_joint4
                 np.deg2rad(-35.0),  # arm_joint5
                 np.deg2rad(15.0),  # arm_joint6
-                -0.03,  # gripper1_axis (open, gripper2_axis will follow via mimic)
+                -0.03,  # gripper1_axis (open, master joint)
+                -0.03,  # gripper2_axis (open, mimic joint - should match gripper1_axis)
             ]),
             pose=sapien.Pose(),
         ),
@@ -281,30 +282,54 @@ class A1Galaxea(BaseAgent):
     @property
     def _sensor_configs(self):
         """Define robot-mounted cameras for the A1 Galaxea robot."""
-        # Camera mounted on arm_seg6 (final arm link) matching the real robot configuration
-        # Based on XML: camera_body pos="0.092689 0 -0.010838" + tilt_down + final camera offset
-        # Total position from arm_seg6: (0.092689, 0, -0.000838)
+        # Camera mounted on galaxea_eoat_set looking down at the TCP
+        #
+        # From URDF analysis:
+        # - Original camera position: [0.092689, 0, 0.052958]
+        # - TCP position relative to galaxea_eoat_set: [0, 0, 0.06]
+        # - Camera moved forward toward TCP for better view
 
-        # Compound quaternion from XML transformations:
-        # 1. camera_body: quat="0.965926 0 -0.258819 0" (w,x,y,z in MuJoCo)
-        # 2. tilt_down: quat="0.9981 0 -0.0611 0"
-        # 3. camera: quat="0 0.7071 0.7071 0"
-        # Result: roughly pointing forward and slightly down from arm_seg6
+        # Calculate the look_at pose for the camera
+        # Camera position relative to galaxea_eoat_set (moved forward toward TCP)
+        camera_eye = [0.06, 0, 0.07]  # Moved closer to TCP: X reduced, Z increased
+        # TCP position relative to galaxea_eoat_set
+        tcp_target = [0, 0, 0.15]
+
+        # Use sapien_utils.look_at to calculate the correct orientation
+        # This will make the camera look from camera_eye toward tcp_target
+        camera_pose = sapien_utils.look_at(eye=camera_eye, target=tcp_target)
 
         return [
             CameraConfig(
                 uid="end_effector_camera",
-                pose=sapien.Pose(
-                    p=[0.092689, 0.0, -0.000838],  # Position from XML transformations
-                    q=[0.5, 0.5, -0.5, 0.5],  # Compound rotation (approximate)
-                ),
-                width=128,
-                height=128,
+                pose=camera_pose,
+                width=224,
+                height=224,
                 fov=60 * np.pi / 180,  # 60 degrees as specified in XML
                 near=0.01,
                 far=100,
-                mount=self.robot.links_map["arm_seg6"],  # Mount on arm_seg6 link
-            )
+                mount=self.robot.links_map[
+                    "galaxea_eoat_set"
+                ],  # Mount on galaxea_eoat_set link
+            ),
+            CameraConfig(
+                uid="static_top",
+                pose=sapien.Pose(
+                    p=[-0.228881, 0.0366335, 1.41154],  # User-specified position
+                    q=[
+                        0.931246,
+                        0.000830829,
+                        0.364383,
+                        -0.00212252,
+                    ],  # User-specified quaternion (w,x,y,z)
+                ),
+                width=224,
+                height=224,
+                fov=1.06,  # User-specified FOV in radians
+                near=0.1,
+                far=1000.0,
+                # No mount - this is a static camera in world coordinates
+            ),
         ]
 
     @staticmethod

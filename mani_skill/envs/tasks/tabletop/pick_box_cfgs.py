@@ -40,6 +40,19 @@ PICK_BOX_CONFIGS = {
         # Override bimanual spawn positions for single-arm use
         "object_spawn_center": [0.1, -0.2],  # Closer to A1 robot
         "goal_spawn_center": [0.1, 0.0],  # Reasonable distance from object
+        # Static top camera configuration (user-specified)
+        "static_top_cam_pos": [-0.228881, 0.0366335, 1.41154],
+        "static_top_cam_quat": [
+            0.931246,
+            0.000830829,
+            0.364383,
+            -0.00212252,
+        ],  # w,x,y,z format
+        "static_top_cam_width": 224,
+        "static_top_cam_height": 224,
+        "static_top_cam_fovy": 1.06,  # Radians
+        "static_top_cam_near": 0.1,
+        "static_top_cam_far": 1000.0,
     },
     "xarm6_robotiq": {
         "cube_half_size": 0.02,
