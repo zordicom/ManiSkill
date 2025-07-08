@@ -1,5 +1,6 @@
 import numpy as np
 import sapien
+
 from mani_skill.envs.tasks import PickCubeEnv
 from mani_skill.examples.motionplanning.a1_galaxea.motionplanner import (
     A1GalaxeaMotionPlanningSolver,
@@ -38,6 +39,7 @@ def solve(env: PickCubeEnv, seed=None, debug: bool = False, vis: bool = False):
             f"This solver only supports 'a1_galaxea', but got {env.unwrapped.robot_uids}."
         )
 
+    # Tweak velocity/acceleration limits for more precise trajectories
     planner = A1GalaxeaMotionPlanningSolver(
         env,
         debug=debug,
@@ -45,9 +47,12 @@ def solve(env: PickCubeEnv, seed=None, debug: bool = False, vis: bool = False):
         base_pose=env.unwrapped.agent.robot.pose,
         visualize_target_grasp_pose=vis,
         print_env_info=False,
+        joint_vel_limits=0.5,
+        joint_acc_limits=0.5,
     )
 
-    FINGER_LENGTH = 0.025  # 2.5 cm effective finger depth
+    # Slightly increase finger depth so the cube sits deeper between the pads
+    FINGER_LENGTH = 0.035  # 3.5 cm
     env_unwrapped = env.unwrapped
 
     # ------------------------------------------------------------------
@@ -69,9 +74,10 @@ def solve(env: PickCubeEnv, seed=None, debug: bool = False, vis: bool = False):
     grasp_pose = env.agent.build_grasp_pose(approaching, closing, env.cube.pose.sp.p)
 
     # ------------------------------------------------------------------
-    # 2) Reach pre-grasp (5 cm above)
+    # 2) Reach pre-grasp (3 cm above)
+    #    A1 has shorter reach; a smaller drop distance yields better IK
     # ------------------------------------------------------------------
-    reach_pose = grasp_pose * sapien.Pose([0, 0, -0.05])
+    reach_pose = grasp_pose * sapien.Pose([0, 0, -0.03])
     planner.move_to_pose_with_screw(reach_pose)
 
     # ------------------------------------------------------------------

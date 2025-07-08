@@ -5,6 +5,7 @@ import sapien
 import torch
 
 from mani_skill.agents.robots.panda import PandaWristCam
+from mani_skill.agents.robots.xarm6 import XArm6Robotiq
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.scene import ManiSkillScene
 from mani_skill.envs.utils import randomization
@@ -64,8 +65,8 @@ class PegInsertionSideEnv(BaseEnv):
     """
 
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/PegInsertionSide-v1_rt.mp4"
-    SUPPORTED_ROBOTS = ["panda_wristcam"]
-    agent: Union[PandaWristCam]
+    SUPPORTED_ROBOTS = ["panda_wristcam", "xarm6_robotiq"]
+    agent: Union[PandaWristCam, XArm6Robotiq]
     _clearance = 0.003
 
     def __init__(
@@ -229,8 +230,25 @@ class PegInsertionSideEnv(BaseEnv):
             self.box.set_pose(Pose.create_from_pq(pos, quat))
 
             # Initialize the robot
-            qpos = np.array(
-                [
+            if self.robot_uids == "xarm6_robotiq":
+                # XArm6 has 12 joints (6 arm + 6 gripper)
+                qpos = np.array([
+                    0.0,
+                    0.22,
+                    -1.23,
+                    0.0,
+                    1.01,
+                    0.0,  # 6 arm joints
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,  # 6 gripper joints (open)
+                ])
+            else:
+                # Panda has 9 joints (7 arm + 2 gripper)
+                qpos = np.array([
                     0.0,
                     np.pi / 8,
                     0,
@@ -240,10 +258,12 @@ class PegInsertionSideEnv(BaseEnv):
                     -np.pi / 4,
                     0.04,
                     0.04,
-                ]
-            )
+                ])
             qpos = self._episode_rng.normal(0, 0.02, (b, len(qpos))) + qpos
-            qpos[:, -2:] = 0.04
+            if self.robot_uids == "xarm6_robotiq":
+                qpos[:, -6:] = 0.0  # Keep gripper open
+            else:
+                qpos[:, -2:] = 0.04  # Keep gripper open
             self.agent.robot.set_qpos(qpos)
             self.agent.robot.set_pose(sapien.Pose([-0.615, 0, 0]))
 
@@ -303,9 +323,11 @@ class PegInsertionSideEnv(BaseEnv):
         # Stage 2: Encourage gripper to move close to peg tail and grasp it
         gripper_pos = self.agent.tcp.pose.p
         tgt_gripper_pose = self.peg.pose
-        offset = sapien.Pose(
-            [-0.06, 0, 0]
-        )  # account for panda gripper width with a bit more leeway
+        offset = sapien.Pose([
+            -0.06,
+            0,
+            0,
+        ])  # account for panda gripper width with a bit more leeway
         tgt_gripper_pose = tgt_gripper_pose * (offset)
         gripper_to_peg_dist = torch.linalg.norm(
             gripper_pos - tgt_gripper_pose.p, axis=1

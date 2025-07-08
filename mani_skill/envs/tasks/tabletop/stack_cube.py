@@ -4,7 +4,7 @@ import numpy as np
 import sapien
 import torch
 
-from mani_skill.agents.robots import A1Galaxea, Fetch, Panda
+from mani_skill.agents.robots import A1Galaxea, Fetch, Panda, XArm6Robotiq
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
@@ -32,8 +32,14 @@ class StackCubeEnv(BaseEnv):
     """
 
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/StackCube-v1_rt.mp4"
-    SUPPORTED_ROBOTS = ["panda_wristcam", "panda", "fetch", "a1_galaxea"]
-    agent: Union[Panda, Fetch, A1Galaxea]
+    SUPPORTED_ROBOTS = [
+        "panda_wristcam",
+        "panda",
+        "fetch",
+        "a1_galaxea",
+        "xarm6_robotiq",
+    ]
+    agent: Union[Panda, Fetch, A1Galaxea, XArm6Robotiq]
 
     # Robot-specific configurations for different reach capabilities
     ROBOT_CONFIGS = {
@@ -53,6 +59,11 @@ class StackCubeEnv(BaseEnv):
             # Adjusted for A1 Galaxea's shorter reach (600mm vs Panda's 850mm)
             "cube_half_size": 0.016,  # Smaller cubes (75% of Panda's)
             "cube_spawn_range": 0.16,  # Smaller spawn range [-0.08, 0.08]
+        },
+        "xarm6_robotiq": {
+            # Similar reach to Panda, use standard config
+            "cube_half_size": 0.02,
+            "cube_spawn_range": 0.2,
         },
     }
 

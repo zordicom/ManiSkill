@@ -23,7 +23,7 @@ import torch
 import torch.random
 from transforms3d.euler import euler2quat
 
-from mani_skill.agents.robots import A1Galaxea, Fetch, Panda
+from mani_skill.agents.robots import A1Galaxea, Fetch, Panda, XArm6Robotiq
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common, sapien_utils
@@ -50,10 +50,10 @@ class PushCubeEnv(BaseEnv):
 
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/PushCube-v1_rt.mp4"
 
-    SUPPORTED_ROBOTS = ["panda", "fetch", "a1_galaxea"]
+    SUPPORTED_ROBOTS = ["panda", "fetch", "a1_galaxea", "xarm6_robotiq"]
 
     # Specify some supported robot types
-    agent: Union[Panda, Fetch, A1Galaxea]
+    agent: Union[Panda, Fetch, A1Galaxea, XArm6Robotiq]
 
     # Robot-specific configurations for different reach capabilities
     ROBOT_CONFIGS = {
@@ -75,6 +75,13 @@ class PushCubeEnv(BaseEnv):
             "cube_half_size": 0.016,  # Smaller cube (75% of Panda's)
             "cube_spawn_range": 0.16,  # Smaller spawn range [-0.08, 0.08]
             "goal_distance": 0.16,  # Shorter push distance (0.08 + 0.08)
+        },
+        "xarm6_robotiq": {
+            # Similar reach to Panda, use standard config
+            "goal_radius": 0.1,
+            "cube_half_size": 0.02,
+            "cube_spawn_range": 0.2,
+            "goal_distance": 0.2,
         },
     }
 

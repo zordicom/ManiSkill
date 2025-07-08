@@ -22,7 +22,7 @@ import torch
 from sapien import physx
 
 from mani_skill import PACKAGE_ASSET_DIR
-from mani_skill.agents.robots import A1Galaxea, Panda, PandaWristCam
+from mani_skill.agents.robots import A1Galaxea, Panda, PandaWristCam, XArm6Robotiq
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.tasks.tabletop.bimanual_pick_place_cfgs import (
     BIMANUAL_PICK_PLACE_CONFIG,
@@ -35,7 +35,9 @@ from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils.building import actors
 from mani_skill.utils.geometry.rotation_conversions import quaternion_apply
 from mani_skill.utils.registration import register_env
+from mani_skill.utils.structs import Actor
 from mani_skill.utils.structs.pose import Pose
+from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 
 __all__ = ["PickBoxEnv"]
 
@@ -48,9 +50,10 @@ class PickBoxEnv(BaseEnv):
         "panda",
         "panda_wristcam",
         "a1_galaxea",
+        "xarm6_robotiq",
     ]
 
-    agent: Union[Panda, PandaWristCam, A1Galaxea]
+    agent: Union[Panda, PandaWristCam, A1Galaxea, XArm6Robotiq]
 
     # Task constants (match BimanualPickPlace)
     # Scale factor applied to the STL/OBJ meshes for the b5box asset. The
@@ -83,25 +86,52 @@ class PickBoxEnv(BaseEnv):
     }
 
     # Lighting variation parameters
-    ambient_light_ranges = {
+    ambient_light_ranges = {  # noqa: RUF012
         "min_intensity": (0.2, 0.5),  # Ambient light intensity range
         "max_intensity": (0.8, 1.2),  # Maximum ambient light
     }
 
-    directional_light_ranges = {
+    directional_light_ranges = {  # noqa: RUF012
         "intensity": (2.0, 4.0),  # Directional light intensity
-        "direction_x": (-0.5, 0.5),  # X component of light direction
-        "direction_y": (0.3, 0.7),  # Y component of light direction
-        "direction_z": (-1.0, -0.5),  # Z component (always downward)
+        "direction_x": (-1.0, 1.0),  # X component of light direction (expanded range)
+        "direction_y": (-1.0, 1.0),  # Y component of light direction (expanded range)
+        "direction_z": (
+            -1.0,
+            -0.3,
+        ),  # Z component (always downward, but more variation)
+    }
+
+    # Shadow box parameters for floating overhead obstacle
+    shadow_box_ranges = {  # noqa: RUF012
+        "probability": 0.7,  # 70% chance to spawn shadow box
+        "width": (0.15, 0.35),  # Box width (x-axis)
+        "depth": (0.15, 0.35),  # Box depth (y-axis)
+        "height": (0.02, 0.08),  # Box thickness (z-axis)
+        "x_position": (-0.1, 0.3),  # X position range
+        "y_position": (-0.2, 0.2),  # Y position range
+        "z_height": (1.5, 2.0),  # Height above table surface (1.5-2.0m above table)
+        "rotation": (0, 2 * np.pi),  # Random rotation around Z-axis
     }
 
     # Class variable to track total environments created across all instances
     _total_environments_created = 0
 
+    # B5box asset usage parameters
+    use_real_b5box_probability = (
+        1.0  # 30% chance to use real b5box assets instead of primitive box
+    )
+
     def __init__(
-        self, *args, robot_uids="a1_galaxea", obs_mode="state", verbose=False, **kwargs
+        self,
+        *args,
+        robot_uids="a1_galaxea",
+        obs_mode="state",
+        verbose=False,
+        enable_shadow=True,
+        **kwargs,
     ):
         self.verbose = verbose
+        self.enable_shadow = enable_shadow
         # Resolve to a canonical UID string
         self.robot_uids = robot_uids
         self.robot_type = robot_uids  # alias for config lookup
@@ -118,15 +148,20 @@ class PickBoxEnv(BaseEnv):
             self.goal_thresh = cfg["goal_thresh"]
 
         # Initialize box_half_sizes early to avoid observation space generation errors
-        # This will be updated later in _load_b5box based on the actual box configuration
+        # This will be updated later in _load_b5box based on the actual box configuration per scene
         self.box_half_sizes = [
             self.b5box_half_size,
             self.b5box_half_size,
             self.b5box_half_size,
         ]
 
+        # Will store per-scene box dimensions after scene loading
+        self.per_scene_box_half_sizes = None
+
         # Assets directory (same as bimanual task)
         self.asset_root = PACKAGE_ASSET_DIR / "tasks/a1_pick_place"
+
+        # Note: use_real_b5box will be determined per sub-scene in _load_b5box using _batched_episode_rng
 
         if self.verbose:
             print("PickBox Environment Initialization:")
@@ -135,8 +170,21 @@ class PickBoxEnv(BaseEnv):
             print(f"  Cube half-size: {self.cube_half_size}")
             print(f"  Box half-size: {self.b5box_half_size}")
             print(f"  Goal threshold: {self.goal_thresh}")
+            print(f"  Shadows enabled: {enable_shadow}")
+            print(
+                "  B5box asset type will be randomized per sub-scene (30% real, 70% primitive)"
+            )
+            print(
+                "  Both asset types have physics variation (friction, mass, damping, scale)"
+            )
 
-        super().__init__(*args, robot_uids=robot_uids, obs_mode=obs_mode, **kwargs)
+        super().__init__(
+            *args,
+            robot_uids=robot_uids,
+            obs_mode=obs_mode,
+            enable_shadow=enable_shadow,
+            **kwargs,
+        )
 
         if self.verbose:
             print("  ✓ PickBox Environment initialization complete!")
@@ -155,26 +203,28 @@ class PickBoxEnv(BaseEnv):
             for name, count in expected_features.items():
                 print(f"    {name}: {count} features")
 
-        # Print box dimension summary after initialization
-        if hasattr(self, "_env_creation_count") and self._env_creation_count > 0:
-            print("\n=== Box Dimension Summary ===")
-            print(
-                f"Total environments created so far: {PickBoxEnv._total_environments_created}"
-            )
-            print("Box dimensions should vary by ±30% per environment")
-            print(f"Base box half-size: {self.b5box_half_size}")
-            print(
-                f"Expected range: [{self.b5box_half_size * 0.7:.4f}, {self.b5box_half_size * 1.3:.4f}]"
-            )
-            print(f"Current environment box half-sizes: {self.box_half_sizes}")
+        # Box dimensions are now randomized per sub-scene during _load_b5box
 
-            # Print milestone messages
-            if PickBoxEnv._total_environments_created in [100, 500, 1000, 2500, 5000]:
-                print(
-                    f"*** MILESTONE: {PickBoxEnv._total_environments_created} environments created with randomized box dimensions! ***"
-                )
-
-            print("============================\n")
+    @property
+    def _default_sim_config(self):
+        """Configure GPU memory settings to handle high collision pair requirements."""
+        return SimConfig(
+            gpu_memory_config=GPUMemoryConfig(
+                # Increase found_lost_pairs_capacity to handle the reported requirement
+                # Error indicated need for 127953602 pairs, so we set to 2**27 (134M pairs)
+                found_lost_pairs_capacity=2
+                ** 27,  # 134M pairs (increased from default 2**25)
+                # Increase other memory buffers proportionally for complex scenes
+                max_rigid_patch_count=2
+                ** 20,  # 1M patches (increased from default 2**18)
+                max_rigid_contact_count=2
+                ** 21,  # 2M contacts (increased from default 2**19)
+                # Increase heap capacity for additional memory overhead
+                heap_capacity=2**27,  # 128MB (increased from default 2**26)
+                # Increase temp buffer for memory operations
+                temp_buffer_capacity=2**25,  # 32MB (increased from default 2**24)
+            )
+        )
 
     # ---------------------------------------------------------------------
     # Camera configuration (static top & human render) --------------------
@@ -211,6 +261,78 @@ class PickBoxEnv(BaseEnv):
             100,
         )
 
+    # # ------------------------------------------------------------------
+    # # Curriculum Learning Support -------------------------------------
+    # # ------------------------------------------------------------------
+
+    # def _apply_curriculum_config(self, options: dict) -> dict:
+    #     """Apply curriculum level configuration to the environment.
+
+    #     Args:
+    #         options: Reset options that may contain curriculum configuration
+
+    #     Returns:
+    #         dict: The curriculum configuration applied
+    #     """
+    #     curriculum_config = {}
+
+    #     # Extract curriculum parameters from options
+    #     if "curriculum_level" in options:
+    #         curriculum_config["curriculum_level"] = options["curriculum_level"]
+
+    #     if "max_episode_steps" in options:
+    #         curriculum_config["max_episode_steps"] = options["max_episode_steps"]
+    #         # Note: max_episode_steps is handled by the curriculum wrapper
+
+    #     if "box_dimensions" in options:
+    #         curriculum_config["box_dimensions"] = options["box_dimensions"]
+    #         # Update box dimensions for this episode
+    #         self._update_box_dimensions(options["box_dimensions"])
+
+    #     if "use_real_b5box_probability" in options:
+    #         curriculum_config["use_real_b5box_probability"] = options[
+    #             "use_real_b5box_probability"
+    #         ]
+    #         self.use_real_b5box_probability = options["use_real_b5box_probability"]
+
+    #     if "physics_variation" in options:
+    #         curriculum_config["physics_variation"] = options["physics_variation"]
+    #         # Physics variations are applied during object creation
+
+    #     if "visual_variation" in options:
+    #         curriculum_config["visual_variation"] = options["visual_variation"]
+    #         # Visual variations are applied during lighting setup
+
+    #     if self.verbose and curriculum_config:
+    #         print(f"  Applied curriculum config: {curriculum_config}")
+
+    #     return curriculum_config
+
+    # def _update_box_dimensions(self, box_dimensions: dict):
+    #     """Update box dimensions for curriculum learning.
+
+    #     Args:
+    #         box_dimensions: Dictionary with 'type' and dimension parameters
+    #     """
+    #     if box_dimensions["type"] == "cube":
+    #         # Basic cube - uniform dimensions
+    #         size = box_dimensions.get("size", 0.02)
+    #         self.box_half_sizes = [size, size, size]
+    #     elif box_dimensions["type"] == "non_uniform":
+    #         # Non-uniform cube (x-axis 3x longer)
+    #         base_size = box_dimensions.get("base_size", 0.02)
+    #         x_multiplier = box_dimensions.get("x_multiplier", 3.0)
+    #         self.box_half_sizes = [base_size * x_multiplier, base_size, base_size]
+    #     elif box_dimensions["type"] == "randomized":
+    #         # Randomized dimensions - will be applied per scene in _load_primitive_b5box_for_scene
+    #         base_size = box_dimensions.get("base_size", 0.02)
+    #         self.box_half_sizes = [base_size, base_size, base_size]
+
+    #     # Update per-scene box dimensions if they exist
+    #     if hasattr(self, "per_scene_box_half_sizes") and self.per_scene_box_half_sizes:
+    #         for i in range(len(self.per_scene_box_half_sizes)):
+    #             self.per_scene_box_half_sizes[i] = self.box_half_sizes.copy()
+
     # ------------------------------------------------------------------
     # Scene & robot loading --------------------------------------------
     # ------------------------------------------------------------------
@@ -227,8 +349,16 @@ class PickBoxEnv(BaseEnv):
         self.basket = self._load_basket()
         self.goal_site = self._create_goal_site()
 
-        # Apply lighting variation
-        self._setup_lighting_variation()
+        # Create floating shadow box for more interesting lighting
+        self.shadow_box = self._create_shadow_box()
+
+        # Lighting variation will be applied per-episode in _initialize_episode
+
+    def _load_lighting(self, options: dict):
+        """Override base lighting setup since we handle lighting in _setup_lighting_variation."""
+        # Don't call super()._load_lighting() to avoid default directional lights
+        # Our lighting is set up in _setup_lighting_variation() which is called from _load_scene()
+        pass
 
     # ------------------------------------------------------------------
     # Asset builders ----------------------------------------------------
@@ -269,27 +399,72 @@ class PickBoxEnv(BaseEnv):
         return builder.build_static(name="table")
 
     def _load_b5box(self):
-        """Create a red box with x-axis 3x longer than other dimensions.
+        """Create either a primitive box or load the real b5box asset based on per-sub-scene randomization.
 
-        For simplicity we keep the original variable name (b5box) so that the
-        rest of the task logic remains unchanged.
+        For primitive box: creates a red box with x-axis 3x longer than other dimensions.
+        For real b5box: loads the actual b5box asset files (STL collision + OBJ visual).
+
+        Each sub-scene (parallel environment) gets its own random decision using _batched_episode_rng.
         """
-        # Apply uniform sampling for 10% +/- variability on each dimension
-        x_multiplier = np.random.uniform(0.9, 1.5)
-        y_multiplier = np.random.uniform(0.9, 1.5)
-        z_multiplier = np.random.uniform(0.9, 1.5)
+        # Use batched episode RNG to make consistent decisions across different numbers of parallel environments
+        random_values = self._batched_episode_rng.random()
+        use_real_b5box_decisions = random_values < self.use_real_b5box_probability
 
-        self.box_half_sizes = [
-            3 * self.b5box_half_size * x_multiplier,  # x-axis: 3x longer with variation
-            self.b5box_half_size
-            * y_multiplier,  # y-axis: same as original with variation
-            self.b5box_half_size
-            * z_multiplier,  # z-axis: same as original with variation
-        ]  # [width, depth, height] half-sizes - longer in x
+        # Create separate objects for each sub-scene based on their individual decisions
+        real_b5box_objects = []
+        primitive_b5box_objects = []
 
-        # Create box with base physical material (friction will be randomized per episode)
-        # Apply some friction randomization at the scene level (affects all environments)
-        scene_friction_multiplier = 0.5 + np.random.random()  # [0.5, 1.5]
+        # Store per-scene box dimensions
+        self.per_scene_box_half_sizes = []
+
+        for i in range(self.num_envs):
+            if bool(use_real_b5box_decisions[i]):
+                # Create real b5box for this sub-scene
+                real_obj, real_box_dims = self._load_real_b5box_for_scene(i)
+                real_b5box_objects.append(real_obj)
+                primitive_b5box_objects.append(None)  # placeholder
+                self.per_scene_box_half_sizes.append(real_box_dims)
+            else:
+                # Create primitive box for this sub-scene
+                primitive_obj, primitive_box_dims = (
+                    self._load_primitive_b5box_for_scene(i)
+                )
+                primitive_b5box_objects.append(primitive_obj)
+                real_b5box_objects.append(None)  # placeholder
+                self.per_scene_box_half_sizes.append(primitive_box_dims)
+
+        # Merge all objects (filtering out None placeholders)
+        all_objects = [
+            obj
+            for obj in real_b5box_objects + primitive_b5box_objects
+            if obj is not None
+        ]
+
+        if self.verbose:
+            real_count = sum(use_real_b5box_decisions)
+            primitive_count = self.num_envs - real_count
+            print(
+                f"    B5box asset distribution: {real_count} real, {primitive_count} primitive"
+            )
+            print(
+                "    Both asset types now have physics variation (friction, mass, damping, scale)"
+            )
+
+        return Actor.merge(all_objects, name="cube")
+
+    def _load_real_b5box_for_scene(self, scene_idx: int):
+        """Load the actual b5box object using STL collision file and OBJ visual (matching bimanual approach)."""
+        builder = self.scene.create_actor_builder()
+
+        # Apply physics randomization similar to primitive box
+        # Scale randomization (±10% variation)
+        scale_multiplier = self._batched_episode_rng[scene_idx].uniform(0.9, 1.1)
+        scale = [scale_multiplier, scale_multiplier, scale_multiplier]
+
+        # Friction randomization
+        scene_friction_multiplier = (
+            0.8 + 0.4 * self._batched_episode_rng[scene_idx].random()
+        )  # [0.8, 1.2]
         randomized_static_friction = (
             self.base_static_friction * scene_friction_multiplier
         )
@@ -297,80 +472,191 @@ class PickBoxEnv(BaseEnv):
             self.base_dynamic_friction * scene_friction_multiplier
         )
 
-        self.box_material = physx.PhysxMaterial(
+        box_material = physx.PhysxMaterial(
             static_friction=randomized_static_friction,
             dynamic_friction=randomized_dynamic_friction,
             restitution=0.1,
         )
 
-        # Always print dimension info for first few environments to verify randomization
-        PickBoxEnv._total_environments_created += 1
-        self._env_creation_count = PickBoxEnv._total_environments_created
+        # Mass/density randomization
+        mass_multiplier = (
+            0.8 + 0.4 * self._batched_episode_rng[scene_idx].random()
+        )  # [0.8, 1.2]
+        randomized_density = (
+            500 * mass_multiplier
+        )  # Base density from bimanual environment
 
-        if self._env_creation_count <= 10:
-            print(f"Environment {self._env_creation_count} box dimensions:")
+        # Use STL file for collision (with randomized parameters)
+        collision_file = str(self.asset_root / "b5box/b5box_collision.stl")
+        builder.add_convex_collision_from_file(
+            filename=collision_file,
+            scale=scale,
+            density=randomized_density,
+            material=box_material,
+        )
+
+        # Use visual mesh for rendering (with matching scale)
+        visual_file = str(self.asset_root / "b5box/b5box.obj")
+        builder.add_visual_from_file(
+            filename=visual_file,
+            scale=scale,
+        )
+
+        # Set initial pose to avoid warnings (will be repositioned in episode init)
+        builder.set_initial_pose(sapien.Pose(p=[0, 0, self.b5box_half_size]))
+
+        # Set scene index for this specific sub-scene
+        builder.set_scene_idxs([scene_idx])
+
+        # Build dynamic object
+        cube = builder.build(name=f"cube_{scene_idx}")
+
+        # Apply damping randomization after creation (like primitive box)
+        damping_multiplier = (
+            0.8 + 0.4 * self._batched_episode_rng[scene_idx].random()
+        )  # [0.8, 1.2]
+        randomized_damping = self.base_linear_damping * damping_multiplier
+        cube.linear_damping = randomized_damping
+
+        # Real b5box approximate dimensions scaled by the randomization
+        # The real b5box is approximately 5cm x 2.5cm x 1.5cm (half-sizes)
+        base_real_box_half_sizes = [0.0625, 0.016, 0.024]  # Base dimensions
+        real_box_half_sizes = [
+            base_real_box_half_sizes[0] * scale_multiplier,
+            base_real_box_half_sizes[1] * scale_multiplier,
+            base_real_box_half_sizes[2] * scale_multiplier,
+        ]
+
+        if self.verbose:
+            print("    Using REAL B5BOX ASSETS (with physics variation):")
+            print("      Collision file: b5box_collision.stl")
+            print("      Visual file: b5box.obj")
+            print(f"      Scale multiplier: {scale_multiplier:.3f}")
+            print(
+                f"      Friction multiplier: {scene_friction_multiplier:.3f} (narrowed)"
+            )
+            print(f"      Static friction: {randomized_static_friction:.3f}")
+            print(f"      Dynamic friction: {randomized_dynamic_friction:.3f}")
+            print(f"      Mass multiplier: {mass_multiplier:.3f} (narrowed)")
+            print(f"      Density: {randomized_density:.1f} kg/m³")
+            print(f"      Damping multiplier: {damping_multiplier:.3f} (narrowed)")
+            print(f"      Damping: {randomized_damping:.4f}")
+            print(f"      Scaled half-sizes: {real_box_half_sizes}")
+
+        return cube, real_box_half_sizes
+
+    def _load_primitive_b5box_for_scene(self, scene_idx: int):
+        """Create a primitive red box with x-axis 3x longer than other dimensions (original approach)."""
+        # Apply uniform sampling for 10% +/- variability on each dimension using batched episode RNG
+        x_multiplier = self._batched_episode_rng[scene_idx].uniform(0.9, 1.2)
+        y_multiplier = self._batched_episode_rng[scene_idx].uniform(0.9, 1.2)
+        z_multiplier = self._batched_episode_rng[scene_idx].uniform(0.9, 1.2)
+
+        box_half_sizes = [
+            3 * self.b5box_half_size * x_multiplier,  # x-axis: 3x longer with variation
+            self.b5box_half_size
+            * y_multiplier,  # y-axis: same as original with variation
+            self.b5box_half_size
+            * z_multiplier,  # z-axis: same as original with variation
+        ]  # [width, depth, height] half-sizes - longer in x
+
+        # Create box with base physical material (friction will be randomized per scene)
+        # Apply some friction randomization at the scene level using batched episode RNG
+        scene_friction_multiplier = (
+            0.5 + self._batched_episode_rng[scene_idx].random()
+        )  # [0.5, 1.5]
+        randomized_static_friction = (
+            self.base_static_friction * scene_friction_multiplier
+        )
+        randomized_dynamic_friction = (
+            self.base_dynamic_friction * scene_friction_multiplier
+        )
+
+        box_material = physx.PhysxMaterial(
+            static_friction=randomized_static_friction,
+            dynamic_friction=randomized_dynamic_friction,
+            restitution=0.1,
+        )
+
+        # Print dimension info for first few scenes to verify randomization (only if verbose)
+        if self.verbose and scene_idx < 5:  # Print for first 5 scenes
+            print(f"Scene {scene_idx} box dimensions:")
             print(
                 f"  Multipliers - X: {x_multiplier:.3f}, Y: {y_multiplier:.3f}, Z: {z_multiplier:.3f}"
             )
             print(
-                f"  Final half-sizes: [{self.box_half_sizes[0]:.4f}, {self.box_half_sizes[1]:.4f}, {self.box_half_sizes[2]:.4f}]"
+                f"  Final half-sizes: [{box_half_sizes[0]:.4f}, {box_half_sizes[1]:.4f}, {box_half_sizes[2]:.4f}]"
             )
 
         if self.verbose:
+            print(f"    Using PRIMITIVE BOX for scene {scene_idx}:")
             print(
-                f"    Scene-level friction multiplier: {scene_friction_multiplier:.3f}"
+                f"      Scene-level friction multiplier: {scene_friction_multiplier:.3f}"
             )
-            print(f"    Scene static friction: {randomized_static_friction:.3f}")
-            print(f"    Scene dynamic friction: {randomized_dynamic_friction:.3f}")
-            if self._env_creation_count > 10:  # Avoid duplicate output
-                print("    Dimensional variation multipliers:")
-                print(f"      X-axis (length): {x_multiplier:.3f}")
-                print(f"      Y-axis (width): {y_multiplier:.3f}")
-                print(f"      Z-axis (height): {z_multiplier:.3f}")
-                print(f"    Final box half-sizes: {self.box_half_sizes}")
+            print(f"      Scene static friction: {randomized_static_friction:.3f}")
+            print(f"      Scene dynamic friction: {randomized_dynamic_friction:.3f}")
+            print("      Dimensional variation multipliers:")
+            print(f"        X-axis (length): {x_multiplier:.3f}")
+            print(f"        Y-axis (width): {y_multiplier:.3f}")
+            print(f"        Z-axis (height): {z_multiplier:.3f}")
+            print(f"      Final box half-sizes: {box_half_sizes}")
 
         # Apply mass/density randomization at creation time (±50% variation)
-        mass_multiplier = 0.5 + np.random.random()  # [0.5, 1.5]
+        mass_multiplier = (
+            0.5 + self._batched_episode_rng[scene_idx].random()
+        )  # [0.5, 1.5]
         randomized_density = self.base_density * mass_multiplier
 
-        # Generate random box color
+        # Generate random box color using batched episode RNG
         box_color = [
-            np.random.uniform(*self.box_color_ranges["red"]),
-            np.random.uniform(*self.box_color_ranges["green"]),
-            np.random.uniform(*self.box_color_ranges["blue"]),
-            np.random.uniform(*self.box_color_ranges["alpha"]),
+            self._batched_episode_rng[scene_idx].uniform(*self.box_color_ranges["red"]),
+            self._batched_episode_rng[scene_idx].uniform(
+                *self.box_color_ranges["green"]
+            ),
+            self._batched_episode_rng[scene_idx].uniform(
+                *self.box_color_ranges["blue"]
+            ),
+            self._batched_episode_rng[scene_idx].uniform(
+                *self.box_color_ranges["alpha"]
+            ),
         ]
 
         if self.verbose:
             print(
-                f"    Box color: RGBA({box_color[0]:.3f}, {box_color[1]:.3f}, {box_color[2]:.3f}, {box_color[3]:.3f})"
+                f"      Box color: RGBA({box_color[0]:.3f}, {box_color[1]:.3f}, {box_color[2]:.3f}, {box_color[3]:.3f})"
             )
 
         builder = self.scene.create_actor_builder()
         builder.add_box_collision(
-            half_size=self.box_half_sizes,
-            material=self.box_material,
+            half_size=box_half_sizes,
+            material=box_material,
             density=randomized_density,
         )
         builder.add_box_visual(
-            half_size=self.box_half_sizes,
+            half_size=box_half_sizes,
             material=box_color,  # Use random color instead of hardcoded red
         )
-        builder.set_initial_pose(sapien.Pose(p=[0, 0, self.box_half_sizes[2]]))
-        cube = builder.build(name="cube")
+        builder.set_initial_pose(sapien.Pose(p=[0, 0, box_half_sizes[2]]))
+
+        # Set scene index for this specific sub-scene
+        builder.set_scene_idxs([scene_idx])
+
+        cube = builder.build(name=f"cube_{scene_idx}")
 
         # Apply damping randomization after creation but before GPU initialization
-        damping_multiplier = 0.5 + np.random.random()  # [0.5, 1.5]
+        damping_multiplier = (
+            0.5 + self._batched_episode_rng[scene_idx].random()
+        )  # [0.5, 1.5]
         randomized_damping = self.base_linear_damping * damping_multiplier
         cube.linear_damping = randomized_damping
 
         if self.verbose:
-            print(f"    Creation-time mass multiplier: {mass_multiplier:.3f}")
-            print(f"    Creation-time density: {randomized_density:.1f} kg/m³")
-            print(f"    Creation-time damping multiplier: {damping_multiplier:.3f}")
-            print(f"    Creation-time damping: {randomized_damping:.4f}")
+            print(f"      Creation-time mass multiplier: {mass_multiplier:.3f}")
+            print(f"      Creation-time density: {randomized_density:.1f} kg/m³")
+            print(f"      Creation-time damping multiplier: {damping_multiplier:.3f}")
+            print(f"      Creation-time damping: {randomized_damping:.4f}")
 
-        return cube
+        return cube, box_half_sizes
 
     def _load_basket(self):
         builder = self.scene.create_actor_builder()
@@ -410,6 +696,72 @@ class PickBoxEnv(BaseEnv):
         self._hidden_objects.append(goal_site)
         return goal_site
 
+    def _create_shadow_box(self):
+        """Create a floating rectangular box above the scene to cast shadows."""
+        # Check if we should create a shadow box (70% chance)
+        if np.random.random() > self.shadow_box_ranges["probability"]:
+            if self.verbose:
+                print("    Shadow box: Not created (random variation)")
+            return None
+
+        # Generate random dimensions
+        width = np.random.uniform(*self.shadow_box_ranges["width"])
+        depth = np.random.uniform(*self.shadow_box_ranges["depth"])
+        height = np.random.uniform(*self.shadow_box_ranges["height"])
+
+        # Get table surface height
+        scene_cfg = BIMANUAL_PICK_PLACE_CONFIG["scene"]
+        table_surface_z = (
+            scene_cfg["table"]["pose"].p[..., 2] + scene_cfg["table"]["size"][2]
+        )
+        if hasattr(table_surface_z, "item"):  # Handle tensor case
+            table_surface_z = table_surface_z.item()
+
+        # Generate random position relative to table surface
+        x_pos = np.random.uniform(*self.shadow_box_ranges["x_position"])
+        y_pos = np.random.uniform(*self.shadow_box_ranges["y_position"])
+        z_height_above_table = np.random.uniform(*self.shadow_box_ranges["z_height"])
+        z_pos = float(
+            table_surface_z + z_height_above_table
+        )  # Position relative to table surface
+
+        # Generate random rotation around Z-axis
+        rotation_z = np.random.uniform(*self.shadow_box_ranges["rotation"])
+
+        # Create a semi-transparent dark box
+        shadow_color = [0.2, 0.2, 0.2, 0.6]  # Dark gray, semi-transparent
+
+        builder = self.scene.create_actor_builder()
+        builder.add_box_visual(
+            half_size=[width / 2, depth / 2, height / 2], material=shadow_color
+        )
+
+        # Set pose with random rotation - ensure all values are float
+        quat = [
+            float(np.cos(rotation_z / 2)),
+            0.0,
+            0.0,
+            float(np.sin(rotation_z / 2)),
+        ]  # Rotation around Z-axis
+        builder.set_initial_pose(
+            sapien.Pose(p=[float(x_pos), float(y_pos), float(z_pos)], q=quat)
+        )
+
+        shadow_box = builder.build_kinematic(name="shadow_box")
+
+        if self.verbose:
+            print("    Shadow box created:")
+            print(f"      Dimensions: {width:.3f} x {depth:.3f} x {height:.3f}")
+            print(f"      Position: ({x_pos:.3f}, {y_pos:.3f}, {z_pos:.3f})")
+            print(f"      Height above table: {z_height_above_table:.3f}m")
+            print(
+                f"      Rotation: {rotation_z:.3f} rad ({rotation_z * 180 / np.pi:.1f}°)"
+            )
+
+        # Add to hidden objects so it doesn't interfere with task logic
+        self._hidden_objects.append(shadow_box)
+        return shadow_box
+
     # ------------------------------------------------------------------
     # Episode initialisation -------------------------------------------
     # ------------------------------------------------------------------
@@ -423,6 +775,9 @@ class PickBoxEnv(BaseEnv):
                 print(
                     f"  Environment indices: {env_idx[: min(5, b)].tolist()}"
                 )  # Show first 5
+
+            # Apply curriculum level configuration if provided
+            # curriculum_config = self._apply_curriculum_config(options)
 
             # Home pose ---------------------------------------------------
             home_qpos = ROBOT_CONFIGS[self.robot_type]["right_arm"]["home_qpos"]
@@ -448,21 +803,27 @@ class PickBoxEnv(BaseEnv):
                 box_spawn["center"][1]
                 + (torch.rand((b,)) * 2 - 1) * box_spawn["half_size"][1]
             )
-            box_xyz[:, 2] = table_surface_z + self.b5box_half_size
+            # Use actual box height from per-scene box dimensions
+            if self.per_scene_box_half_sizes is not None:
+                # Use per-scene box dimensions
+                for i, env_id in enumerate(env_idx):
+                    actual_box_height = self.per_scene_box_half_sizes[env_id][
+                        2
+                    ]  # Z-dimension half-size
+                    box_xyz[i, 2] = table_surface_z + actual_box_height
+            else:
+                # Fallback to default (shouldn't happen in normal operation)
+                actual_box_height = self.box_half_sizes[2]  # Z-dimension half-size
+                box_xyz[:, 2] = table_surface_z + actual_box_height
             box_qs = randomization.random_quaternions(b, lock_x=True, lock_y=True)
             self.b5box.set_pose(Pose.create_from_pq(box_xyz, box_qs))
 
-            # Randomise basket position ----------------------------------
+            # Fixed basket position (no randomization) ----------------------------------
             basket_spawn = scene_cfg["basket"]["spawn_region"]
             basket_xyz = torch.zeros((b, 3))
-            basket_xyz[:, 0] = (
-                basket_spawn["center"][0]
-                + (torch.rand((b,)) * 2 - 1) * basket_spawn["half_size"][0]
-            )
-            basket_xyz[:, 1] = (
-                basket_spawn["center"][1]
-                + (torch.rand((b,)) * 2 - 1) * basket_spawn["half_size"][1]
-            )
+            # Use center position without randomization
+            basket_xyz[:, 0] = basket_spawn["center"][0]
+            basket_xyz[:, 1] = basket_spawn["center"][1]
             basket_xyz[:, 2] = table_surface_z + 0.054  # basket bottom height
             # 90° rotation around Z (match original)
             z_rot = torch.tensor(np.pi / 2, device=self.device)
@@ -473,8 +834,17 @@ class PickBoxEnv(BaseEnv):
 
             # Goal site for visualisation ------------------------------
             goal_xyz = basket_xyz.clone()
-            goal_xyz[:, 2] = table_surface_z + 0.15
+            goal_xyz[:, 2] = table_surface_z + 0.25
             self.goal_site.set_pose(Pose.create_from_pq(goal_xyz))
+
+            # Apply per-episode lighting variation
+            self._setup_per_episode_lighting_variation()
+
+            # Initialize transport timer for reward decay mechanism
+            if not hasattr(self, "transport_timer"):
+                self.transport_timer = torch.zeros(self.num_envs, device=self.device)
+            # Reset transport timer for environments being reset
+            self.transport_timer[env_idx] = 0.0
 
             # Physical properties (mass, damping, friction) are randomized at creation time
             # since they cannot be modified after GPU simulation initialization
@@ -484,12 +854,22 @@ class PickBoxEnv(BaseEnv):
                 print(f"    Box position (first env): {box_xyz[0]}")
                 print(f"    Basket position (first env): {basket_xyz[0]}")
                 print(f"    Goal position (first env): {goal_xyz[0]}")
-                print(f"    Box half-sizes for this env: {self.box_half_sizes}")
+                if self.per_scene_box_half_sizes is not None:
+                    print(
+                        f"    Box half-sizes for env 0: {self.per_scene_box_half_sizes[env_idx[0]]}"
+                    )
+                    expected_z = (
+                        table_surface_z + self.per_scene_box_half_sizes[env_idx[0]][2]
+                    )
+                else:
+                    print(f"    Box half-sizes for env 0: {self.box_half_sizes}")
+                    expected_z = table_surface_z + self.box_half_sizes[2]
+
                 print(
                     f"    Box z-placement: {box_xyz[0][2]:.4f} (should be table + box height)"
                 )
                 print(
-                    f"    Expected box z-placement: {(table_surface_z + self.b5box_half_size).item():.4f}"
+                    f"    Expected box z-placement: {expected_z.item() if hasattr(expected_z, 'item') else expected_z:.4f}"
                 )
 
     # ------------------------------------------------------------------
@@ -519,17 +899,7 @@ class PickBoxEnv(BaseEnv):
         dot_product = torch.clamp(dot_product, -1.0, 1.0)
         angle_between_axes = torch.acos(dot_product)
 
-        if self.verbose and hasattr(self, "_verbose_obs_count"):
-            self._verbose_obs_count += 1
-            if self._verbose_obs_count % 100 == 1:  # Print every 100 observations
-                print(f"\nObservation {self._verbose_obs_count} (first env):")
-                print(f"  Box x-axis: {box_x_axis[0]}")
-                print(f"  Gripper x-axis: {gripper_x_axis[0]}")
-                print(
-                    f"  Angle between axes: {angle_between_axes[0].item():.3f} rad ({angle_between_axes[0].item() * 180 / math.pi:.1f}°)"
-                )
-        elif self.verbose:
-            self._verbose_obs_count = 1
+        # Observation debugging removed for performance
 
         obs = dict(
             is_grasped=info["is_grasped"],
@@ -618,10 +988,12 @@ class PickBoxEnv(BaseEnv):
         # Lifting reward: high reward for lifting the box above the table
         # Get table surface height
         scene_cfg = BIMANUAL_PICK_PLACE_CONFIG["scene"]
-        table_pose_z = torch.tensor(
+        table_pose_z = torch.as_tensor(
             scene_cfg["table"]["pose"].p[..., 2], device=self.device
         )
-        table_size_z = torch.tensor(scene_cfg["table"]["size"][2], device=self.device)
+        table_size_z = torch.as_tensor(
+            scene_cfg["table"]["size"][2], device=self.device
+        )
         table_surface_z = table_pose_z + table_size_z
 
         # Calculate how high the box is above the table surface
@@ -643,7 +1015,36 @@ class PickBoxEnv(BaseEnv):
         transport_reward = (
             place_reward * is_grasped.float() * is_lifted_above_threshold.float()
         )
+
+        # Decay transport reward if held too long in place (Option 2)
+        if not hasattr(self, "transport_timer"):
+            self.transport_timer = torch.zeros(self.num_envs, device=self.device)
+
+        is_transporting = (
+            is_grasped & is_lifted_above_threshold & (obj_to_goal_dist < 0.05)
+        )
+        self.transport_timer = torch.where(
+            is_transporting,
+            self.transport_timer + 1,
+            torch.zeros_like(self.transport_timer),
+        )
+
+        # Decay transport reward after holding for too long (20 steps = ~0.4 seconds at 50Hz)
+        transport_decay = torch.clamp(
+            1.0 - self.transport_timer / 20.0, 0.1, 1.0
+        )  # Decay over 20 steps
+        transport_reward = transport_reward * transport_decay
         reward += transport_reward
+
+        # Penalize holding object still when it should be released (Option 1)
+        is_near_goal = obj_to_goal_dist < (self.goal_thresh * 2.0)
+        is_holding_still = (
+            torch.linalg.norm(self.b5box.linear_velocity, axis=1) < 0.1
+        )  # Very still
+        holding_still_penalty = (
+            0.5 * is_grasped.float() * is_near_goal.float() * is_holding_still.float()
+        )
+        reward -= holding_still_penalty
 
         # After release phase: continue rewarding good placement even when not grasped
         # This ensures the robot doesn't lose reward for releasing the object in the right place
@@ -685,22 +1086,32 @@ class PickBoxEnv(BaseEnv):
             gripper_openness = torch.sum(gripper_qpos, dim=-1)
             max_gripper_openness = 0.08  # Panda gripper max opening (~4cm per finger)
         elif self.robot_uids == "a1_galaxea":
-            # For A1 Galaxea, gripper joints are the last 2 joints
-            gripper_qpos = robot_qpos[..., -2:]  # [left_finger, right_finger]
-            # Gripper openness is the sum of finger positions (more open = higher values)
-            # Note: A1 gripper has negative values, so we need to negate for proper openness calculation
-            gripper_openness = torch.sum(-1 * gripper_qpos, dim=-1)
-            max_gripper_openness = -0.01  # A1 gripper max opening
+            # A1 Galaxea gripper is *flipped*: open ≈ -0.01 rad, closed ≈ +0.03 rad (per finger).
+            # Let s = sum(qpos_last_two).  We map s=0.06 → 0 (fully closed) and s=-0.02 →1 (fully open).
+            gripper_qpos = robot_qpos[..., -2:]
+            gripper_qpos_sum = torch.sum(gripper_qpos, dim=-1)
+
+            closed_sum = 0.06  # 0.03 + 0.03  (fully closed)
+            open_sum = -0.02  # -0.01 + -0.01 (fully open)
+            range_sum = closed_sum - open_sum  # 0.08
+
+            gripper_openness = torch.clamp(
+                (closed_sum - gripper_qpos_sum) / range_sum, 0.0, 1.0
+            )
+            # gripper_openness is *already normalized* ∈[0,1]
+            normalized_gripper_openness = gripper_openness  # skip re-normalizing below
+            max_gripper_openness = 1.0  # since already scaled
         else:
             # Fallback for other robots
             gripper_qpos = robot_qpos[..., -2:]
             gripper_openness = torch.sum(gripper_qpos, dim=-1)
             max_gripper_openness = 0.08
 
-        # Normalize gripper openness to [0, 1] range
-        normalized_gripper_openness = torch.clamp(
-            gripper_openness / max_gripper_openness, 0.0, 1.0
-        )
+        # Normalize (for non-A1 robots)
+        if self.robot_uids != "a1_galaxea":
+            normalized_gripper_openness = torch.clamp(
+                gripper_openness / max_gripper_openness, 0.0, 1.0
+            )
 
         # Gripper reward logic based on context
         # Check if object is near goal and at good height (ready for release)
@@ -710,11 +1121,11 @@ class PickBoxEnv(BaseEnv):
 
         # RELEASE REWARD: Encourage releasing when object is well-positioned
         # This is the key addition - reward for opening gripper when near goal
-        release_reward = 2.0 * normalized_gripper_openness * ready_for_release.float()
+        release_reward = 3.0 * normalized_gripper_openness * ready_for_release.float()
         reward += release_reward
 
         # CONTINUED GRASP PENALTY: Penalize keeping gripper closed when ready for release
-        continued_grasp_penalty = (1.0 - normalized_gripper_openness) * 0.5
+        continued_grasp_penalty = (1.0 - normalized_gripper_openness) * 0.6
         reward -= continued_grasp_penalty * ready_for_release.float()
 
         # STANDARD GRIPPER REWARDS (when not ready for release)
@@ -722,12 +1133,12 @@ class PickBoxEnv(BaseEnv):
 
         # Reward open gripper when NOT grasping and NOT ready for release
         should_reward_open_gripper = ~is_grasped & not_ready_for_release
-        open_gripper_reward = normalized_gripper_openness * 0.01
+        open_gripper_reward = normalized_gripper_openness * 0.02
         reward += open_gripper_reward * should_reward_open_gripper.float()
 
         # Penalty for closing gripper when far from object and not grasping
         should_penalize_close_gripper = ~is_grasped & not_ready_for_release
-        premature_close_penalty = (1.0 - normalized_gripper_openness) * 0.3
+        premature_close_penalty = (1.0 - normalized_gripper_openness) * 0.2
         reward -= premature_close_penalty * should_penalize_close_gripper.float()
 
         # Object stability bonus when placed and released
@@ -739,31 +1150,7 @@ class PickBoxEnv(BaseEnv):
             stability_reward * info["is_obj_placed"].float() * (~is_grasped).float()
         )
 
-        # Debug output for release reward (if verbose)
-        if self.verbose and hasattr(self, "_release_debug_count"):
-            self._release_debug_count += 1
-            if self._release_debug_count % 100 == 1:  # Print every 100 steps
-                env_0_ready = ready_for_release[0].item()
-                env_0_near_goal = is_near_goal[0].item()
-                env_0_good_height = is_at_good_height[0].item()
-                env_0_gripper_open = normalized_gripper_openness[0].item()
-                env_0_release_reward = release_reward[0].item()
-                env_0_obj_vel = torch.linalg.norm(self.b5box.linear_velocity[0]).item()
-                env_0_stability_reward = stability_reward[0].item()
-                print(f"\nRelease Debug (step {self._release_debug_count}):")
-                print(f"  Ready for release: {env_0_ready}")
-                print(
-                    f"  Near goal: {env_0_near_goal} (dist: {obj_to_goal_dist[0].item():.3f})"
-                )
-                print(
-                    f"  Good height: {env_0_good_height} (height: {box_height_above_table[0].item():.3f})"
-                )
-                print(f"  Gripper openness: {env_0_gripper_open:.3f}")
-                print(f"  Release reward: {env_0_release_reward:.3f}")
-                print(f"  Object velocity: {env_0_obj_vel:.3f} m/s")
-                print(f"  Stability reward: {env_0_stability_reward:.3f}")
-        elif self.verbose:
-            self._release_debug_count = 1
+        # Debug output for release reward (removed for performance)
 
         # Success bonus
         reward[info["success"]] = 5.0
@@ -779,11 +1166,13 @@ class PickBoxEnv(BaseEnv):
         # - transport_reward: 1.0 (when grasped and lifted)
         # - post_release_reward: 0.5 (when not grasped and lifted)
         # - alignment_reward: 0.1 (when should_reward_tcp_proximity)
-        # - release_reward: 2.0 (when ready for release)
+        # - release_reward: 3.0 (when ready for release)
         # - stability_reward: 1.0 (when object is stable and placed after release)
         # - success_bonus: 5.0
-        # Total max positive reward: 1.0 + 1.0 + 2.0 + 1.0 + 0.5 + 0.1 + 2.0 + 1.0 + 5.0 = 13.6
-        return self.compute_dense_reward(obs, action, info) / 13.6
+        # - holding_still_penalty: -0.5 (when grasped, near goal, and holding still)
+        # Total max positive reward: 1.0 + 1.0 + 2.0 + 1.0 + 0.5 + 0.1 + 3.0 + 1.0 + 5.0 = 14.6
+        # Note: holding_still_penalty reduces reward when robot stabilizes while grasped
+        return self.compute_dense_reward(obs, action, info) / 14.6
 
     def inspect_observation_space(self, verbose=True):
         """Inspect the observation space structure and validate all features are present.
@@ -1013,69 +1402,86 @@ class PickBoxEnv(BaseEnv):
             else:
                 print(f"  Value: {value}")
 
-    def _setup_lighting_variation(self):
-        """Apply randomized ambient and directional lighting to the scene."""
-        # Generate random ambient light intensity
-        ambient_intensity = np.random.uniform(
-            *self.ambient_light_ranges["min_intensity"]
-        )
-        ambient_color = [ambient_intensity, ambient_intensity, ambient_intensity]
-
-        # Set ambient light
-        self.scene.set_ambient_light(ambient_color)
-
-        # Generate random directional light parameters
-        directional_intensity = np.random.uniform(
-            *self.directional_light_ranges["intensity"]
-        )
-        directional_color = [
-            directional_intensity,
-            directional_intensity,
-            directional_intensity,
-        ]
-
-        # Generate random direction (ensure it's always pointing somewhat downward)
-        direction = [
-            np.random.uniform(*self.directional_light_ranges["direction_x"]),
-            np.random.uniform(*self.directional_light_ranges["direction_y"]),
-            np.random.uniform(*self.directional_light_ranges["direction_z"]),
-        ]
-
-        # Add primary directional light with randomized parameters
-        self.scene.add_directional_light(
-            direction=direction,
-            color=directional_color,
-            shadow=self.enable_shadow,
-            shadow_scale=5,
-            shadow_map_size=2048,
-        )
-
-        # Add secondary directional light with different parameters for more realistic lighting
-        secondary_intensity = directional_intensity * 0.6  # 60% of primary intensity
-        secondary_color = [
-            secondary_intensity,
-            secondary_intensity,
-            secondary_intensity,
-        ]
-        secondary_direction = [
-            -direction[0] * 0.5,  # Opposite-ish direction
-            -direction[1] * 0.3,
-            np.random.uniform(-0.8, -0.3),  # Still downward
-        ]
-
-        self.scene.add_directional_light(
-            direction=secondary_direction,
-            color=secondary_color,
-            shadow=False,  # Secondary light doesn't cast shadows
-        )
-
-        if self.verbose:
-            print("    Lighting variation applied:")
-            print(f"      Ambient light: {ambient_color}")
-            print(
-                f"      Primary directional light: {directional_color}, direction: {direction}"
+    def _setup_per_episode_lighting_variation(self):
+        """Apply randomized ambient and directional lighting per episode using torch random functions."""
+        with torch.device(self.device):
+            # Generate random ambient light intensity using torch for GPU compatibility
+            ambient_intensity = (
+                torch.rand(1).item()
+                * (
+                    self.ambient_light_ranges["max_intensity"][1]
+                    - self.ambient_light_ranges["min_intensity"][0]
+                )
+                + self.ambient_light_ranges["min_intensity"][0]
             )
-            print(
-                f"      Secondary directional light: {secondary_color}, direction: {secondary_direction}"
+
+            ambient_color = [ambient_intensity, ambient_intensity, ambient_intensity]
+
+            # Clear existing lights and set new ambient light
+            self.scene.set_ambient_light(ambient_color)
+
+            # Remove existing directional lights
+            # Note: SAPIEN doesn't have a direct way to remove lights, so we'll replace them
+
+            # Generate random directional light parameters using torch
+            directional_intensity = (
+                torch.rand(1).item()
+                * (
+                    self.directional_light_ranges["intensity"][1]
+                    - self.directional_light_ranges["intensity"][0]
+                )
+                + self.directional_light_ranges["intensity"][0]
             )
-            print(f"      Shadows enabled: {self.enable_shadow}")
+
+            directional_color = [
+                directional_intensity,
+                directional_intensity,
+                directional_intensity,
+            ]
+
+            # Generate random direction (ensure it's always pointing somewhat downward)
+            direction = [
+                torch.rand(1).item()
+                * (
+                    self.directional_light_ranges["direction_x"][1]
+                    - self.directional_light_ranges["direction_x"][0]
+                )
+                + self.directional_light_ranges["direction_x"][0],
+                torch.rand(1).item()
+                * (
+                    self.directional_light_ranges["direction_y"][1]
+                    - self.directional_light_ranges["direction_y"][0]
+                )
+                + self.directional_light_ranges["direction_y"][0],
+                torch.rand(1).item()
+                * (
+                    self.directional_light_ranges["direction_z"][1]
+                    - self.directional_light_ranges["direction_z"][0]
+                )
+                + self.directional_light_ranges["direction_z"][0],
+            ]
+
+            # Add single directional light with randomized parameters
+            # Note: This replaces any existing directional lights
+            # COMMENTED OUT: Causes "too many directional lights that cast shadows" error
+            # self.scene.add_directional_light(
+            #     direction=direction,
+            #     color=directional_color,
+            #     shadow=self.enable_shadow,
+            #     shadow_scale=10,  # Larger shadow map coverage
+            #     shadow_map_size=4096,  # Higher resolution shadows
+            # )
+
+            if self.verbose:
+                print("    Per-episode lighting variation applied:")
+                print(f"      Ambient light: {ambient_color}")
+                print(
+                    f"      Directional light: {directional_color}, direction: {direction}"
+                )
+                print(f"      Shadows enabled: {self.enable_shadow}")
+                if self.enable_shadow:
+                    print("      Shadow quality: 4096x4096 map, scale=10")
+                    shadow_objects = "table, box, basket, robot"
+                    if hasattr(self, "shadow_box") and self.shadow_box is not None:
+                        shadow_objects += ", floating shadow box"
+                    print(f"      Shadow-casting objects: {shadow_objects}")

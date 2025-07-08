@@ -5,7 +5,7 @@ import sapien
 import torch
 from transforms3d.euler import euler2quat
 
-from mani_skill.agents.robots import PandaWristCam
+from mani_skill.agents.robots import PandaWristCam, XArm6Robotiq
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
@@ -40,8 +40,8 @@ class PlugChargerEnv(BaseEnv):
     _clearance = 5e-4  # single side clearance
     _receptacle_size = [1e-2, 5e-2, 5e-2]  # receptacle half size
 
-    SUPPORTED_ROBOTS = ["panda_wristcam"]
-    agent: Union[PandaWristCam]
+    SUPPORTED_ROBOTS = ["panda_wristcam", "xarm6_robotiq"]
+    agent: Union[PandaWristCam, XArm6Robotiq]
     SUPPORTED_REWARD_MODES = ["none", "sparse"]
 
     def __init__(
@@ -185,19 +185,17 @@ class PlugChargerEnv(BaseEnv):
 
             # Initialize agent
             if self.agent.uid == "panda_wristcam":
-                qpos = torch.tensor(
-                    [
-                        0.0,
-                        np.pi / 8,
-                        0,
-                        -np.pi * 5 / 8,
-                        0,
-                        np.pi * 3 / 4,
-                        np.pi / 4,
-                        0.04,
-                        0.04,
-                    ]
-                )
+                qpos = torch.tensor([
+                    0.0,
+                    np.pi / 8,
+                    0,
+                    -np.pi * 5 / 8,
+                    0,
+                    np.pi * 3 / 4,
+                    np.pi / 4,
+                    0.04,
+                    0.04,
+                ])
                 qpos = (
                     torch.normal(
                         0,
@@ -208,6 +206,34 @@ class PlugChargerEnv(BaseEnv):
                     + qpos
                 )
                 qpos[:, -2:] = 0.04
+                self.agent.robot.set_qpos(qpos)
+                self.agent.robot.set_pose(sapien.Pose([-0.615, 0, 0]))
+            elif self.agent.uid == "xarm6_robotiq":
+                # XArm6 has 12 joints (6 arm + 6 gripper)
+                qpos = torch.tensor([
+                    0.0,
+                    0.22,
+                    -1.23,
+                    0.0,
+                    1.01,
+                    0.0,  # 6 arm joints
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,  # 6 gripper joints (open)
+                ])
+                qpos = (
+                    torch.normal(
+                        0,
+                        self.robot_init_qpos_noise,
+                        (b, len(qpos)),
+                        device=self.device,
+                    )
+                    + qpos
+                )
+                qpos[:, -6:] = 0.0  # Keep gripper open
                 self.agent.robot.set_qpos(qpos)
                 self.agent.robot.set_pose(sapien.Pose([-0.615, 0, 0]))
 

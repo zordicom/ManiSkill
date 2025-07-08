@@ -32,7 +32,7 @@ PICK_BOX_CONFIGS = {
         "goal_thresh": 0.015,  # Tight threshold like PickCube
         "cube_spawn_half_size": 0.06,
         "cube_spawn_center": (-0.05, 0),
-        "max_goal_height": 0.25,
+        "max_goal_height": 0.3,
         "sensor_cam_eye_pos": [0.25, 0, 0.5],
         "sensor_cam_target_pos": [-0.08, 0, 0.08],
         "human_cam_eye_pos": [0.5, 0.6, 0.5],
@@ -40,5 +40,16 @@ PICK_BOX_CONFIGS = {
         # Override bimanual spawn positions for single-arm use
         "object_spawn_center": [0.1, -0.2],  # Closer to A1 robot
         "goal_spawn_center": [0.1, 0.0],  # Reasonable distance from object
+    },
+    "xarm6_robotiq": {
+        "cube_half_size": 0.02,
+        "goal_thresh": 0.025,
+        "cube_spawn_half_size": 0.1,
+        "cube_spawn_center": (0, 0),
+        "max_goal_height": 0.3,
+        "sensor_cam_eye_pos": [0.3, 0, 0.6],
+        "sensor_cam_target_pos": [-0.1, 0, 0.1],
+        "human_cam_eye_pos": [0.6, 0.7, 0.6],
+        "human_cam_target_pos": [0.0, 0.0, 0.35],
     },
 }

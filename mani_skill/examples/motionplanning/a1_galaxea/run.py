@@ -9,12 +9,16 @@ import gymnasium as gym
 import numpy as np
 from tqdm import tqdm
 
-from mani_skill.examples.motionplanning.a1_galaxea.solutions import solvePickCube
+from mani_skill.examples.motionplanning.a1_galaxea.solutions import (
+    solvePickBox,
+    solvePickCube,
+)
 from mani_skill.trajectory.merge_trajectory import merge_trajectories
 from mani_skill.utils.wrappers.record import RecordEpisode
 
 MP_SOLUTIONS = {
     "PickCube-v1": solvePickCube,
+    "PickBox-v1": solvePickBox,
 }
 
 

@@ -497,7 +497,7 @@
     <axis
       xyz="0.0014394 -1 0" />
     <limit
-      lower="-0.01"
+      lower="-0.03"
       upper="0.025"
       effort="200"
       velocity="0.25" />
@@ -555,10 +555,10 @@
     <axis
       xyz="-0.0014394 1 0" />
     <limit
-      lower="-0.01"
+      lower="-0.03"
       upper="0.025"
-      effort="200"
-      velocity="0.25" />
+      effort="500"
+      velocity="100.0" />
     <mimic joint="gripper1_axis" />
   </joint>
   <link

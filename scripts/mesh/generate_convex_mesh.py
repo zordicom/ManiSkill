@@ -4,7 +4,6 @@ import trimesh
 
 
 def generate_convex_stl(input_stl_path, output_stl_path):
-
     # Load the mesh
     original_mesh = trimesh.load(input_stl_path)
     vertices = original_mesh.vertices
@@ -15,9 +14,9 @@ def generate_convex_stl(input_stl_path, output_stl_path):
     vertex_map = {old_idx: new_idx for new_idx, old_idx in enumerate(hull.vertices)}
 
     # Remap face indices to use new vertex ordering
-    convex_faces = np.array(
-        [[vertex_map[idx] for idx in face] for face in hull.simplices]
-    )
+    convex_faces = np.array([
+        [vertex_map[idx] for idx in face] for face in hull.simplices
+    ])
     convex_mesh = trimesh.Trimesh(vertices=convex_vertices, faces=convex_faces)
 
     # Export as STL
@@ -36,6 +35,7 @@ if __name__ == "__main__":
 
     # Get all .stl and .ply files in the folder
     mesh_files = glob.glob(os.path.join(args.folder, "*.stl"))
+    mesh_files.extend(glob.glob(os.path.join(args.folder, "*.STL")))
     mesh_files.extend(glob.glob(os.path.join(args.folder, "*.ply")))
 
     for input_path in mesh_files:

@@ -116,6 +116,48 @@ ROBOT_CONFIGS = {
             ]),
         },
     },
+    "xarm6_robotiq": {
+        "left_arm": {
+            "pose": Pose.create_from_pq(
+                p=[0, 0.4, 0.82], q=[1, 0, 0, 0]
+            ),  # Left arm position (Y-axis layout, facing +X)
+            "home_qpos": np.array([
+                # XArm6 home pose for left arm (mirrored from right)
+                0.0,  # joint1 (mirrored)
+                0.22,  # joint2
+                -1.23,  # joint3
+                0.0,  # joint4
+                1.01,  # joint5
+                0.0,  # joint6
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,  # 6 gripper joints (open)
+            ]),
+        },
+        "right_arm": {
+            "pose": Pose.create_from_pq(
+                p=[0, -0.4, 0.82], q=[1, 0, 0, 0]
+            ),  # Right arm position (Y-axis layout, facing +X)
+            "home_qpos": np.array([
+                # XArm6 home pose for right arm - using rest keyframe values
+                0.0,  # joint1
+                0.22,  # joint2
+                -1.23,  # joint3
+                0.0,  # joint4
+                1.01,  # joint5
+                0.0,  # joint6
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,  # 6 gripper joints (open)
+            ]),
+        },
+    },
 }
 
 BIMANUAL_PICK_PLACE_CONFIG = {

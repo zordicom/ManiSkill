@@ -44,3 +44,6 @@ imgui.ini
 # testing
 .coverage*
 htmlcov/
+**/runs/*
+*.mp4
+*.ckpt

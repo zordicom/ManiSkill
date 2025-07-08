@@ -35,19 +35,20 @@ class A1Galaxea(BaseAgent):
             ),
         ),
     )
+    disable_self_collisions = True
 
     keyframes = dict(  # noqa: RUF012
         rest=Keyframe(
-            qpos=np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            qpos=np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
             pose=sapien.Pose(),
         ),
         extended=Keyframe(
-            qpos=np.array([0.0, 0.5, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            qpos=np.array([0.0, 0.5, -0.5, 0.0, 0.0, 0.0, 0.0]),
             pose=sapien.Pose(),
         ),
         home=Keyframe(
             # Home pose from simple_task project: [42.0, 45.0, -48.0, 80.0, -35.0, 15.0] degrees
-            # Convert to radians for the 6 arm joints + 2 gripper joints (0.02 for parallel gripper)
+            # Convert to radians for the 6 arm joints + 1 gripper joint (master only)
             qpos=np.array([
                 np.deg2rad(42.0),  # arm_joint1
                 np.deg2rad(45.0),  # arm_joint2
@@ -55,8 +56,7 @@ class A1Galaxea(BaseAgent):
                 np.deg2rad(80.0),  # arm_joint4
                 np.deg2rad(-35.0),  # arm_joint5
                 np.deg2rad(15.0),  # arm_joint6
-                -0.01,  # gripper1_axis (open)
-                -0.01,  # gripper2_axis (mimic)
+                -0.03,  # gripper1_axis (open, gripper2_axis will follow via mimic)
             ]),
             pose=sapien.Pose(),
         ),
@@ -72,7 +72,6 @@ class A1Galaxea(BaseAgent):
     ]
     gripper_joint_names = [  # noqa: RUF012
         "gripper1_axis",
-        "gripper2_axis",
     ]
     ee_link_name = "tcp"
 
@@ -185,14 +184,14 @@ class A1Galaxea(BaseAgent):
         # -------------------------------------------------------------------------- #
         # Gripper
         # -------------------------------------------------------------------------- #
-        gripper_pd_joint_pos = PDJointPosMimicControllerConfig(
+        gripper_pd_joint_pos = PDJointPosControllerConfig(
             self.gripper_joint_names,
-            lower=0.0,
-            upper=0.03,
+            lower=-0.03,
+            upper=0.025,
             stiffness=self.gripper_stiffness,
             damping=self.gripper_damping,
             force_limit=self.gripper_force_limit,
-            mimic={"gripper2_axis": {"joint": "gripper1_axis"}},
+            normalize_action=False,
         )
 
         controller_configs = dict(

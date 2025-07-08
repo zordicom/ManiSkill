@@ -1,11 +1,7 @@
-import argparse
-
-import gymnasium as gym
 import numpy as np
 import sapien
-from transforms3d.euler import euler2quat
 
-from mani_skill.envs.tasks import StackCubeEnv
+from mani_skill.envs.tasks.tabletop.pick_box import PickBoxEnv
 from mani_skill.examples.motionplanning.panda.utils import (
     compute_grasp_info_by_obb,
     get_actor_obb,
@@ -14,15 +10,11 @@ from mani_skill.examples.motionplanning.xarm6.motionplanner import (
     XArm6PandaGripperMotionPlanningSolver,
     XArm6RobotiqMotionPlanningSolver,
 )
-from mani_skill.utils.wrappers.record import RecordEpisode
 
 
-def solve(env: StackCubeEnv, seed=None, debug=False, vis=False):
+def solve(env: PickBoxEnv, seed=None, debug=False, vis=False):
     env.reset(seed=seed)
-    assert env.unwrapped.control_mode in [
-        "pd_joint_pos",
-        "pd_joint_pos_vel",
-    ], env.unwrapped.control_mode
+
     if env.unwrapped.robot_uids == "xarm6_robotiq":
         planner_cls = XArm6RobotiqMotionPlanningSolver
     elif env.unwrapped.robot_uids == "xarm6_pandagripper":
@@ -37,12 +29,19 @@ def solve(env: StackCubeEnv, seed=None, debug=False, vis=False):
         visualize_target_grasp_pose=vis,
         print_env_info=False,
     )
+
     FINGER_LENGTH = 0.025
     env = env.unwrapped
-    obb = get_actor_obb(env.cubeA)
+
+    # retrieves the object oriented bounding box (trimesh box object)
+    obb = get_actor_obb(env.b5box)
 
     approaching = np.array([0, 0, -1])
-    target_closing = env.agent.tcp.pose.to_transformation_matrix()[0, :3, 1].numpy()
+    # get transformation matrix of the tcp pose, is default batched and on torch
+    target_closing = (
+        env.agent.tcp.pose.to_transformation_matrix()[0, :3, 1].cpu().numpy()
+    )
+    # we can build a simple grasp pose using this information
     grasp_info = compute_grasp_info_by_obb(
         obb,
         approaching=approaching,
@@ -50,22 +49,7 @@ def solve(env: StackCubeEnv, seed=None, debug=False, vis=False):
         depth=FINGER_LENGTH,
     )
     closing, center = grasp_info["closing"], grasp_info["center"]
-    grasp_pose = env.agent.build_grasp_pose(approaching, closing, center)
-
-    # Search a valid pose
-    angles = np.arange(0, np.pi * 2 / 3, np.pi / 2)
-    angles = np.repeat(angles, 2)
-    angles[1::2] *= -1
-    for angle in angles:
-        delta_pose = sapien.Pose(q=euler2quat(0, 0, angle))
-        grasp_pose2 = grasp_pose * delta_pose
-        res = planner.move_to_pose_with_RRTStar(grasp_pose2, dry_run=True)
-        if res == -1:
-            continue
-        grasp_pose = grasp_pose2
-        break
-    else:
-        print("Fail to find a valid grasp pose")
+    grasp_pose = env.agent.build_grasp_pose(approaching, closing, env.b5box.pose.sp.p)
 
     # -------------------------------------------------------------------------- #
     # Reach
@@ -80,21 +64,27 @@ def solve(env: StackCubeEnv, seed=None, debug=False, vis=False):
     planner.close_gripper()
 
     # -------------------------------------------------------------------------- #
-    # Lift
+    # Move to basket - three stage approach: lift → move → drop
     # -------------------------------------------------------------------------- #
-    lift_pose = sapien.Pose([0, 0, 0.1]) * grasp_pose
-    planner.move_to_pose_with_screw(lift_pose)
+    # Stage 1: Lift the box 15cm straight up from current position
+    current_pos = env.agent.tcp.pose.p.cpu().numpy().flatten()
+    lift_pose = sapien.Pose(current_pos + np.array([0, 0, 0.15]), grasp_pose.q)
+    planner.move_to_pose_with_RRTStar(lift_pose)
 
-    # -------------------------------------------------------------------------- #
-    # Stack
-    # -------------------------------------------------------------------------- #
-    goal_pose = env.cubeB.pose * sapien.Pose([0, 0, env.cube_half_size * 2])
-    offset = (goal_pose.p - env.cubeA.pose.p).numpy()[
-        0
-    ]  # remember that all data in ManiSkill is batched and a torch tensor
-    align_pose = sapien.Pose(lift_pose.p + offset, lift_pose.q)
-    planner.move_to_pose_with_RRTStar(align_pose)
+    # Stage 2: Move horizontally to above the basket (maintaining 15cm height)
+    basket_pose = env.basket.pose
+    basket_pos = (
+        basket_pose.p.cpu().numpy().flatten()
+        if hasattr(basket_pose.p, "cpu")
+        else basket_pose.p
+    )
+    above_basket_pose = sapien.Pose(basket_pos + np.array([0, 0, 0.15]), grasp_pose.q)
+    planner.move_to_pose_with_RRTStar(above_basket_pose)
 
-    res = planner.open_gripper()
+    # Stage 3: Drop down into the basket and release
+    place_pose = sapien.Pose(basket_pos + np.array([0, 0, 0.05]), grasp_pose.q)
+    res = planner.move_to_pose_with_RRTStar(place_pose)
+    planner.open_gripper()
+
     planner.close()
     return res

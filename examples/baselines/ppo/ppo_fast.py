@@ -266,6 +266,22 @@ def rollout(obs, done):
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, reward, next_done, infos = step_func(action)
 
+        # ================= NaN / Inf Guard =================
+        if torch.isnan(next_obs).any() or torch.isinf(next_obs).any():
+            bad_mask = torch.isnan(next_obs).any(dim=1) | torch.isinf(next_obs).any(
+                dim=1
+            )
+            bad_indices = bad_mask.nonzero(as_tuple=True)[0]
+            print(f"[NaN/Inf detected] Resetting env indices: {bad_indices}")
+            try:
+                reset_obs, _ = envs.reset(env_ids=bad_indices)
+            except TypeError:
+                # Fallback: full reset if partial reset not supported
+                reset_obs, _ = envs.reset()
+            next_obs[bad_mask] = reset_obs
+            next_done[bad_mask] = False
+        # ====================================================
+
         if "final_info" in infos:
             final_info = infos["final_info"]
             done_mask = infos["_final_info"]
