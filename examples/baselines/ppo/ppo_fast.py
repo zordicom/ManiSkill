@@ -5,6 +5,12 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
+# Expert+Residual wrapper utility
+try:
+    from util import create_expert_residual_envs
+except ImportError:
+    create_expert_residual_envs = None
+
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 
 import math
@@ -130,6 +136,20 @@ class Args:
     reward_scale: float = 1.0
     """Scale the reward by this factor"""
     finite_horizon_gae: bool = False
+
+    # Expert+Residual parameters (optional)
+    expert_type: str = "none"
+    """type of expert policy: 'none' (regular PPO), 'zero', 'ik', 'model'"""
+    residual_scale: float = 1.0
+    """scale factor for residual actions"""
+    expert_action_noise: float = 0.0
+    """Gaussian noise std to add to expert actions"""
+    track_action_stats: bool = False
+    """whether to track expert/residual action statistics"""
+    ik_gain: float = 2.0
+    """proportional gain for IK expert policy"""
+    model_path: Optional[str] = None
+    """path to pre-trained model for model expert policy"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -520,29 +540,42 @@ if __name__ == "__main__":
         if args.verbose:
             print(f"Using table origin coordinate system: {args.use_table_origin}")
 
-    envs = gym.make(
-        args.env_id,
-        num_envs=args.num_envs if not args.evaluate else 1,
-        reconfiguration_freq=args.reconfiguration_freq,
-        **env_kwargs,
-    )
-
-    if args.verbose:
-        print(f"Created training environment: {args.env_id}")
-        print(f"Environment kwargs: {env_kwargs}")
+    # Create environments conditionally based on expert mode
+    if args.expert_type != "none":
         print(
-            f"Number of training environments: {args.num_envs if not args.evaluate else 1}"
+            f"Creating Expert+Residual environments with expert type: {args.expert_type}"
         )
-    eval_envs = gym.make(
-        args.env_id,
-        num_envs=args.num_eval_envs,
-        reconfiguration_freq=args.eval_reconfiguration_freq,
-        human_render_camera_configs=dict(shader_pack="default"),
-        **env_kwargs,
-    )
-    if isinstance(envs.action_space, gym.spaces.Dict):
-        envs = FlattenActionSpaceWrapper(envs)
-        eval_envs = FlattenActionSpaceWrapper(eval_envs)
+        if create_expert_residual_envs is None:
+            raise ImportError(
+                "Expert+Residual wrapper not available. Please ensure util.py is importable."
+            )
+        envs, eval_envs = create_expert_residual_envs(args, env_kwargs, device)
+    else:
+        envs = gym.make(
+            args.env_id,
+            num_envs=args.num_envs if not args.evaluate else 1,
+            reconfiguration_freq=args.reconfiguration_freq,
+            **env_kwargs,
+        )
+
+        if args.verbose:
+            print(f"Created training environment: {args.env_id}")
+            print(f"Environment kwargs: {env_kwargs}")
+            print(
+                f"Number of training environments: {args.num_envs if not args.evaluate else 1}"
+            )
+        eval_envs = gym.make(
+            args.env_id,
+            num_envs=args.num_eval_envs,
+            reconfiguration_freq=args.eval_reconfiguration_freq,
+            human_render_camera_configs=dict(shader_pack="default"),
+            **env_kwargs,
+        )
+
+        # Flatten action space for regular envs if needed
+        if isinstance(envs.action_space, gym.spaces.Dict):
+            envs = FlattenActionSpaceWrapper(envs)
+            eval_envs = FlattenActionSpaceWrapper(eval_envs)
     if args.capture_video or args.save_trajectory:
         eval_output_dir = f"runs/{run_name}/videos"
         if args.evaluate:
@@ -634,7 +667,19 @@ if __name__ == "__main__":
         print("Running evaluation")
     n_act = math.prod(envs.single_action_space.shape)
 
-    n_obs = math.prod(envs.single_observation_space.shape)
+    # Handle both Box and Dict observation spaces
+    if isinstance(envs.single_observation_space, gym.spaces.Box):
+        n_obs = math.prod(envs.single_observation_space.shape)
+    elif isinstance(envs.single_observation_space, gym.spaces.Dict):
+        # For dict observations, compute flattened size
+        n_obs = 0
+        for key, space in envs.single_observation_space.spaces.items():
+            if isinstance(space, gym.spaces.Box):
+                n_obs += math.prod(space.shape)
+    else:
+        raise ValueError(
+            f"Unsupported observation space type: {type(envs.single_observation_space)}"
+        )
 
     if args.verbose:
         print(f"\nObservation space: {envs.single_observation_space}")

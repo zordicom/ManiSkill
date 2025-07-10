@@ -44,6 +44,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 import wandb
 
+# Expert+Residual wrapper utility
+try:
+    from util import create_expert_residual_envs
+except ImportError:
+    create_expert_residual_envs = None
+
 # Set optimization flags
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 
@@ -157,6 +163,20 @@ class Args:
     """whether to use torch.compile."""
     cudagraphs: bool = False
     """whether to use cudagraphs on top of compile."""
+
+    # Expert+Residual parameters (optional)
+    expert_type: str = "none"
+    """type of expert policy: 'none' (regular PPO), 'zero', 'ik', 'model'"""
+    residual_scale: float = 1.0
+    """scale factor for residual actions"""
+    expert_action_noise: float = 0.0
+    """Gaussian noise std to add to expert actions"""
+    track_action_stats: bool = False
+    """whether to track expert/residual action statistics"""
+    ik_gain: float = 2.0
+    """proportional gain for IK expert policy"""
+    model_path: Optional[str] = None
+    """path to pre-trained model for model expert policy"""
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -588,29 +608,41 @@ if __name__ == "__main__":
     if args.robot_uids is not None:
         env_kwargs["robot_uids"] = args.robot_uids
 
-    envs = gym.make(
-        args.env_id,
-        num_envs=args.num_envs if not args.evaluate else 1,
-        reconfiguration_freq=args.reconfiguration_freq,
-        **env_kwargs,
-    )
-    eval_envs = gym.make(
-        args.env_id,
-        num_envs=args.num_eval_envs,
-        reconfiguration_freq=args.eval_reconfiguration_freq,
-        human_render_camera_configs=dict(shader_pack="default"),
-        **env_kwargs,
-    )
+    # Create environments conditionally based on expert mode
+    if args.expert_type != "none":
+        print(
+            f"Creating Expert+Residual environments with expert type: {args.expert_type}"
+        )
+        if create_expert_residual_envs is None:
+            raise ImportError(
+                "Expert+Residual wrapper not available. Please ensure util.py is importable."
+            )
+        envs, eval_envs = create_expert_residual_envs(args, env_kwargs, device)
+    else:
+        # Regular environments
+        envs = gym.make(
+            args.env_id,
+            num_envs=args.num_envs if not args.evaluate else 1,
+            reconfiguration_freq=args.reconfiguration_freq,
+            **env_kwargs,
+        )
+        eval_envs = gym.make(
+            args.env_id,
+            num_envs=args.num_eval_envs,
+            reconfiguration_freq=args.eval_reconfiguration_freq,
+            human_render_camera_configs=dict(shader_pack="default"),
+            **env_kwargs,
+        )
 
-    # Apply observation and action space wrappers
-    envs = FlattenRGBDObservationWrapper(envs, rgb=True, state=args.include_state)
-    eval_envs = FlattenRGBDObservationWrapper(
-        eval_envs, rgb=True, state=args.include_state
-    )
+        # Apply observation and action space wrappers for regular envs only
+        envs = FlattenRGBDObservationWrapper(envs, rgb=True, state=args.include_state)
+        eval_envs = FlattenRGBDObservationWrapper(
+            eval_envs, rgb=True, state=args.include_state
+        )
 
-    if isinstance(envs.action_space, gym.spaces.Dict):
-        envs = FlattenActionSpaceWrapper(envs)
-        eval_envs = FlattenActionSpaceWrapper(eval_envs)
+        if isinstance(envs.action_space, gym.spaces.Dict):
+            envs = FlattenActionSpaceWrapper(envs)
+            eval_envs = FlattenActionSpaceWrapper(eval_envs)
 
     # Recording setup
     if args.capture_video or args.save_trajectory:

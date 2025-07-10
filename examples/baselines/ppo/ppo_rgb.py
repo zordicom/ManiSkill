@@ -24,6 +24,12 @@ from torch import nn, optim
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
+# Import expert environment creation utility
+try:
+    from util import create_expert_residual_envs
+except ImportError:
+    create_expert_residual_envs = None
+
 
 @dataclass
 class Args:
@@ -114,6 +120,20 @@ class Args:
     save_train_video_freq: Optional[int] = None
     """frequency to save training videos in terms of iterations"""
     finite_horizon_gae: bool = False
+
+    # Expert+Residual parameters (optional)
+    expert_type: str = "none"
+    """type of expert policy: 'none' (regular PPO), 'zero', 'ik', 'model'"""
+    residual_scale: float = 1.0
+    """scale factor for residual actions"""
+    expert_action_noise: float = 0.0
+    """Gaussian noise std to add to expert actions"""
+    track_action_stats: bool = False
+    """whether to track expert/residual action statistics"""
+    ik_gain: float = 2.0
+    """proportional gain for IK expert policy"""
+    model_path: Optional[str] = None
+    """path to pre-trained model for model expert policy"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -345,30 +365,46 @@ if __name__ == "__main__":
         env_kwargs["control_mode"] = args.control_mode
     if args.robot_uids is not None:
         env_kwargs["robot_uids"] = args.robot_uids
-    eval_envs = gym.make(
-        args.env_id,
-        num_envs=args.num_eval_envs,
-        reconfiguration_freq=args.eval_reconfiguration_freq,
-        **env_kwargs,
-    )
-    envs = gym.make(
-        args.env_id,
-        num_envs=args.num_envs if not args.evaluate else 1,
-        reconfiguration_freq=args.reconfiguration_freq,
-        **env_kwargs,
-    )
 
-    # rgbd obs mode returns a dict of data, we flatten it so there is just a rgbd key and state key
-    envs = FlattenRGBDObservationWrapper(
-        envs, rgb=True, depth=False, state=args.include_state
-    )
-    eval_envs = FlattenRGBDObservationWrapper(
-        eval_envs, rgb=True, depth=False, state=args.include_state
-    )
+    # Create environments conditionally based on expert mode
+    if args.expert_type != "none":
+        print(
+            f"Creating Expert+Residual environments with expert type: {args.expert_type}"
+        )
+        if create_expert_residual_envs is None:
+            raise ImportError(
+                "Expert+Residual wrapper not available. Please ensure the expert_residual wrapper is installed."
+            )
+        envs, eval_envs = create_expert_residual_envs(args, env_kwargs, device)
+    else:
+        print("Creating regular environments")
+        eval_envs = gym.make(
+            args.env_id,
+            num_envs=args.num_eval_envs,
+            reconfiguration_freq=args.eval_reconfiguration_freq,
+            **env_kwargs,
+        )
+        envs = gym.make(
+            args.env_id,
+            num_envs=args.num_envs if not args.evaluate else 1,
+            reconfiguration_freq=args.reconfiguration_freq,
+            **env_kwargs,
+        )
 
-    if isinstance(envs.action_space, gym.spaces.Dict):
-        envs = FlattenActionSpaceWrapper(envs)
-        eval_envs = FlattenActionSpaceWrapper(eval_envs)
+    # Apply observation and action wrappers only for regular environments
+    # Expert environments handle their own observation formatting
+    if args.expert_type == "none":
+        # rgbd obs mode returns a dict of data, we flatten it so there is just a rgbd key and state key
+        envs = FlattenRGBDObservationWrapper(
+            envs, rgb=True, depth=False, state=args.include_state
+        )
+        eval_envs = FlattenRGBDObservationWrapper(
+            eval_envs, rgb=True, depth=False, state=args.include_state
+        )
+
+        if isinstance(envs.action_space, gym.spaces.Dict):
+            envs = FlattenActionSpaceWrapper(envs)
+            eval_envs = FlattenActionSpaceWrapper(eval_envs)
     if args.capture_video:
         eval_output_dir = f"runs/{run_name}/videos"
         if args.evaluate:
