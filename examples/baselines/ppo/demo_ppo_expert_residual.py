@@ -20,15 +20,19 @@ from typing import Dict, List
 # Path to the reference PPO training script. We deduce it relative to this file
 PPO_SCRIPT = Path(__file__).resolve().parent / "ppo.py"
 # Experiment parameters requested by the user
-TOTAL_TIMESTEPS = 50_000  # shorter runs for quick sanity checks
+TOTAL_TIMESTEPS = 100_000  # shorter runs for quick sanity checks
 
 # Default parallel environment counts (can be overridden per experiment)
 DEFAULT_NUM_ENVS_STATE = 256
 DEFAULT_NUM_ENVS_RGB = 32
 
-# Regex to capture evaluation metrics printed by `ppo.py`.
-# Expected format: "eval_<metric_name>_mean=<value>"
-EVAL_LINE_RE = re.compile(r"eval_(\w+)_mean=([0-9eE+\.\-]+)")
+# The evaluation scripts may print values as plain floats (e.g. ``eval_reward_mean=0.12``)
+# or as PyTorch scalars (e.g. ``eval_reward_mean=tensor(0.12, device='cuda:0')``).
+# The regex below captures *both* patterns by optionally matching the ``tensor(" prefix
+# and grabbing the first numeric token that appears.
+EVAL_LINE_RE = re.compile(
+    r"eval_(\w+)_mean=(?:tensor\()?([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+)
 
 # Metrics we care about from stdout (the key between "eval_" and "_mean")
 METRICS_OF_INTEREST = ["success_once", "reward"]
@@ -117,7 +121,7 @@ def run_experiment(cfg: ExperimentConfig, dry_run: bool = False) -> ExperimentRe
         f"--expert-type={cfg.expert_type}",
         f"--num-envs={cfg.num_envs}",
         f"--total-timesteps={TOTAL_TIMESTEPS}",
-        "--eval-freq=1",  # Evaluate every iteration so we always capture metrics.
+        "--eval-freq=2",  # Evaluate every iteration so we always capture metrics.
         "--no-capture-video",
         "--no-save-model",
         "--no-track",
