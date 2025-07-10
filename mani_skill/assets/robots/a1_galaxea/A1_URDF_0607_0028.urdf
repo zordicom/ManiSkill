@@ -627,4 +627,15 @@
     <child
       link="tcp" />
   </joint>
+
+  <link name="tool_tip"/>
+  <joint name="tool_tip_joint" type="fixed">
+    <origin
+      xyz="0 0 0.018"
+      rpy="0 0 0" />
+    <parent
+      link="tcp" />
+    <child
+      link="tool_tip" />
+  </joint>
 </robot>

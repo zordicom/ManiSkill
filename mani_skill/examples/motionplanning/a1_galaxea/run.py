@@ -105,19 +105,34 @@ def parse_args():
 
 
 def _main(args, proc_id: int = 0, start_seed: int = 0) -> str:
-    env = gym.make(
-        args.env_id,
-        robot_uids="a1_galaxea",
-        obs_mode=args.obs_mode,
-        reward_mode=args.reward_mode,
-        control_mode="pd_joint_pos",
-        render_mode=args.render_mode,
-        sensor_configs=dict(shader_pack=args.shader),
-        human_render_camera_configs=dict(shader_pack=args.shader),
-        viewer_camera_configs=dict(shader_pack=args.shader),
-        sim_backend=args.sim_backend,
-    )
+    # Use bimanual environment for A1 Galaxea where supported
+    if args.env_id == "PickBox-v1":
+        env_id = "PickBoxBimanual-v1"
+        bimanual = True
+    else:
+        env_id = args.env_id
+        bimanual = False
 
+    # Create environment with appropriate parameters
+    env_kwargs = {
+        "robot_uids": "a1_galaxea",
+        "obs_mode": args.obs_mode,
+        "reward_mode": args.reward_mode,
+        "control_mode": "pd_joint_pos",
+        "render_mode": args.render_mode,
+        "sensor_configs": dict(shader_pack=args.shader),
+        "human_render_camera_configs": dict(shader_pack=args.shader),
+        "viewer_camera_configs": dict(shader_pack=args.shader),
+        "sim_backend": args.sim_backend,
+    }
+
+    # Only add bimanual parameter for environments that support it
+    if bimanual:
+        env_kwargs["bimanual"] = bimanual
+
+    env = gym.make(env_id, **env_kwargs)
+
+    # Use the same solver for both single-arm and bimanual versions
     solve_fn = MP_SOLUTIONS[args.env_id]
 
     if not args.traj_name:
@@ -127,19 +142,25 @@ def _main(args, proc_id: int = 0, start_seed: int = 0) -> str:
     if args.num_procs > 1:
         traj_basename = f"{traj_basename}.{proc_id}"
 
-    env = RecordEpisode(
-        env,
-        output_dir=osp.join(args.record_dir, args.env_id, "motionplanning"),
-        trajectory_name=traj_basename,
-        save_video=args.save_video,
-        source_type="motionplanning",
-        source_desc="Official A1 Galaxea motion-planning solution (ManiSkill)",
-        video_fps=30,
-        record_reward=False,
-        save_on_reset=False,
-    )
+        # Use appropriate directory name for bimanual vs single-arm
+    output_env_name = env_id if bimanual else args.env_id
+    source_desc = f"Official A1 Galaxea motion-planning solution ({'Bimanual' if bimanual else 'Single-arm'}) (ManiSkill)"
 
-    output_h5 = env._h5_file.filename
+    # Skip recording for bimanual mode due to dict action space compatibility issues
+    if not bimanual:
+        env = RecordEpisode(
+            env,
+            output_dir=osp.join(args.record_dir, output_env_name, "motionplanning"),
+            trajectory_name=traj_basename,
+            save_video=args.save_video,
+            source_type="motionplanning",
+            source_desc=source_desc,
+            video_fps=30,
+            record_reward=False,
+            save_on_reset=False,
+        )
+
+    output_h5 = env._h5_file.filename if hasattr(env, "_h5_file") else None
     successes = []
     episode_lengths = []
 
@@ -152,8 +173,10 @@ def _main(args, proc_id: int = 0, start_seed: int = 0) -> str:
             episode_lengths.append(res[-1]["elapsed_steps"].item())
         successes.append(success)
 
-        env.flush_trajectory()
-        if args.save_video:
+        # Only flush if recording is enabled (single-arm mode)
+        if hasattr(env, "flush_trajectory"):
+            env.flush_trajectory()
+        if args.save_video and hasattr(env, "flush_video"):
             env.flush_video()
 
     print(

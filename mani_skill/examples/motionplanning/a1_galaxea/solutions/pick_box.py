@@ -36,16 +36,26 @@ def solve(env: PickBoxEnv, seed=None, debug: bool = False, vis: bool = False):
     """
     env.reset(seed=seed)
 
-    if env.unwrapped.robot_uids != "a1_galaxea":
+    # Support both single-arm and bimanual A1 Galaxea
+    robot_uids = env.unwrapped.robot_uids
+    if robot_uids != "a1_galaxea" and robot_uids != ("a1_galaxea", "a1_galaxea"):
         raise ValueError(
-            f"This solver only supports 'a1_galaxea', but got {env.unwrapped.robot_uids}."
+            f"This solver only supports 'a1_galaxea' (single-arm) or ('a1_galaxea', 'a1_galaxea') (bimanual), but got {robot_uids}."
         )
+
+    # Get robot pose - handle both single-arm and bimanual modes
+    if hasattr(env.unwrapped.agent, "robot"):
+        # Single-arm mode
+        base_pose = env.unwrapped.agent.robot.pose
+    else:
+        # Bimanual mode - use right arm (active agent, index 1)
+        base_pose = env.unwrapped.agent.agents[1].robot.pose
 
     planner = A1GalaxeaMotionPlanningSolver(
         env,
         debug=debug,
         vis=vis,
-        base_pose=env.unwrapped.agent.robot.pose,
+        base_pose=base_pose,
         visualize_target_grasp_pose=vis,
         print_env_info=False,
     )
@@ -63,9 +73,15 @@ def solve(env: PickBoxEnv, seed=None, debug: bool = False, vis: bool = False):
     # ------------------------------------------------------------------
     obb = get_actor_obb(env_unwrapped.b5box)
     approaching = np.array([0, 0, -1])  # approach from +Z world direction
-    target_closing = (
-        env.agent.tcp.pose.to_transformation_matrix()[0, :3, 1].cpu().numpy()
-    )
+    # Get TCP pose - handle both single-arm and bimanual modes
+    if hasattr(env.unwrapped.agent, "tcp"):
+        # Single-arm mode
+        tcp_pose = env.agent.tcp.pose
+    else:
+        # Bimanual mode - use right arm (active agent, index 1)
+        tcp_pose = env.unwrapped.agent.agents[1].tcp.pose
+
+    target_closing = tcp_pose.to_transformation_matrix()[0, :3, 1].cpu().numpy()
 
     grasp_info = compute_grasp_info_by_obb(
         obb,
@@ -74,7 +90,17 @@ def solve(env: PickBoxEnv, seed=None, debug: bool = False, vis: bool = False):
         depth=FINGER_LENGTH,
     )
     closing, _ = grasp_info["closing"], grasp_info["center"]
-    grasp_pose = env.agent.build_grasp_pose(approaching, closing, env.b5box.pose.sp.p)
+    # Build grasp pose - handle both single-arm and bimanual modes
+    if hasattr(env.unwrapped.agent, "build_grasp_pose"):
+        # Single-arm mode
+        grasp_pose = env.agent.build_grasp_pose(
+            approaching, closing, env.b5box.pose.sp.p
+        )
+    else:
+        # Bimanual mode - use right arm (active agent, index 1)
+        grasp_pose = env.unwrapped.agent.agents[1].build_grasp_pose(
+            approaching, closing, env.b5box.pose.sp.p
+        )
 
     # ------------------------------------------------------------------
     # 2) Reach pre-grasp (5 cm above) with gripper fully open
@@ -92,7 +118,13 @@ def solve(env: PickBoxEnv, seed=None, debug: bool = False, vis: bool = False):
     # 4) Move to basket - three stage approach: lift → move → drop
     # ------------------------------------------------------------------
     # Stage 1: Lift the box 15cm straight up from current position (reduced for better reachability)
-    current_pos = env.agent.tcp.pose.p.cpu().numpy().flatten()
+    # Get current TCP position - handle both single-arm and bimanual modes
+    if hasattr(env.unwrapped.agent, "tcp"):
+        # Single-arm mode
+        current_pos = env.agent.tcp.pose.p.cpu().numpy().flatten()
+    else:
+        # Bimanual mode - use right arm (active agent, index 1)
+        current_pos = env.unwrapped.agent.agents[1].tcp.pose.p.cpu().numpy().flatten()
     lift_pose = sapien.Pose(current_pos + np.array([0, 0, 0.15]), grasp_pose.q)
     result = planner.move_to_pose_with_RRTConnect(lift_pose)
     if result == -1:

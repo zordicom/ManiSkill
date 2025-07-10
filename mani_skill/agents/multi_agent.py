@@ -20,6 +20,11 @@ class MultiAgent(BaseAgent, Generic[T]):
             self.sensor_configs += agent._sensor_configs
             self.agents_dict[f"{agent.uid}-{i}"] = agent
 
+    @property
+    def _sensor_configs(self):
+        """Return the sensor configs for compatibility with BaseEnv"""
+        return self.sensor_configs
+
     def get_proprioception(self):
         proprioception = dict()
         for i, agent in enumerate(self.agents):
@@ -37,9 +42,9 @@ class MultiAgent(BaseAgent, Generic[T]):
             for agent in self.agents:
                 agent.set_control_mode()
         else:
-            assert len(control_mode) == len(
-                self.agents
-            ), "For task with multiple agents, setting control mode on the MultiAgent object requires a control mode for each agent"
+            assert len(control_mode) == len(self.agents), (
+                "For task with multiple agents, setting control mode on the MultiAgent object requires a control mode for each agent"
+            )
             for cm, agent in zip(control_mode, self.agents):
                 agent.set_control_mode(cm)
 
@@ -49,15 +54,15 @@ class MultiAgent(BaseAgent, Generic[T]):
 
     @property
     def action_space(self):
-        return spaces.Dict(
-            {uid: agent.action_space for uid, agent in self.agents_dict.items()}
-        )
+        return spaces.Dict({
+            uid: agent.action_space for uid, agent in self.agents_dict.items()
+        })
 
     @property
     def single_action_space(self):
-        return spaces.Dict(
-            {uid: agent.single_action_space for uid, agent in self.agents_dict.items()}
-        )
+        return spaces.Dict({
+            uid: agent.single_action_space for uid, agent in self.agents_dict.items()
+        })
 
     def set_action(self, action):
         """

@@ -276,7 +276,7 @@ class BimanualPickPlace(BaseEnv):
         goal_site = actors.build_sphere(
             self.scene,
             radius=0.02,
-            color=[0, 1, 0, 0.5],  # Semi-transparent green
+            color=[0, 1, 0, 0.0],  # Set alpha to 0.0 to make completely transparent
             name="goal_site",
             body_type="kinematic",
             add_collision=False,
@@ -348,8 +348,8 @@ class BimanualPickPlace(BaseEnv):
                 + (torch.rand((b,)) * 2 - 1) * basket_spawn["half_size"][1]
             )
             basket_xyz[:, 2] = (
-                table_surface_height + 0.054
-            )  # On table surface (basket bottom height above table surface)
+                table_surface_height + 0.004
+            )  # On table surface (basket bottom height above table surface, lowered by 5cm)
 
             # Add 90-degree rotation around Z-axis (matching rotated basket in XML)
             z_rotation = torch.tensor(

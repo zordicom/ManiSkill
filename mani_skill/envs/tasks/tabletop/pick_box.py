@@ -14,7 +14,7 @@ centre **and** the robot is static.
 """
 
 import math
-from typing import Any, Dict, Union
+from typing import Any, Dict, Tuple, Union
 
 import numpy as np
 import sapien
@@ -22,6 +22,7 @@ import torch
 from sapien import physx
 
 from mani_skill import PACKAGE_ASSET_DIR
+from mani_skill.agents.multi_agent import MultiAgent
 from mani_skill.agents.robots import A1Galaxea, Panda, PandaWristCam, XArm6Robotiq
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.tasks.tabletop.bimanual_pick_place_cfgs import (
@@ -39,21 +40,40 @@ from mani_skill.utils.structs import Actor
 from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 
-__all__ = ["PickBoxEnv"]
+__all__ = ["PickBoxBimanualEnv", "PickBoxEnv"]
+
+# A1 Galaxea table origin coordinate system constants
+# Right arm offset from table origin (in meters)
+RIGHT_ARM_OFFSET = torch.tensor([-0.025, -0.365, 0.005])
+# Left arm offset from table origin (in meters)
+LEFT_ARM_OFFSET = torch.tensor([-0.025, 0.365, 0.005])
 
 
 @register_env("PickBox-v1", max_episode_steps=100)
 class PickBoxEnv(BaseEnv):
-    """Single-arm pick-and-place task using b5box and basket assets."""
+    """Single-arm or bimanual pick-and-place task using b5box and basket assets."""
 
     SUPPORTED_ROBOTS = [
         "panda",
         "panda_wristcam",
         "a1_galaxea",
         "xarm6_robotiq",
+        ("panda", "panda"),
+        ("panda_wristcam", "panda_wristcam"),
+        ("a1_galaxea", "a1_galaxea"),
+        ("xarm6_robotiq", "xarm6_robotiq"),
     ]
 
-    agent: Union[Panda, PandaWristCam, A1Galaxea, XArm6Robotiq]
+    agent: Union[
+        Panda,
+        PandaWristCam,
+        A1Galaxea,
+        XArm6Robotiq,
+        MultiAgent[Tuple[Panda, Panda]],
+        MultiAgent[Tuple[PandaWristCam, PandaWristCam]],
+        MultiAgent[Tuple[A1Galaxea, A1Galaxea]],
+        MultiAgent[Tuple[XArm6Robotiq, XArm6Robotiq]],
+    ]
 
     # Task constants (match BimanualPickPlace)
     # Scale factor applied to the STL/OBJ meshes for the b5box asset. The
@@ -79,30 +99,36 @@ class PickBoxEnv(BaseEnv):
     }
 
     table_color_ranges = {
-        "red": (0.4, 0.9),  # Brownish to light wood tones
-        "green": (0.3, 0.7),
-        "blue": (0.2, 0.6),
+        "red": (0.0, 1.0),  # Full red range for dramatic color variations
+        "green": (0.0, 1.0),  # Full green range
+        "blue": (0.0, 1.0),  # Full blue range
         "alpha": (1.0, 1.0),  # Alpha channel (keep opaque)
     }
 
-    # Lighting variation parameters - optimized for stronger shadows
+    # Lighting variation parameters - moderate ranges for reasonable lighting
     ambient_light_ranges = {  # noqa: RUF012
-        "min_intensity": (0.1, 0.3),  # Reduced ambient light for stronger shadows
-        "max_intensity": (0.4, 0.6),  # Lower max ambient light for better contrast
+        "min_intensity": (0.1, 0.3),  # Moderate ambient light range
+        "max_intensity": (
+            0.4,
+            0.8,
+        ),  # Reduced max ambient light for less extreme brightness
     }
 
     directional_light_ranges = {  # noqa: RUF012
         "intensity": (
+            0.8,
             2.5,
-            4.5,
-        ),  # Increased directional light intensity for stronger shadows
+        ),  # Reduced directional light intensity range for more reasonable lighting
         "direction_x": (-1.0, 1.0),  # X component of light direction
         "direction_y": (-1.0, 1.0),  # Y component of light direction
-        "direction_z": (-1.0, -0.3),  # Z component (always downward)
+        "direction_z": (-1.0, -0.2),  # Z component (always downward, wider range)
     }
 
     # Store per-environment lighting directions (set at environment creation)
     _env_lighting_directions = None
+
+    # Store reference to the directional light for updating direction
+    _directional_light = None
 
     # Shadow box parameters for floating overhead obstacle
     shadow_box_ranges = {  # noqa: RUF012
@@ -131,18 +157,43 @@ class PickBoxEnv(BaseEnv):
         obs_mode="state",
         verbose=False,
         enable_shadow=True,
+        bimanual=False,
+        use_table_origin=True,
         **kwargs,
     ):
         self.verbose = verbose
         # Always enable shadows as requested
         self.enable_shadow = True
-        # Resolve to a canonical UID string
+
+        # Initialize directional light reference
+        self._directional_light = None
+
+        # Handle bimanual mode
+        self.bimanual = bimanual
+        if self.bimanual:
+            # Convert single robot_uids to tuple for bimanual mode
+            if isinstance(robot_uids, str):
+                robot_uids = (robot_uids, robot_uids)
+            elif isinstance(robot_uids, (list, tuple)) and len(robot_uids) == 1:
+                robot_uids = (robot_uids[0], robot_uids[0])
+            self.robot_type = robot_uids[0]  # Use first robot type for config lookup
+        else:
+            # Single arm mode
+            if isinstance(robot_uids, (list, tuple)):
+                robot_uids = robot_uids[0]  # Use first robot for single arm
+            self.robot_type = robot_uids
+
+        # Resolve to a canonical UID string or tuple
         self.robot_uids = robot_uids
-        self.robot_type = robot_uids  # alias for config lookup
+
+        # Table origin coordinate system
+        self.use_table_origin = use_table_origin
+        self._table_origin = None
+        self._table_origin_computed = False
 
         # Use robot-specific configs like PickCube does
-        if robot_uids in PICK_BOX_CONFIGS:
-            cfg = PICK_BOX_CONFIGS[robot_uids]
+        if self.robot_type in PICK_BOX_CONFIGS:
+            cfg = PICK_BOX_CONFIGS[self.robot_type]
             self.goal_thresh = cfg["goal_thresh"]
             self.b5box_half_size = cfg["cube_half_size"]
             self.cube_half_size = cfg["cube_half_size"]
@@ -155,6 +206,8 @@ class PickBoxEnv(BaseEnv):
             # Fallback to default values
             cfg = PICK_BOX_CONFIGS["panda"]
             self.goal_thresh = cfg["goal_thresh"]
+            self.b5box_half_size = cfg["cube_half_size"]
+            self.cube_half_size = cfg["cube_half_size"]
             self.sensor_cam_eye_pos = cfg["sensor_cam_eye_pos"]
             self.sensor_cam_target_pos = cfg["sensor_cam_target_pos"]
             self.human_cam_eye_pos = cfg["human_cam_eye_pos"]
@@ -179,6 +232,7 @@ class PickBoxEnv(BaseEnv):
         if self.verbose:
             print("PickBox Environment Initialization:")
             print(f"  Robot: {robot_uids}")
+            print(f"  Bimanual mode: {bimanual}")
             print(f"  Observation mode: {obs_mode}")
             print(f"  Cube half-size: {self.cube_half_size}")
             print(f"  Box half-size: {self.b5box_half_size}")
@@ -219,6 +273,30 @@ class PickBoxEnv(BaseEnv):
         # Box dimensions are now randomized per sub-scene during _load_b5box
 
     @property
+    def left_agent(self) -> Union[Panda, PandaWristCam, A1Galaxea, XArm6Robotiq]:
+        """Get the left agent (only available in bimanual mode)."""
+        if self.bimanual:
+            return self.agent.agents[0]
+        else:
+            return None
+
+    @property
+    def right_agent(self) -> Union[Panda, PandaWristCam, A1Galaxea, XArm6Robotiq]:
+        """Get the right agent (active agent in single-arm mode, right agent in bimanual mode)."""
+        if self.bimanual:
+            return self.agent.agents[1]
+        else:
+            return self.agent
+
+    @property
+    def active_agent(self) -> Union[Panda, PandaWristCam, A1Galaxea, XArm6Robotiq]:
+        """Get the active agent (right agent in both single-arm and bimanual modes)."""
+        if self.bimanual:
+            return self.agent.agents[1]  # Right agent is active in bimanual mode
+        else:
+            return self.agent
+
+    @property
     def _default_sim_config(self):
         """Configure GPU memory settings to handle high collision pair requirements."""
         return SimConfig(
@@ -245,8 +323,34 @@ class PickBoxEnv(BaseEnv):
 
     @property
     def _default_sensor_configs(self):
-        # No additional sensor cameras - only use robot-mounted cameras
-        return []
+        # In bimanual mode, we need to explicitly add robot cameras since MultiAgent
+        # sensor configs might not be automatically included
+        if self.robot_type == "a1_galaxea" and self.bimanual:
+            # For bimanual A1 Galaxea, don't add any cameras here
+            # The end effector cameras will be automatically provided by the MultiAgent
+            # from each robot's _sensor_configs and will be renamed in _setup_bimanual_camera_mounts
+            # The static_top cameras are also provided by each robot
+            return []
+        elif self.robot_type == "a1_galaxea":
+            return []  # Single-arm A1 Galaxea provides its own cameras
+        else:
+            # For other robots, use sensor camera configuration
+            from mani_skill.utils import sapien_utils
+
+            pose = sapien_utils.look_at(
+                eye=self.sensor_cam_eye_pos, target=self.sensor_cam_target_pos
+            )
+            return [
+                CameraConfig(
+                    "base_camera",
+                    pose,
+                    128,
+                    128,
+                    1,
+                    0.01,
+                    100,
+                )
+            ]
 
     @property
     def _default_human_render_camera_configs(self):
@@ -348,13 +452,185 @@ class PickBoxEnv(BaseEnv):
     #             self.per_scene_box_half_sizes[i] = self.box_half_sizes.copy()
 
     # ------------------------------------------------------------------
+    # Table origin coordinate system -----------------------------------
+    # ------------------------------------------------------------------
+
+    def _compute_table_origin(self) -> torch.Tensor:
+        """Compute table origin position based on robot arm base positions.
+
+        Returns:
+            torch.Tensor: Table origin position [x, y, z] in world coordinates
+        """
+        if self._table_origin_computed:
+            return self._table_origin
+
+        # Get robot arm base positions
+        if self.bimanual:
+            # Bimanual mode - use actual robot positions
+            left_robot = self.left_agent.robot
+            right_robot = self.right_agent.robot
+            left_base_pos = left_robot.pose.p[0]
+            right_base_pos = right_robot.pose.p[0]
+        else:
+            # Single arm mode - use right arm and estimate left arm position
+            right_robot = self.active_agent.robot
+            right_base_pos = right_robot.pose.p[0]
+
+            # For single arm, estimate left arm position using bimanual config offsets
+            cfg = PICK_BOX_CONFIGS[self.robot_type]
+            if "left_arm" in cfg:
+                # cfg["left_arm"]["pose"] is already a tensor from Pose.p
+                # Ensure it has the same shape as right_base_pos by taking [0] if needed
+                left_arm_pose = cfg["left_arm"]["pose"]
+                if hasattr(left_arm_pose, "shape") and len(left_arm_pose.shape) > 1:
+                    left_base_pos = left_arm_pose[0].to(self.device)
+                else:
+                    left_base_pos = torch.tensor(left_arm_pose, device=self.device)
+            else:
+                # Fallback: mirror right arm position
+                left_base_pos = right_base_pos.clone()
+                left_base_pos[1] = -left_base_pos[1]  # Mirror Y coordinate
+
+        # Ensure offsets are on the same device
+        right_arm_offset = RIGHT_ARM_OFFSET.to(self.device)
+        left_arm_offset = LEFT_ARM_OFFSET.to(self.device)
+
+        # Calculate table origin such that:
+        # right_base_pos = table_origin + right_arm_offset
+        # left_base_pos = table_origin + left_arm_offset
+        # Take average to get best estimate
+        table_origin_from_right = right_base_pos - right_arm_offset
+        table_origin_from_left = left_base_pos - left_arm_offset
+
+        self._table_origin = (table_origin_from_right + table_origin_from_left) / 2
+        self._table_origin_computed = True
+
+        if self.verbose:
+            print(f"🔧 Table origin computed: {self._table_origin}")
+            print(f"🔧 Right arm world pos: {right_base_pos}")
+            print(f"🔧 Left arm world pos: {left_base_pos}")
+            print(
+                f"🔧 Expected right arm table-relative: {self._table_origin + right_arm_offset}"
+            )
+            print(
+                f"🔧 Expected left arm table-relative: {self._table_origin + left_arm_offset}"
+            )
+
+        return self._table_origin
+
+    def _transform_pose_to_table_origin(self, pose: torch.Tensor) -> torch.Tensor:
+        """Transform poses from world coordinates to table_origin coordinates.
+
+        Args:
+            pose: Tensor of shape (num_envs, 7) containing [x, y, z, qx, qy, qz, qw] in world coordinates
+
+        Returns:
+            Tensor of shape (num_envs, 7) containing [x, y, z, qx, qy, qz, qw] in table_origin coordinates
+        """
+        if not self.use_table_origin:
+            return pose
+
+        table_origin = self._compute_table_origin()
+
+        # Transform position relative to table origin
+        transformed_pose = pose.clone()
+        transformed_pose[:, :3] = pose[:, :3] - table_origin.unsqueeze(0)
+        # Orientation (quaternion) remains the same
+
+        return transformed_pose
+
+    def _transform_position_to_table_origin(
+        self, position: torch.Tensor
+    ) -> torch.Tensor:
+        """Transform positions from world coordinates to table_origin coordinates.
+
+        Args:
+            position: Tensor of shape (num_envs, 3) containing [x, y, z] in world coordinates
+
+        Returns:
+            Tensor of shape (num_envs, 3) containing [x, y, z] in table_origin coordinates
+        """
+        if not self.use_table_origin:
+            return position
+
+        table_origin = self._compute_table_origin()
+        return position - table_origin.unsqueeze(0)
+
+    # ------------------------------------------------------------------
     # Scene & robot loading --------------------------------------------
     # ------------------------------------------------------------------
 
     def _load_agent(self, options: dict):
-        # Use bimanual config positioning for all robots
-        right_pose = ROBOT_CONFIGS[self.robot_type]["right_arm"]["pose"].sp
-        super()._load_agent(options, right_pose)
+        if self.bimanual:
+            # Load both arms using poses from config
+            cfg = PICK_BOX_CONFIGS[self.robot_type]
+            left_pose = cfg["left_arm"]["pose"]
+            right_pose = cfg["right_arm"]["pose"]
+            super()._load_agent(options, [left_pose, right_pose])
+
+            # Set up camera mounts for bimanual A1 Galaxea
+            if self.robot_type == "a1_galaxea":
+                self._setup_bimanual_camera_mounts()
+        else:
+            # Use bimanual config positioning for single right arm
+            cfg = PICK_BOX_CONFIGS[self.robot_type]
+            right_pose = cfg["right_arm"]["pose"]
+            super()._load_agent(options, right_pose)
+
+    def _setup_bimanual_camera_mounts(self):
+        """Set up camera mounts for bimanual A1 Galaxea end effector cameras."""
+        # The MultiAgent automatically merges sensor configs from both robots
+        # Each A1 Galaxea robot provides an "end_effector_camera" - we need to rename them
+        # to "eoat_left_top" and "eoat_right_top" to match the expected naming convention
+        # Also need to remove duplicate static_top cameras
+
+        # Find and rename the end effector cameras
+        end_effector_cameras = []
+        static_top_cameras = []
+
+        for sensor_config in self.agent.sensor_configs:
+            if sensor_config.uid == "end_effector_camera":
+                end_effector_cameras.append(sensor_config)
+            elif sensor_config.uid == "static_top":
+                static_top_cameras.append(sensor_config)
+
+        # Rename the end effector cameras based on their mount (left vs right arm)
+        if len(end_effector_cameras) == 2:
+            # Determine which camera belongs to which arm by checking the mount
+            left_camera = None
+            right_camera = None
+
+            for camera in end_effector_cameras:
+                # Check if this camera is mounted on the left or right arm
+                if camera.mount == self.left_agent.robot.links_map["galaxea_eoat_set"]:
+                    left_camera = camera
+                elif (
+                    camera.mount == self.right_agent.robot.links_map["galaxea_eoat_set"]
+                ):
+                    right_camera = camera
+
+            # Rename the cameras
+            if left_camera:
+                left_camera.uid = "eoat_left_top"
+            if right_camera:
+                right_camera.uid = "eoat_right_top"
+
+        # Remove duplicate static_top cameras, keeping only the first one
+        if len(static_top_cameras) > 1:
+            # Create a new sensor_configs list without the duplicate static_top cameras
+            new_sensor_configs = []
+            static_top_added = False
+
+            for sensor_config in self.agent.sensor_configs:
+                if sensor_config.uid == "static_top":
+                    if not static_top_added:
+                        new_sensor_configs.append(sensor_config)
+                        static_top_added = True
+                    # Skip duplicate static_top cameras
+                else:
+                    new_sensor_configs.append(sensor_config)
+
+            self.agent.sensor_configs = new_sensor_configs
 
     def _load_scene(self, options: dict):
         # Table, b5box, basket, and goal site (for visualisation) ----------
@@ -391,24 +667,19 @@ class PickBoxEnv(BaseEnv):
             restitution=0.0,
         )
 
-        # Generate random table color
-        table_color = [
-            np.random.uniform(*self.table_color_ranges["red"]),
-            np.random.uniform(*self.table_color_ranges["green"]),
-            np.random.uniform(*self.table_color_ranges["blue"]),
-            np.random.uniform(*self.table_color_ranges["alpha"]),
-        ]
+        # Use default table color - will be randomized per episode in _initialize_episode
+        default_table_color = [0.6, 0.5, 0.4, 1.0]  # Default brownish color
 
         builder.add_box_collision(
             half_size=cfg["size"],
             material=table_fric_mat,
         )
-        builder.add_box_visual(half_size=cfg["size"], material=table_color)
+        builder.add_box_visual(half_size=cfg["size"], material=default_table_color)
         builder.set_initial_pose(cfg["pose"].sp)
 
         if self.verbose:
             print(
-                f"    Table color: RGBA({table_color[0]:.3f}, {table_color[1]:.3f}, {table_color[2]:.3f}, {table_color[3]:.3f})"
+                "    Table created with default color (will be randomized per episode)"
             )
 
         return builder.build_static(name="table")
@@ -702,7 +973,7 @@ class PickBoxEnv(BaseEnv):
         goal_site = actors.build_sphere(
             self.scene,
             radius=0.02,
-            color=[0, 1, 0, 0.5],
+            color=[0, 1, 0, 0.0],  # Set alpha to 0.0 to make completely transparent
             name="goal_site",
             body_type="kinematic",
             add_collision=False,
@@ -795,10 +1066,27 @@ class PickBoxEnv(BaseEnv):
             # curriculum_config = self._apply_curriculum_config(options)
 
             # Home pose ---------------------------------------------------
-            home_qpos = ROBOT_CONFIGS[self.robot_type]["right_arm"]["home_qpos"]
-            self.agent.robot.set_qpos(
-                torch.tensor(home_qpos, device=self.device).repeat(b, 1)
-            )
+            if self.bimanual:
+                # Set both arms to their respective home positions
+                cfg = PICK_BOX_CONFIGS[self.robot_type]
+                left_qpos = cfg["left_arm"]["home_qpos"]
+                right_qpos = cfg["right_arm"]["home_qpos"]
+
+                # Set left arm to home position (static)
+                self.left_agent.robot.set_qpos(
+                    torch.tensor(left_qpos, device=self.device).repeat(b, 1)
+                )
+                # Set right arm to home position (active)
+                self.right_agent.robot.set_qpos(
+                    torch.tensor(right_qpos, device=self.device).repeat(b, 1)
+                )
+            else:
+                # Single arm mode - use right arm configuration
+                cfg = PICK_BOX_CONFIGS[self.robot_type]
+                right_qpos = cfg["right_arm"]["home_qpos"]
+                self.active_agent.robot.set_qpos(
+                    torch.tensor(right_qpos, device=self.device).repeat(b, 1)
+                )
 
             # Scene parameters ------------------------------------------
             scene_cfg = BIMANUAL_PICK_PLACE_CONFIG["scene"]
@@ -839,7 +1127,9 @@ class PickBoxEnv(BaseEnv):
             # Use center position without randomization
             basket_xyz[:, 0] = basket_spawn["center"][0]
             basket_xyz[:, 1] = basket_spawn["center"][1]
-            basket_xyz[:, 2] = table_surface_z + 0.054  # basket bottom height
+            basket_xyz[:, 2] = (
+                table_surface_z + 0.004
+            )  # basket bottom height (lowered by 5cm)
             # 90° rotation around Z (match original)
             z_rot = torch.tensor(np.pi / 2, device=self.device)
             basket_qs = torch.zeros((b, 4), device=self.device)
@@ -852,8 +1142,9 @@ class PickBoxEnv(BaseEnv):
             goal_xyz[:, 2] = table_surface_z + 0.25
             self.goal_site.set_pose(Pose.create_from_pq(goal_xyz))
 
-            # Lighting is now set up at environment creation, not per episode
-            # No need to call _setup_per_episode_lighting_variation()
+            # Per-episode visual randomization (table color and lighting)
+            self._randomize_table_color_per_episode(env_idx)
+            self._randomize_lighting_per_episode(env_idx)
 
             # Initialize transport timer for reward decay mechanism
             if not hasattr(self, "transport_timer"):
@@ -866,6 +1157,9 @@ class PickBoxEnv(BaseEnv):
 
             if self.verbose and b > 0:
                 print(f"  ✓ Episode initialized for {b} environments")
+                print(
+                    f"    Mode: {'Bimanual' if self.bimanual else 'Single-arm (right)'}"
+                )
                 print(f"    Box position (first env): {box_xyz[0]}")
                 print(f"    Basket position (first env): {basket_xyz[0]}")
                 print(f"    Goal position (first env): {goal_xyz[0]}")
@@ -890,6 +1184,84 @@ class PickBoxEnv(BaseEnv):
                     f"    Lighting direction (fixed): {self._env_lighting_directions}"
                 )
 
+                if self.bimanual:
+                    print("    Left arm: Static at home position")
+                    print("    Right arm: Active (controlled by agent)")
+
+    def _randomize_table_color_per_episode(self, env_idx: torch.Tensor):
+        """Randomize table color for each episode reset."""
+        # Generate random table color using proper random number generator
+        # Use the first environment's RNG for simplicity since table is shared
+        if len(env_idx) > 0:
+            first_env_idx = env_idx[0].item()
+            rng = self._batched_episode_rng[first_env_idx]
+
+            table_color = [
+                rng.uniform(*self.table_color_ranges["red"]),
+                rng.uniform(*self.table_color_ranges["green"]),
+                rng.uniform(*self.table_color_ranges["blue"]),
+                rng.uniform(*self.table_color_ranges["alpha"]),
+            ]
+
+            # Update table visual appearance using the correct SAPIEN approach
+            try:
+                # Access the underlying SAPIEN actors from the ManiSkill Actor wrapper
+                for sapien_actor in self.table._objs:
+                    # Get the render body component
+                    render_body = sapien_actor.find_component_by_type(
+                        sapien.render.RenderBodyComponent
+                    )
+                    if render_body:
+                        # Get render shapes from the render body
+                        render_shapes = render_body.render_shapes
+                        if render_shapes:
+                            for shape in render_shapes:
+                                # Update the material's base color
+                                material = shape.material
+                                material.set_base_color(table_color)
+
+                if self.verbose:
+                    print(
+                        f"    Table color randomized: RGBA({table_color[0]:.3f}, {table_color[1]:.3f}, {table_color[2]:.3f}, {table_color[3]:.3f})"
+                    )
+            except Exception as e:
+                if self.verbose:
+                    print(f"    Warning: Could not update table color: {e}")
+                    print(f"    Table object type: {type(self.table)}")
+                    if hasattr(self.table, "_objs"):
+                        print(
+                            f"    Underlying SAPIEN actor type: {type(self.table._objs[0]) if self.table._objs else 'None'}"
+                        )
+                    else:
+                        print(
+                            f"    Table attributes: {dir(self.table)[:10]}..."
+                        )  # Show first 10 attributes
+
+    def _randomize_lighting_per_episode(self, env_idx: torch.Tensor):
+        """Randomize lighting for each episode reset."""
+        if len(env_idx) > 0:
+            first_env_idx = env_idx[0].item()
+            rng = self._batched_episode_rng[first_env_idx]
+
+            # Generate random ambient light intensity
+            ambient_intensity = rng.uniform(
+                self.ambient_light_ranges["min_intensity"][0],
+                self.ambient_light_ranges["max_intensity"][1],
+            )
+
+            ambient_color = [ambient_intensity, ambient_intensity, ambient_intensity]
+
+            # Set ambient light - this works reliably without accumulation
+            self.scene.set_ambient_light(ambient_color)
+
+            if self.verbose:
+                print("    Lighting randomized per episode:")
+                print(f"      Ambient: {ambient_color}")
+                print("      ✓ Applied ambient light successfully")
+                print(
+                    "      Note: Directional light remains fixed to prevent accumulation issues"
+                )
+
     # ------------------------------------------------------------------
     # Observation extras -----------------------------------------------
     # ------------------------------------------------------------------
@@ -899,7 +1271,7 @@ class PickBoxEnv(BaseEnv):
 
         # Calculate gripper x-axis in world frame
         local_x_axis = torch.tensor([1, 0, 0], device=self.device).expand(b, 3)
-        gripper_x_axis = quaternion_apply(self.agent.tcp_pose.q, local_x_axis)
+        gripper_x_axis = quaternion_apply(self.active_agent.tcp_pose.q, local_x_axis)
 
         # Calculate box x-axis in world frame
         box_x_axis = quaternion_apply(self.b5box.pose.q, local_x_axis)
@@ -917,20 +1289,54 @@ class PickBoxEnv(BaseEnv):
         dot_product = torch.clamp(dot_product, -1.0, 1.0)
         angle_between_axes = torch.acos(dot_product)
 
-        # Observation debugging removed for performance
+        # Apply table origin transformations if enabled
+        tcp_pose = self._transform_pose_to_table_origin(
+            self.active_agent.tcp_pose.raw_pose
+        )
+        goal_pos = self._transform_position_to_table_origin(self.goal_site.pose.p)
+        obj_pose = self._transform_pose_to_table_origin(self.b5box.pose.raw_pose)
+        tcp_to_obj_pos = self._transform_position_to_table_origin(
+            self.b5box.pose.p
+        ) - self._transform_position_to_table_origin(self.active_agent.tcp_pose.p)
+        obj_to_goal_pos = goal_pos - self._transform_position_to_table_origin(
+            self.b5box.pose.p
+        )
 
         obs = dict(
             is_grasped=info["is_grasped"],
-            tcp_pose=self.agent.tcp_pose.raw_pose,
-            goal_pos=self.goal_site.pose.p,
-            obj_pose=self.b5box.pose.raw_pose,
-            tcp_to_obj_pos=self.b5box.pose.p - self.agent.tcp_pose.p,
-            obj_to_goal_pos=self.goal_site.pose.p - self.b5box.pose.p,
+            tcp_pose=tcp_pose,
+            goal_pos=goal_pos,
+            obj_pose=obj_pose,
+            tcp_to_obj_pos=tcp_to_obj_pos,
+            obj_to_goal_pos=obj_to_goal_pos,
             box_x_axis_in_world=self._get_box_axes_in_world(),
             gripper_x_axis=gripper_x_axis,
             angle_between_axes=angle_between_axes,
             is_obj_stable=info["is_obj_stable"],
         )
+
+        # Add bimanual-specific observations if in bimanual mode
+        if self.bimanual:
+            left_tcp_pose = self._transform_pose_to_table_origin(
+                self.left_agent.tcp_pose.raw_pose
+            )
+            right_tcp_pose = self._transform_pose_to_table_origin(
+                self.right_agent.tcp_pose.raw_pose
+            )
+            left_tcp_to_obj_pos = self._transform_position_to_table_origin(
+                self.b5box.pose.p
+            ) - self._transform_position_to_table_origin(self.left_agent.tcp_pose.p)
+            right_tcp_to_obj_pos = self._transform_position_to_table_origin(
+                self.b5box.pose.p
+            ) - self._transform_position_to_table_origin(self.right_agent.tcp_pose.p)
+
+            obs.update({
+                "left_tcp_pose": left_tcp_pose,
+                "right_tcp_pose": right_tcp_pose,
+                "left_tcp_to_obj_pos": left_tcp_to_obj_pos,
+                "right_tcp_to_obj_pos": right_tcp_to_obj_pos,
+            })
+
         return obs
 
     def _get_box_axes_in_world(self):
@@ -961,8 +1367,8 @@ class PickBoxEnv(BaseEnv):
             torch.linalg.norm(self.goal_site.pose.p - self.b5box.pose.p, axis=1)
             <= self.goal_thresh
         )
-        is_grasped = self.agent.is_grasping(self.b5box)
-        is_robot_static = self.agent.is_static(0.2)
+        is_grasped = self.active_agent.is_grasping(self.b5box)
+        is_robot_static = self.active_agent.is_static(0.2)
 
         # Check if object is stable (not moving much)
         obj_velocity = self.b5box.linear_velocity
@@ -986,7 +1392,7 @@ class PickBoxEnv(BaseEnv):
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
         tcp_to_obj_dist = torch.linalg.norm(
-            self.b5box.pose.p - self.agent.tcp_pose.p, axis=1
+            self.b5box.pose.p - self.active_agent.tcp_pose.p, axis=1
         )
 
         # TCP-to-object proximity reward throughout task, except after releasing
@@ -1076,7 +1482,7 @@ class PickBoxEnv(BaseEnv):
         local_x_axis = torch.tensor([1, 0, 0], device=self.device).expand(
             len(self.scene.sub_scenes), 3
         )
-        gripper_x_axis = quaternion_apply(self.agent.tcp_pose.q, local_x_axis)
+        gripper_x_axis = quaternion_apply(self.active_agent.tcp_pose.q, local_x_axis)
         # Calculate box x-axis in world frame
         box_x_axis = quaternion_apply(self.b5box.pose.q, local_x_axis)
         # Calculate angle between axes
@@ -1096,7 +1502,7 @@ class PickBoxEnv(BaseEnv):
 
         # Gripper openness reward: encourage keeping gripper open when far from object
         # Get gripper joint positions (assuming they're at the end of qpos)
-        robot_qpos = self.agent.robot.get_qpos()
+        robot_qpos = self.active_agent.robot.get_qpos()
         if self.robot_uids in ["panda", "panda_wristcam"]:
             # For Panda robots, gripper joints are the last 2 joints
             gripper_qpos = robot_qpos[..., -2:]  # [left_finger, right_finger]
@@ -1357,7 +1763,7 @@ class PickBoxEnv(BaseEnv):
 
     def _get_expected_features(self):
         """Get expected feature counts based on obs_mode."""
-        return {
+        features = {
             "is_grasped": 1,
             "tcp_pose": 7,
             "goal_pos": 3,
@@ -1369,6 +1775,17 @@ class PickBoxEnv(BaseEnv):
             "angle_between_axes": 1,
             "is_obj_stable": 1,
         }
+
+        # Add bimanual-specific features if in bimanual mode
+        if self.bimanual:
+            features.update({
+                "left_tcp_pose": 7,
+                "right_tcp_pose": 7,
+                "left_tcp_to_obj_pos": 3,
+                "right_tcp_to_obj_pos": 3,
+            })
+
+        return features
 
     def print_observation_details(self, obs=None):
         """Print detailed information about the current observation.
@@ -1422,8 +1839,14 @@ class PickBoxEnv(BaseEnv):
 
     def _setup_env_creation_lighting(self):
         """Setup lighting at environment creation with randomized directions per environment."""
+        # Use a properly seeded random number generator for lighting randomization
+        # This ensures different lighting for each environment creation
+        import time
+
+        rng = np.random.RandomState(int(time.time() * 1000000) % (2**32))
+
         # Generate random ambient light intensity
-        ambient_intensity = np.random.uniform(
+        ambient_intensity = rng.uniform(
             self.ambient_light_ranges["min_intensity"][0],
             self.ambient_light_ranges["max_intensity"][1],
         )
@@ -1434,7 +1857,7 @@ class PickBoxEnv(BaseEnv):
         self.scene.set_ambient_light(ambient_color)
 
         # Generate random directional light parameters (fixed per environment creation)
-        directional_intensity = np.random.uniform(
+        directional_intensity = rng.uniform(
             self.directional_light_ranges["intensity"][0],
             self.directional_light_ranges["intensity"][1],
         )
@@ -1447,15 +1870,15 @@ class PickBoxEnv(BaseEnv):
 
         # Generate random direction (fixed per environment creation)
         direction = [
-            np.random.uniform(
+            rng.uniform(
                 self.directional_light_ranges["direction_x"][0],
                 self.directional_light_ranges["direction_x"][1],
             ),
-            np.random.uniform(
+            rng.uniform(
                 self.directional_light_ranges["direction_y"][0],
                 self.directional_light_ranges["direction_y"][1],
             ),
-            np.random.uniform(
+            rng.uniform(
                 self.directional_light_ranges["direction_z"][0],
                 self.directional_light_ranges["direction_z"][1],
             ),
@@ -1464,14 +1887,19 @@ class PickBoxEnv(BaseEnv):
         # Store the direction for this environment instance
         self._env_lighting_directions = direction
 
-        # Add single directional light with enhanced shadow settings
-        self.scene.add_directional_light(
+        # Add single directional light with enhanced shadow settings and store reference
+        self._directional_light = self.scene.add_directional_light(
             direction=direction,
             color=directional_color,
             shadow=True,  # Always enable shadows as requested
             shadow_scale=15,  # Increased shadow coverage for stronger shadows
             shadow_map_size=4096,  # High resolution shadows for crisp edges
         )
+
+        if self.verbose:
+            print(
+                f"    ✓ Directional light created and stored: {self._directional_light is not None}"
+            )
 
         if self.verbose:
             print("    Environment creation lighting setup (enhanced shadows):")
@@ -1482,3 +1910,13 @@ class PickBoxEnv(BaseEnv):
             print("      Shadows: Always enabled with enhanced settings")
             print("      Shadow quality: 4096x4096 map, scale=15 (stronger shadows)")
             print("      Lighting direction: Fixed per environment creation")
+
+
+@register_env("PickBoxBimanual-v1", max_episode_steps=100)
+class PickBoxBimanualEnv(PickBoxEnv):
+    """Bimanual pick-and-place task using b5box and basket assets with static left arm."""
+
+    def __init__(self, *args, **kwargs):
+        # Force bimanual mode
+        kwargs["bimanual"] = True
+        super().__init__(*args, **kwargs)

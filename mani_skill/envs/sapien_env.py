@@ -8,11 +8,11 @@ import dacite
 import gymnasium as gym
 import numpy as np
 import sapien
-import sapien.physx as physx
 import sapien.render
 import sapien.utils.viewer.control_window
 import torch
 from gymnasium.vector.utils import batch_space
+from sapien import physx
 
 import mani_skill.render.utils as render_utils
 from mani_skill import logger
@@ -380,6 +380,7 @@ class BaseEnv(gym.Env):
     @property
     def _default_sim_config(self):
         return SimConfig()
+
     def _load_agent(self, options: dict, initial_agent_poses: Optional[Union[sapien.Pose, Pose]] = None, build_separate: bool = False):
         """
         loads the agent/controllable articulations into the environment. The default function provides a convenient way to setup the agent/robot by a robot_uid
@@ -434,15 +435,17 @@ class BaseEnv(gym.Env):
         BaseSensorConfig, Sequence[BaseSensorConfig], Dict[str, BaseSensorConfig]
     ]:
         """Add default (non-agent) sensors to the environment by returning sensor configurations. These can be overriden by the user at
-        env creation time"""
+        env creation time
+        """
         return []
+
     @property
     def _default_human_render_camera_configs(
         self,
     ) -> Union[
         CameraConfig, Sequence[CameraConfig], Dict[str, CameraConfig]
     ]:
-        """Add default cameras for rendering when using render_mode='rgb_array'. These can be overriden by the user at env creation time """
+        """Add default cameras for rendering when using render_mode='rgb_array'. These can be overriden by the user at env creation time"""
         return []
 
     @property
@@ -544,7 +547,8 @@ class BaseEnv(gym.Env):
 
     def _get_obs_agent(self):
         """Get observations about the agent's state. By default it is proprioceptive observations which include qpos and qvel.
-        Controller state is also included although most default controllers do not have any state."""
+        Controller state is also included although most default controllers do not have any state.
+        """
         return self.agent.get_proprioception()
 
     def _get_obs_extra(self, info: Dict):
@@ -680,11 +684,10 @@ class BaseEnv(gym.Env):
                     reward = info["success"] - info["fail"]
             else:
                 reward = info["success"]
+        elif "fail" in info:
+            reward = -info["fail"]
         else:
-            if "fail" in info:
-                reward = -info["fail"]
-            else:
-                reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         return reward
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
@@ -714,7 +717,7 @@ class BaseEnv(gym.Env):
     # -------------------------------------------------------------------------- #
     # Reconfigure
     # -------------------------------------------------------------------------- #
-    def _reconfigure(self, options = dict()):
+    def _reconfigure(self, options=dict()):
         """Reconfigure the simulation scene instance.
         This function clears the previous scene and creates a new one.
 
@@ -725,7 +728,6 @@ class BaseEnv(gym.Env):
         Tasks like PegInsertionSide and TurnFaucet will call this each time as the peg
         shape changes each time and the faucet model changes each time respectively.
         """
-
         self._clear()
         # load everything into the scene first before initializing anything
         self._setup_scene()
@@ -753,16 +755,17 @@ class BaseEnv(gym.Env):
     def _after_reconfigure(self, options):
         """Add code here that should run immediately after self._reconfigure is called. The torch RNG context is still active so RNG is still
         seeded here by self._episode_seed. This is useful if you need to run something that only happens after reconfiguration but need the
-        GPU initialized so that you can check e.g. collisons, poses etc."""
+        GPU initialized so that you can check e.g. collisons, poses etc.
+        """
 
     def _load_scene(self, options: dict):
         """Loads all objects like actors and articulations into the scene. Called by `self._reconfigure`. Given options argument
-        is the same options dictionary passed to the self.reset function"""
+        is the same options dictionary passed to the self.reset function
+        """
 
     # TODO (stao): refactor this into sensor API
     def _setup_sensors(self, options: dict):
         """Setup sensor configurations and the sensor objects in the scene. Called by `self._reconfigure`"""
-
         # First create all the configurations
         self._sensor_configs = dict()
 
@@ -806,7 +809,11 @@ class BaseEnv(gym.Env):
 
         for uid, sensor_config in self._sensor_configs.items():
             if uid in self._agent_sensor_configs:
-                articulation = self.agent.robot
+                # For MultiAgent, sensors are already properly mounted by individual agents
+                if hasattr(self.agent, 'robot'):
+                    articulation = self.agent.robot
+                else:
+                    articulation = None
             else:
                 articulation = None
             if isinstance(sensor_config, StereoDepthCameraConfig):
@@ -832,13 +839,13 @@ class BaseEnv(gym.Env):
 
     def _load_lighting(self, options: dict):
         """Loads lighting into the scene. Called by `self._reconfigure`. If not overriden will set some simple default lighting"""
-
         shadow = self.enable_shadow
         self.scene.set_ambient_light([0.3, 0.3, 0.3])
         self.scene.add_directional_light(
             [1, 1, -1], [1, 1, 1], shadow=shadow, shadow_scale=5, shadow_map_size=2048
         )
         self.scene.add_directional_light([0, 0, -1], [1, 1, 1])
+
     # -------------------------------------------------------------------------- #
     # Reset
     # -------------------------------------------------------------------------- #
@@ -1026,11 +1033,10 @@ class BaseEnv(gym.Env):
                 terminated = torch.logical_or(info["success"], info["fail"])
             else:
                 terminated = info["success"].clone()
+        elif "fail" in info:
+            terminated = info["fail"].clone()
         else:
-            if "fail" in info:
-                terminated = info["fail"].clone()
-            else:
-                terminated = torch.zeros(self.num_envs, dtype=bool, device=self.device)
+            terminated = torch.zeros(self.num_envs, dtype=bool, device=self.device)
 
         return (
             obs,
@@ -1127,13 +1133,17 @@ class BaseEnv(gym.Env):
 
     def _before_control_step(self):
         """Code that runs before each action has been taken via env.step(action).
-        On GPU simulation this is called before observations are fetched from the GPU buffers."""
+        On GPU simulation this is called before observations are fetched from the GPU buffers.
+        """
+
     def _after_control_step(self):
         """Code that runs after each action has been taken.
-        On GPU simulation this is called right before observations are fetched from the GPU buffers."""
+        On GPU simulation this is called right before observations are fetched from the GPU buffers.
+        """
 
     def _before_simulation_step(self):
         """Code to run right before each physx_system.step is called"""
+
     def _after_simulation_step(self):
         """Code to run right after each physx_system.step is called"""
 
@@ -1143,12 +1153,13 @@ class BaseEnv(gym.Env):
     def _set_scene_config(self):
         physx.set_shape_config(contact_offset=self.sim_config.scene_config.contact_offset, rest_offset=self.sim_config.scene_config.rest_offset)
         physx.set_body_config(solver_position_iterations=self.sim_config.scene_config.solver_position_iterations, solver_velocity_iterations=self.sim_config.scene_config.solver_velocity_iterations, sleep_threshold=self.sim_config.scene_config.sleep_threshold)
-        physx.set_scene_config(gravity=self.sim_config.scene_config.gravity, bounce_threshold=self.sim_config.scene_config.bounce_threshold, enable_pcm=self.sim_config.scene_config.enable_pcm, enable_tgs=self.sim_config.scene_config.enable_tgs, enable_ccd=self.sim_config.scene_config.enable_ccd, enable_enhanced_determinism=self.sim_config.scene_config.enable_enhanced_determinism, enable_friction_every_iteration=self.sim_config.scene_config.enable_friction_every_iteration, cpu_workers=self.sim_config.scene_config.cpu_workers )
+        physx.set_scene_config(gravity=self.sim_config.scene_config.gravity, bounce_threshold=self.sim_config.scene_config.bounce_threshold, enable_pcm=self.sim_config.scene_config.enable_pcm, enable_tgs=self.sim_config.scene_config.enable_tgs, enable_ccd=self.sim_config.scene_config.enable_ccd, enable_enhanced_determinism=self.sim_config.scene_config.enable_enhanced_determinism, enable_friction_every_iteration=self.sim_config.scene_config.enable_friction_every_iteration, cpu_workers=self.sim_config.scene_config.cpu_workers)
         physx.set_default_material(**self.sim_config.default_materials_config.dict())
 
     def _setup_scene(self):
         """Setup the simulation scene instance.
-        The function should be called in reset(). Called by `self._reconfigure`"""
+        The function should be called in reset(). Called by `self._reconfigure`
+        """
         self._set_scene_config()
         if self._sim_device.is_cuda():
             physx_system = physx.PhysxGpuSystem(device=self._sim_device)
@@ -1207,7 +1218,7 @@ class BaseEnv(gym.Env):
         self._human_render_cameras = dict()
         self.scene = None
         self._hidden_objects = []
-        gc.collect() # force gc to collect which releases most GPU memory
+        gc.collect()  # force gc to collect which releases most GPU memory
 
     def close(self):
         self._clear()
@@ -1233,6 +1244,7 @@ class BaseEnv(gym.Env):
 
     def add_to_state_dict_registry(self, object: Union[Actor, Articulation]):
         self.scene.add_to_state_dict_registry(object)
+
     def remove_from_state_dict_registry(self, object: Union[Actor, Articulation]):
         self.scene.remove_from_state_dict_registry(object)
 
@@ -1336,7 +1348,8 @@ class BaseEnv(gym.Env):
     def render_rgb_array(self, camera_name: str = None):
         """Returns an RGB array / image of size (num_envs, H, W, 3) of the current state of the environment.
         This is captured by any of the registered human render cameras. If a camera_name is given, only data from that camera is returned.
-        Otherwise all camera data is captured and returned as a single batched image. Any objects registered in the _hidden_objects list will be shown"""
+        Otherwise all camera data is captured and returned as a single batched image. Any objects registered in the _hidden_objects list will be shown
+        """
         for obj in self._hidden_objects:
             obj.show_visual()
         self.scene.update_render(update_sensors=False, update_human_render_cameras=True)
@@ -1433,7 +1446,6 @@ class BaseEnv(gym.Env):
     #     scene_mesh = merge_meshes(meshes)
     #     scene_pcd = scene_mesh.sample(num_points)
     #     return scene_pcd
-
 
     # Printing metrics/info
     def print_sim_details(self):

@@ -1,11 +1,15 @@
-import os
+#!/usr/bin/env python3
+"""
+Fast PPO with RGB observations and Expert+Residual Action Decomposition for ManiSkill
 
-from mani_skill.utils import gym_utils
-from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
-from mani_skill.utils.wrappers.record import RecordEpisode
-from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+Modular implementation that borrows components from:
+- ppo_fast.py: layer_init, base optimizations
+- ppo_rgb_fast.py: NatureCNN, DictArray, fast training loop, Args
+- ppo_fast_expert_residual.py: ExpertResidualWrapper, expert policy creation
 
-os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
+Usage:
+    python ppo_rgb_fast_expert_residual.py --env-id PickCube-v1 --robot-uids a1_galaxea --expert-type zero --compile
+"""
 
 import math
 import os
@@ -22,6 +26,14 @@ import tensordict
 import torch
 import tqdm
 import tyro
+from mani_skill.envs.wrappers.expert_residual import (
+    ExpertResidualWrapper,
+    create_expert_policy,
+)
+from mani_skill.utils import gym_utils
+from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
+from mani_skill.utils.wrappers.record import RecordEpisode
+from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 from tensordict import from_module
 from tensordict.nn import CudaGraphModule
 from torch import nn, optim
@@ -30,15 +42,83 @@ from torch.utils.tensorboard import SummaryWriter
 
 import wandb
 
-# A1 Galaxea table origin coordinate system constants
-# Right arm offset from table origin (in meters)
-RIGHT_ARM_OFFSET = torch.tensor([-0.025, -0.365, 0.005])
-# Left arm offset from table origin (in meters)
-LEFT_ARM_OFFSET = torch.tensor([-0.025, 0.365, 0.005])
+# Set optimization flags (from ppo_rgb_fast.py)
+os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
+
+
+# Import reusable components by directly copying functions/classes
+
+
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    """Layer initialization from ppo_fast.py - using Xavier normal to avoid CUDA solver issues"""
+    torch.nn.init.xavier_normal_(layer.weight, gain=std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
+class DictArray(object):
+    """Efficient dictionary-based array for handling complex observations from ppo_rgb_fast.py"""
+
+    def __init__(self, buffer_shape, element_space, data_dict=None, device=None):
+        self.buffer_shape = buffer_shape
+        if data_dict:
+            self.data = data_dict
+        else:
+            assert isinstance(element_space, gym.spaces.dict.Dict)
+            self.data = {}
+            for k, v in element_space.items():
+                if isinstance(v, gym.spaces.dict.Dict):
+                    self.data[k] = DictArray(buffer_shape, v, device=device)
+                else:
+                    dtype = (
+                        torch.float32
+                        if v.dtype in (np.float32, np.float64)
+                        else torch.uint8
+                        if v.dtype == np.uint8
+                        else torch.int16
+                        if v.dtype == np.int16
+                        else torch.int32
+                        if v.dtype == np.int32
+                        else v.dtype
+                    )
+                    self.data[k] = torch.zeros(
+                        buffer_shape + v.shape, dtype=dtype, device=device
+                    )
+
+    def keys(self):
+        return self.data.keys()
+
+    def __getitem__(self, index):
+        if isinstance(index, str):
+            return self.data[index]
+        return {k: v[index] for k, v in self.data.items()}
+
+    def __setitem__(self, index, value):
+        if isinstance(index, str):
+            self.data[index] = value
+        for k, v in value.items():
+            self.data[k][index] = v
+
+    @property
+    def shape(self):
+        return self.buffer_shape
+
+    def reshape(self, shape):
+        t = len(self.buffer_shape)
+        new_dict = {}
+        for k, v in self.data.items():
+            if isinstance(v, DictArray):
+                new_dict[k] = v.reshape(shape)
+            else:
+                new_dict[k] = v.reshape(shape + v.shape[t:])
+        new_buffer_shape = next(iter(new_dict.values())).shape[: len(shape)]
+        return DictArray(new_buffer_shape, None, data_dict=new_dict)
 
 
 @dataclass
 class Args:
+    """Extended Args from ppo_rgb_fast.py with expert-specific fields."""
+
     exp_name: Optional[str] = None
     """the name of this experiment"""
     seed: int = 1
@@ -49,11 +129,11 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "ManiSkill"
+    wandb_project_name: str = "ManiSkill-ExpertResidual-RGB"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
-    wandb_group: str = "PPO"
+    wandb_group: str = "PPO-ExpertResidual-RGB"
     """the group of the run for wandb"""
     capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
@@ -65,15 +145,19 @@ class Args:
     """if toggled, only runs evaluation with the given model checkpoint and saves the evaluation trajectories"""
     checkpoint: Optional[str] = None
     """path to a pretrained checkpoint file to start evaluation/training from"""
+    render_mode: str = "all"
+    """the environment rendering mode"""
 
-    # Environment specific arguments
+    # Environment specific arguments (from ppo_rgb_fast.py)
     env_id: str = "PickCube-v1"
     """the id of the environment"""
     robot_uids: Optional[str] = None
     """robot uid(s) to use for the environment"""
+    include_state: bool = True
+    """whether to include state information in observations"""
     env_vectorization: str = "gpu"
     """the type of environment vectorization to use"""
-    num_envs: int = 512
+    num_envs: int = 256
     """the number of parallel environments"""
     num_eval_envs: int = 16
     """the number of parallel evaluation environments"""
@@ -95,10 +179,22 @@ class Args:
     """frequency to save training videos in terms of iterations"""
     control_mode: Optional[str] = "pd_joint_delta_pos"
     """the control mode to use for the environment"""
-    obs_mode: str = "state"
-    """the observation mode to use for the environment"""
 
-    # Algorithm specific arguments
+    # Expert + Residual specific arguments (from ppo_fast_expert_residual.py)
+    expert_type: str = "zero"
+    """type of expert policy: 'zero', 'ik', 'model'"""
+    residual_scale: float = 1.0
+    """scale factor for residual actions"""
+    expert_action_noise: float = 0.0
+    """Gaussian noise std to add to expert actions"""
+    track_action_stats: bool = False
+    """whether to track expert/residual action statistics"""
+    ik_gain: float = 2.0
+    """proportional gain for IK expert policy"""
+    model_path: Optional[str] = None
+    """path to pre-trained model for model expert policy"""
+
+    # Algorithm specific arguments (from ppo_rgb_fast.py)
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
@@ -139,178 +235,189 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
-    # Torch optimizations
+    # Torch optimizations (from ppo_rgb_fast.py)
     compile: bool = False
     """whether to use torch.compile."""
     cudagraphs: bool = False
     """whether to use cudagraphs on top of compile."""
-    verbose: bool = False
-    """whether to print verbose output during training."""
-
-    # Table origin coordinate system
-    use_table_origin: bool = True
-    """whether to use table origin coordinate system for pose observations."""
 
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
+class NatureCNNWithExpert(nn.Module):
+    """Extended NatureCNN from ppo_rgb_fast.py with expert action support."""
 
+    def __init__(self, sample_obs, device=None):
+        super().__init__()
 
-class TableOriginTransform:
-    """Utility class for transforming observations to table origin coordinate system."""
+        extractors = {}
+        self.out_features = 0
+        feature_size = 256
 
-    def __init__(self, use_table_origin: bool = True, device: torch.device = None):
-        self.use_table_origin = use_table_origin
-        self.device = device or torch.device("cpu")
-        self.table_origin = None
-        self.table_origin_computed = False
+        # Handle RGB observations (from ppo_rgb_fast.py logic)
+        if "rgb" in sample_obs:
+            in_channels = sample_obs["rgb"].shape[-1]
+            image_size = (sample_obs["rgb"].shape[1], sample_obs["rgb"].shape[2])
 
-    def compute_table_origin(self, obs: dict) -> torch.Tensor:
-        """Compute table origin from bimanual robot observations."""
-        if self.table_origin_computed:
-            return self.table_origin
+            extractors["rgb"] = nn.Sequential(
+                layer_init(
+                    nn.Conv2d(in_channels, 32, kernel_size=8, stride=4, device=device)
+                ),
+                nn.ReLU(),
+                layer_init(nn.Conv2d(32, 64, kernel_size=4, stride=2, device=device)),
+                nn.ReLU(),
+                layer_init(nn.Conv2d(64, 64, kernel_size=3, stride=1, device=device)),
+                nn.ReLU(),
+                nn.Flatten(),
+                layer_init(
+                    nn.Linear(
+                        self._get_conv_output_size(image_size, in_channels),
+                        feature_size,
+                        device=device,
+                    )
+                ),
+                nn.ReLU(),
+            )
+            self.out_features += feature_size
 
-        # Extract left and right TCP poses from observations
-        if "left_tcp_pose" in obs and "right_tcp_pose" in obs:
-            # Bimanual mode - use both TCP poses
-            left_tcp_pos = obs["left_tcp_pose"][:, :3]  # Extract position
-            right_tcp_pos = obs["right_tcp_pose"][:, :3]  # Extract position
-        elif "tcp_pose" in obs:
-            # Single arm mode - use TCP pose and estimate other arm position
-            right_tcp_pos = obs["tcp_pose"][:, :3]
-            # Estimate left arm position by mirroring Y coordinate
-            left_tcp_pos = right_tcp_pos.clone()
-            left_tcp_pos[:, 1] = -left_tcp_pos[:, 1]  # Mirror Y coordinate
-        else:
-            # Fallback: use origin
-            batch_size = len(obs[next(iter(obs.keys()))])
-            self.table_origin = torch.zeros(3, device=self.device)
-            self.table_origin_computed = True
-            return self.table_origin
+        # Handle additional RGB cameras (from ppo_rgb_fast.py)
+        for key in sample_obs.keys():
+            if key.endswith("_rgb") or (key.startswith("rgb") and key != "rgb"):
+                in_channels = sample_obs[key].shape[-1]
+                image_size = (sample_obs[key].shape[1], sample_obs[key].shape[2])
 
-        # Ensure offsets are on the correct device
-        right_arm_offset = RIGHT_ARM_OFFSET.to(self.device)
-        left_arm_offset = LEFT_ARM_OFFSET.to(self.device)
+                extractors[key] = nn.Sequential(
+                    layer_init(
+                        nn.Conv2d(
+                            in_channels, 32, kernel_size=8, stride=4, device=device
+                        )
+                    ),
+                    nn.ReLU(),
+                    layer_init(
+                        nn.Conv2d(32, 64, kernel_size=4, stride=2, device=device)
+                    ),
+                    nn.ReLU(),
+                    layer_init(
+                        nn.Conv2d(64, 64, kernel_size=3, stride=1, device=device)
+                    ),
+                    nn.ReLU(),
+                    nn.Flatten(),
+                    layer_init(
+                        nn.Linear(
+                            self._get_conv_output_size(image_size, in_channels),
+                            feature_size,
+                            device=device,
+                        )
+                    ),
+                    nn.ReLU(),
+                )
+                self.out_features += feature_size
 
-        # Calculate table origin (use first environment)
-        right_base_pos = right_tcp_pos[0]  # Use first environment
-        left_base_pos = left_tcp_pos[0]
+        # Handle state observations (from ppo_rgb_fast.py)
+        if "state" in sample_obs:
+            state_size = sample_obs["state"].shape[-1]
+            extractors["state"] = nn.Sequential(
+                layer_init(nn.Linear(state_size, 256, device=device)),
+                nn.ReLU(),
+                layer_init(nn.Linear(256, 256, device=device)),
+                nn.ReLU(),
+            )
+            self.out_features += 256
 
-        # Calculate table origin such that:
-        # right_base_pos = table_origin + right_arm_offset
-        # left_base_pos = table_origin + left_arm_offset
-        table_origin_from_right = right_base_pos - right_arm_offset
-        table_origin_from_left = left_base_pos - left_arm_offset
+        # Handle expert action (NEW: specific to expert+residual)
+        if "expert_action" in sample_obs:
+            expert_action_size = sample_obs["expert_action"].shape[-1]
+            extractors["expert_action"] = nn.Sequential(
+                layer_init(nn.Linear(expert_action_size, 128, device=device)),
+                nn.ReLU(),
+            )
+            self.out_features += 128
 
-        self.table_origin = (table_origin_from_right + table_origin_from_left) / 2
-        self.table_origin_computed = True
+        self.extractors = nn.ModuleDict(extractors)
 
-        return self.table_origin
+    def _get_conv_output_size(self, image_size, in_channels):
+        """Calculate the output size of convolutional layers."""
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, in_channels, *image_size)
+            dummy_output = nn.Sequential(
+                nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1),
+                nn.Flatten(),
+            )(dummy_input)
+            return dummy_output.shape[1]
 
-    def transform_observations(self, obs: dict) -> dict:
-        """Transform pose observations to table origin coordinate system."""
-        if not self.use_table_origin:
-            return obs
+    def forward(self, observations) -> torch.Tensor:
+        encoded_tensor_list = []
 
-        # Compute table origin if not done yet
-        table_origin = self.compute_table_origin(obs)
+        for key, extractor in self.extractors.items():
+            if key in observations:
+                # Handle RGB observations (need channel permutation)
+                if "rgb" in key:
+                    # Convert from (B, H, W, C) to (B, C, H, W)
+                    obs = observations[key].permute(0, 3, 1, 2) / 255.0
+                else:
+                    obs = observations[key]
 
-        # Transform pose observations
-        transformed_obs = {}
-        for key, value in obs.items():
-            if key in ["tcp_pose", "left_tcp_pose", "right_tcp_pose", "obj_pose"]:
-                # Transform poses (position only, keep orientation)
-                transformed_value = value.clone()
-                transformed_value[:, :3] = value[:, :3] - table_origin.unsqueeze(0)
-                transformed_obs[key] = transformed_value
-            elif key in [
-                "goal_pos",
-                "tcp_to_obj_pos",
-                "obj_to_goal_pos",
-                "left_tcp_to_obj_pos",
-                "right_tcp_to_obj_pos",
-            ]:
-                # Transform positions
-                transformed_obs[key] = value - table_origin.unsqueeze(0)
-            else:
-                # Keep other observations unchanged
-                transformed_obs[key] = value
+                encoded_tensor_list.append(extractor(obs))
 
-        return transformed_obs
+        return torch.cat(encoded_tensor_list, dim=1)
 
 
 class Agent(nn.Module):
-    def __init__(self, n_obs, n_act, device=None, use_table_origin=True):
+    """Agent class adapted from ppo_rgb_fast.py with expert support."""
+
+    def __init__(self, n_act, sample_obs, device=None):
         super().__init__()
+
+        # CNN feature extractor (extended for expert actions)
+        self.cnn = NatureCNNWithExpert(sample_obs, device=device)
+
+        # Policy and value networks (from ppo_rgb_fast.py)
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(n_obs, 256, device=device)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256, device=device)),
+            layer_init(nn.Linear(self.cnn.out_features, 256, device=device)),
             nn.Tanh(),
             layer_init(nn.Linear(256, 256, device=device)),
             nn.Tanh(),
             layer_init(nn.Linear(256, 1, device=device)),
         )
+
         self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(n_obs, 256, device=device)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256, device=device)),
+            layer_init(nn.Linear(self.cnn.out_features, 256, device=device)),
             nn.Tanh(),
             layer_init(nn.Linear(256, 256, device=device)),
             nn.Tanh(),
             layer_init(nn.Linear(256, n_act, device=device), std=0.01 * np.sqrt(2)),
         )
+
         self.actor_logstd = nn.Parameter(torch.zeros(1, n_act, device=device))
 
-        # Table origin transformation
-        self.table_origin_transform = TableOriginTransform(use_table_origin, device)
-
-    def _flatten_obs(self, obs):
-        """Flatten observation if it's a dictionary, otherwise return as-is."""
-        if isinstance(obs, dict):
-            # Apply table origin transformation before flattening
-            obs = self.table_origin_transform.transform_observations(obs)
-
-            # Flatten dictionary observations into a single tensor
-            flattened_parts = []
-            for key in sorted(obs.keys()):  # Sort keys for consistent ordering
-                value = obs[key]
-                if isinstance(value, torch.Tensor):
-                    flattened_parts.append(value.view(value.shape[0], -1))
-                # Handle nested dictionaries
-                elif isinstance(value, dict):
-                    for nested_key in sorted(value.keys()):
-                        nested_value = value[nested_key]
-                        if isinstance(nested_value, torch.Tensor):
-                            flattened_parts.append(
-                                nested_value.view(nested_value.shape[0], -1)
-                            )
-            return torch.cat(flattened_parts, dim=1)
-        return obs
+    def get_features(self, x):
+        return self.cnn(x)
 
     def get_value(self, x):
-        x = self._flatten_obs(x)
-        return self.critic(x)
+        features = self.get_features(x)
+        return self.critic(features)
 
     def get_action_and_value(self, obs, action=None):
-        obs = self._flatten_obs(obs)
-        action_mean = self.actor_mean(obs)
+        features = self.get_features(obs)
+        action_mean = self.actor_mean(features)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
+
         if action is None:
             action = action_mean + action_std * torch.randn_like(action_mean)
+
         return (
             action,
             probs.log_prob(action).sum(1),
             probs.entropy().sum(1),
-            self.critic(obs),
+            self.critic(features),
         )
 
 
 class Logger:
+    """Logger class from ppo_rgb_fast.py"""
+
     def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
         self.writer = tensorboard
         self.log_wandb = log_wandb
@@ -325,7 +432,8 @@ class Logger:
 
 
 def gae(next_obs, next_done, container, final_values):
-    # bootstrap value if not done
+    """GAE function from ppo_rgb_fast.py"""
+    # Bootstrap value if not done
     next_value = get_value(next_obs).reshape(-1)
     lastgaelam = 0
     nextnonterminals = (~container["dones"]).float().unbind(0)
@@ -336,9 +444,9 @@ def gae(next_obs, next_done, container, final_values):
     advantages = []
     nextnonterminal = (~next_done).float()
     nextvalues = next_value
+
     for t in range(args.num_steps - 1, -1, -1):
         cur_val = vals_unbind[t]
-        # real_next_values = nextvalues * nextnonterminal
         real_next_values = (
             nextnonterminal * nextvalues + final_values[t]
         )  # t instead of t+1
@@ -357,30 +465,16 @@ def gae(next_obs, next_done, container, final_values):
 
 
 def rollout(obs, done):
+    """Rollout function from ppo_rgb_fast.py with expert stats logging"""
     ts = []
     final_values = torch.zeros((args.num_steps, args.num_envs), device=device)
+
     for step in range(args.num_steps):
         # ALGO LOGIC: action logic
         action, logprob, _, value = policy(obs=obs)
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, reward, next_done, infos = step_func(action)
-
-        # ================= NaN / Inf Guard =================
-        if torch.isnan(next_obs).any() or torch.isinf(next_obs).any():
-            bad_mask = torch.isnan(next_obs).any(dim=1) | torch.isinf(next_obs).any(
-                dim=1
-            )
-            bad_indices = bad_mask.nonzero(as_tuple=True)[0]
-            print(f"[NaN/Inf detected] Resetting env indices: {bad_indices}")
-            try:
-                reset_obs, _ = envs.reset(env_ids=bad_indices)
-            except TypeError:
-                # Fallback: full reset if partial reset not supported
-                reset_obs, _ = envs.reset()
-            next_obs[bad_mask] = reset_obs
-            next_done[bad_mask] = False
-        # ====================================================
 
         if "final_info" in infos:
             final_info = infos["final_info"]
@@ -389,10 +483,34 @@ def rollout(obs, done):
                 logger.add_scalar(
                     f"train/{k}", v[done_mask].float().mean(), global_step
                 )
+            # Apply mask to each key in final_observation dictionary
+            for k in infos["final_observation"]:
+                infos["final_observation"][k] = infos["final_observation"][k][done_mask]
+
             with torch.no_grad():
                 final_values[
                     step, torch.arange(args.num_envs, device=device)[done_mask]
-                ] = agent.get_value(infos["final_observation"][done_mask]).view(-1)
+                ] = agent.get_value(infos["final_observation"]).view(-1)
+
+        # Log expert+residual action statistics (NEW: from ppo_fast_expert_residual.py)
+        if "expert_action" in infos and step % 25 == 0:  # Log every 25 steps
+            expert_action = infos["expert_action"]
+            residual_action = infos["residual_action"]
+
+            # Ensure tensors are 2D for norm calculation
+            if expert_action.dim() == 1:
+                expert_action = expert_action.unsqueeze(0)
+            if residual_action.dim() == 1:
+                residual_action = residual_action.unsqueeze(0)
+
+            expert_norm = torch.norm(expert_action, dim=1).mean()
+            residual_norm = torch.norm(residual_action, dim=1).mean()
+            logger.add_scalar(
+                "expert_residual/expert_action_norm", expert_norm, global_step
+            )
+            logger.add_scalar(
+                "expert_residual/residual_action_norm", residual_norm, global_step
+            )
 
         ts.append(
             tensordict.TensorDict._new_unsafe(
@@ -409,12 +527,14 @@ def rollout(obs, done):
         # NOTE (stao): change here for gpu env
         obs = next_obs = next_obs
         done = next_done
+
     # NOTE (stao): need to do .to(device) i think? otherwise container.device is None, not sure if this affects anything
     container = torch.stack(ts, 0).to(device)
     return next_obs, done, container, final_values
 
 
 def update(obs, actions, logprobs, advantages, returns, vals):
+    """Update function from ppo_rgb_fast.py"""
     optimizer.zero_grad()
     _, newlogprob, entropy, newvalue = agent.get_action_and_value(obs, actions)
     logratio = newlogprob - logprobs
@@ -467,6 +587,7 @@ def update(obs, actions, logprobs, advantages, returns, vals):
     )
 
 
+# TensorDict wrapper for update function (from ppo_rgb_fast.py)
 update = tensordict.nn.TensorDictModule(
     update,
     in_keys=["obs", "actions", "logprobs", "advantages", "returns", "vals"],
@@ -481,21 +602,23 @@ update = tensordict.nn.TensorDictModule(
     ],
 )
 
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    # if not args.evaluate: exit()
 
+    # Calculate runtime parameters (from ppo_rgb_fast.py)
     batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = batch_size // args.num_minibatches
     args.batch_size = args.num_minibatches * args.minibatch_size
     args.num_iterations = args.total_timesteps // args.batch_size
+
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"{args.env_id}__{args.exp_name}__{args.expert_type}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
 
-    # TRY NOT TO MODIFY: seeding
+    # TRY NOT TO MODIFY: seeding (from ppo_rgb_fast.py)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -503,51 +626,74 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # Environment setup #######
+    # Environment setup (adapted from ppo_fast_expert_residual.py)
     env_kwargs = dict(
-        obs_mode=args.obs_mode, render_mode="rgb_array", sim_backend="physx_cuda"
+        obs_mode="rgb", render_mode=args.render_mode, sim_backend="physx_cuda"
     )
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
     if args.robot_uids is not None:
         env_kwargs["robot_uids"] = args.robot_uids
-    if args.verbose:
-        env_kwargs["verbose"] = args.verbose
 
-    # Add table origin support for PickBox environments
-    if "PickBox" in args.env_id:
-        env_kwargs["use_table_origin"] = args.use_table_origin
-        if args.verbose:
-            print(f"Using table origin coordinate system: {args.use_table_origin}")
+    # Create temporary environment to get action dimension for expert policy
+    temp_env = gym.make(args.env_id, num_envs=1, **env_kwargs)
+    action_dim = temp_env.action_space.shape[0]
+    temp_env.close()
 
-    envs = gym.make(
-        args.env_id,
+    # Create expert policy (from ppo_fast_expert_residual.py)
+    expert_kwargs = {}
+    if args.expert_type == "ik":
+        expert_kwargs["gain"] = args.ik_gain
+    elif args.expert_type == "model":
+        expert_kwargs["model_path"] = args.model_path
+        expert_kwargs["device"] = str(device)
+
+    expert_policy = create_expert_policy(args.expert_type, action_dim, **expert_kwargs)
+
+    # Create training environment with Expert+Residual wrapper (from ppo_fast_expert_residual.py)
+    envs = ExpertResidualWrapper(
+        env_id=args.env_id,
+        expert_policy_fn=expert_policy,
         num_envs=args.num_envs if not args.evaluate else 1,
+        residual_scale=args.residual_scale,
+        clip_final_action=True,
+        expert_action_noise=args.expert_action_noise,
+        log_actions=False,
+        track_action_stats=args.track_action_stats,
+        device=str(device),
         reconfiguration_freq=args.reconfiguration_freq,
         **env_kwargs,
     )
 
-    if args.verbose:
-        print(f"Created training environment: {args.env_id}")
-        print(f"Environment kwargs: {env_kwargs}")
-        print(
-            f"Number of training environments: {args.num_envs if not args.evaluate else 1}"
-        )
-    eval_envs = gym.make(
-        args.env_id,
+    # Create evaluation environment with Expert+Residual wrapper
+    eval_envs = ExpertResidualWrapper(
+        env_id=args.env_id,
+        expert_policy_fn=expert_policy,
         num_envs=args.num_eval_envs,
+        residual_scale=args.residual_scale,
+        clip_final_action=True,
+        expert_action_noise=0.0,
+        log_actions=False,
+        track_action_stats=False,
+        device=str(device),
         reconfiguration_freq=args.eval_reconfiguration_freq,
         human_render_camera_configs=dict(shader_pack="default"),
         **env_kwargs,
     )
+
+    # Note: Do NOT apply FlattenRGBDObservationWrapper since we handle dict observations directly
+
     if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
+
+    # Recording setup (from ppo_rgb_fast.py)
     if args.capture_video or args.save_trajectory:
         eval_output_dir = f"runs/{run_name}/videos"
         if args.evaluate:
             eval_output_dir = f"{os.path.dirname(args.checkpoint)}/test_videos"
         print(f"Saving eval trajectories/videos to {eval_output_dir}")
+
         if args.save_train_video_freq is not None:
             save_video_trigger = (
                 lambda x: (x // args.num_steps) % args.save_train_video_freq == 0
@@ -569,6 +715,8 @@ if __name__ == "__main__":
             max_steps_per_video=args.num_eval_steps,
             video_fps=30,
         )
+
+    # Vector environment setup (from ppo_rgb_fast.py)
     envs = ManiSkillVectorEnv(
         envs,
         args.num_envs,
@@ -581,14 +729,16 @@ if __name__ == "__main__":
         ignore_terminations=not args.eval_partial_reset,
         record_metrics=True,
     )
+
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
     )
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
     logger = None
+
     if not args.evaluate:
-        print("Running training")
+        print("Running Expert+Residual RGB PPO training")
         if args.track:
             import wandb
 
@@ -609,6 +759,12 @@ if __name__ == "__main__":
                 env_horizon=max_episode_steps,
                 partial_reset=False,
             )
+            config["expert_residual_cfg"] = dict(
+                expert_type=args.expert_type,
+                residual_scale=args.residual_scale,
+                expert_action_noise=args.expert_action_noise,
+                track_action_stats=args.track_action_stats,
+            )
             wandb.init(
                 project=args.wandb_project_name,
                 entity=args.wandb_entity,
@@ -619,7 +775,11 @@ if __name__ == "__main__":
                 group=args.wandb_group,
                 tags=[
                     "ppo",
-                    "walltime_efficient",
+                    "expert_residual",
+                    f"expert_{args.expert_type}",
+                    "rgb",
+                    "vision",
+                    "fast",
                     f"GPU:{torch.cuda.get_device_name()}",
                 ],
             )
@@ -631,23 +791,31 @@ if __name__ == "__main__":
         )
         logger = Logger(log_wandb=args.track, tensorboard=writer)
     else:
-        print("Running evaluation")
+        print("Running Expert+Residual RGB PPO evaluation")
+
+    # Get environment info (from ppo_rgb_fast.py)
     n_act = math.prod(envs.single_action_space.shape)
+    sample_obs = envs.reset()[0]
 
-    n_obs = math.prod(envs.single_observation_space.shape)
+    # Agent setup (using our extended Agent class)
+    agent = Agent(n_act, sample_obs, device=device)
+    if args.checkpoint:
+        agent.load_state_dict(torch.load(args.checkpoint))
 
-    if args.verbose:
-        print(f"\nObservation space: {envs.single_observation_space}")
-        print(f"Action space: {envs.single_action_space}")
-        print(f"Number of observations per env: {n_obs}")
-        print(f"Number of actions per env: {n_act}")
+    # Make a version of agent with detached params for inference (from ppo_rgb_fast.py)
+    agent_inference = Agent(n_act, sample_obs, device=device)
+    agent_inference_p = from_module(agent).data
+    agent_inference_p.to_module(agent_inference)
 
-    assert isinstance(envs.single_action_space, gym.spaces.Box), (
-        "only continuous action space is supported"
+    # Optimizer setup (from ppo_rgb_fast.py)
+    optimizer = optim.Adam(
+        agent.parameters(),
+        lr=torch.tensor(args.learning_rate, device=device),
+        eps=1e-5,
+        capturable=args.cudagraphs and not args.compile,
     )
 
-    # Register step as a special op not to graph break
-    # @torch.library.custom_op("mylib::step", mutates_args=())
+    # Define step function (from ppo_rgb_fast.py)
     def step_func(
         action: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -656,41 +824,26 @@ if __name__ == "__main__":
         next_done = torch.logical_or(terminations, truncations)
         return next_obs, reward, next_done, info
 
-    # Agent #######
-    agent = Agent(n_obs, n_act, device=device, use_table_origin=args.use_table_origin)
-    if args.checkpoint:
-        agent.load_state_dict(torch.load(args.checkpoint))
-    # Make a version of agent with detached params
-    agent_inference = Agent(
-        n_obs, n_act, device=device, use_table_origin=args.use_table_origin
-    )
-    agent_inference_p = from_module(agent).data
-    agent_inference_p.to_module(agent_inference)
-
-    # Optimizer #######
-    optimizer = optim.Adam(
-        agent.parameters(),
-        lr=torch.tensor(args.learning_rate, device=device),
-        eps=1e-5,
-        capturable=args.cudagraphs and not args.compile,
-    )
-
-    # Executables #######
-    # Define networks: wrapping the policy in a TensorDictModule allows us to use CudaGraphModule
+    # Define executables (from ppo_rgb_fast.py)
     policy = agent_inference.get_action_and_value
     get_value = agent_inference.get_value
 
-    # Compile policy
+    # Compile optimizations (from ppo_rgb_fast.py)
     if args.compile:
+        print("🔥 Compiling policy and training functions...")
         policy = torch.compile(policy)
         gae = torch.compile(gae, fullgraph=True)
         update = torch.compile(update)
+        print("✅ Compilation complete!")
 
     if args.cudagraphs:
+        print("🚀 Enabling CUDA graphs...")
         policy = CudaGraphModule(policy)
         gae = CudaGraphModule(gae)
         update = CudaGraphModule(update)
+        print("✅ CUDA graphs enabled!")
 
+    # Training loop (from ppo_rgb_fast.py)
     global_step = 0
     start_time = time.time()
     container_local = None
@@ -702,14 +855,17 @@ if __name__ == "__main__":
 
     for iteration in pbar:
         agent.eval()
+
+        # Evaluation (from ppo_rgb_fast.py)
         if iteration % args.eval_freq == 1:
             stime = time.perf_counter()
             eval_obs, _ = eval_envs.reset()
             eval_metrics = defaultdict(list)
             num_episodes = 0
+
             for _ in range(args.num_eval_steps):
                 with torch.no_grad():
-                    action = agent.actor_mean(eval_obs)
+                    action = agent.actor_mean(agent.get_features(eval_obs))
                     (
                         eval_obs,
                         eval_rew,
@@ -717,11 +873,13 @@ if __name__ == "__main__":
                         eval_truncations,
                         eval_infos,
                     ) = eval_envs.step(action)
+
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
                         num_episodes += mask.sum()
                         for k, v in eval_infos["final_info"]["episode"].items():
                             eval_metrics[k].append(v)
+
             eval_metrics_mean = {}
             for k, v in eval_metrics.items():
                 mean = torch.stack(v).float().mean()
@@ -736,31 +894,34 @@ if __name__ == "__main__":
                 eval_metrics_mean["return"] = torch.tensor(0.0, device=device)
 
             pbar.set_description(
-                f"success_once: {eval_metrics_mean['success_once']:.2f}, "
+                f"Expert={args.expert_type}, success_once: {eval_metrics_mean['success_once']:.2f}, "
                 f"return: {eval_metrics_mean['return']:.2f}"
             )
+
             if logger is not None:
                 eval_time = time.perf_counter() - stime
                 cumulative_times["eval_time"] += eval_time
                 logger.add_scalar("time/eval_time", eval_time, global_step)
+
             if args.evaluate:
                 break
+
+        # Save model (from ppo_rgb_fast.py)
         if args.save_model and iteration % args.eval_freq == 1:
             model_path = f"runs/{run_name}/ckpt_{iteration}.pt"
             torch.save(agent.state_dict(), model_path)
-            if args.verbose:
-                print(
-                    f"Model checkpoint saved to {model_path} at iteration {iteration}"
-                )
-            else:
-                print(f"model saved to {model_path}")
-        # Annealing the rate if instructed to do so.
+            print(f"model saved to {model_path}")
+
+        # Learning rate annealing (from ppo_rgb_fast.py)
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"].copy_(lrnow)
 
+        # Training step (from ppo_rgb_fast.py)
+        agent.train()
         torch.compiler.cudagraph_mark_step_begin()
+
         rollout_time = time.perf_counter()
         next_obs, next_done, container, final_values = rollout(next_obs, next_done)
         rollout_time = time.perf_counter() - rollout_time
@@ -771,7 +932,7 @@ if __name__ == "__main__":
         container = gae(next_obs, next_done, container, final_values)
         container_flat = container.view(-1)
 
-        # Optimizing the policy and value network
+        # Policy optimization (from ppo_rgb_fast.py)
         clipfracs = []
         for epoch in range(args.update_epochs):
             b_inds = torch.randperm(container_flat.shape[0], device=device).split(
@@ -782,50 +943,59 @@ if __name__ == "__main__":
 
                 out = update(container_local, tensordict_out=tensordict.TensorDict())
                 clipfracs.append(out["clipfrac"])
+
                 if args.target_kl is not None and out["approx_kl"] > args.target_kl:
                     break
             else:
                 continue
             break
+
         update_time = time.perf_counter() - update_time
         cumulative_times["update_time"] += update_time
 
-        logger.add_scalar(
-            "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
-        )
-        logger.add_scalar("losses/value_loss", out["v_loss"].item(), global_step)
-        logger.add_scalar("losses/policy_loss", out["pg_loss"].item(), global_step)
-        logger.add_scalar("losses/entropy", out["entropy_loss"].item(), global_step)
-        logger.add_scalar(
-            "losses/old_approx_kl", out["old_approx_kl"].item(), global_step
-        )
-        logger.add_scalar("losses/approx_kl", out["approx_kl"].item(), global_step)
-        logger.add_scalar(
-            "losses/clipfrac", torch.stack(clipfracs).mean().cpu().item(), global_step
-        )
-        logger.add_scalar(
-            "charts/SPS", int(global_step / (time.time() - start_time)), global_step
-        )
-        logger.add_scalar("time/step", global_step, global_step)
-        logger.add_scalar("time/update_time", update_time, global_step)
-        logger.add_scalar("time/rollout_time", rollout_time, global_step)
-        logger.add_scalar(
-            "time/rollout_fps",
-            args.num_envs * args.num_steps / rollout_time,
-            global_step,
-        )
-        for k, v in cumulative_times.items():
-            logger.add_scalar(f"time/total_{k}", v, global_step)
-        logger.add_scalar(
-            "time/total_rollout+update_time",
-            cumulative_times["rollout_time"] + cumulative_times["update_time"],
-            global_step,
-        )
+        # Logging (from ppo_rgb_fast.py)
+        if logger is not None:
+            logger.add_scalar(
+                "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
+            )
+            logger.add_scalar("losses/value_loss", out["v_loss"].item(), global_step)
+            logger.add_scalar("losses/policy_loss", out["pg_loss"].item(), global_step)
+            logger.add_scalar("losses/entropy", out["entropy_loss"].item(), global_step)
+            logger.add_scalar(
+                "losses/old_approx_kl", out["old_approx_kl"].item(), global_step
+            )
+            logger.add_scalar("losses/approx_kl", out["approx_kl"].item(), global_step)
+            logger.add_scalar(
+                "losses/clipfrac",
+                torch.stack(clipfracs).mean().cpu().item(),
+                global_step,
+            )
+            logger.add_scalar(
+                "charts/SPS", int(global_step / (time.time() - start_time)), global_step
+            )
+            logger.add_scalar("time/step", global_step, global_step)
+            logger.add_scalar("time/update_time", update_time, global_step)
+            logger.add_scalar("time/rollout_time", rollout_time, global_step)
+            logger.add_scalar(
+                "time/rollout_fps",
+                args.num_envs * args.num_steps / rollout_time,
+                global_step,
+            )
+            for k, v in cumulative_times.items():
+                logger.add_scalar(f"time/total_{k}", v, global_step)
+            logger.add_scalar(
+                "time/total_rollout+update_time",
+                cumulative_times["rollout_time"] + cumulative_times["update_time"],
+                global_step,
+            )
+
+    # Final model save (from ppo_rgb_fast.py)
     if not args.evaluate:
         if args.save_model:
             model_path = f"runs/{run_name}/final_ckpt.pt"
             torch.save(agent.state_dict(), model_path)
             print(f"model saved to {model_path}")
         logger.close()
+
     envs.close()
     eval_envs.close()

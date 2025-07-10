@@ -1,5 +1,19 @@
+"""
+PPO with Expert+Residual Action Decomposition for ManiSkill
+
+This script combines the high-performance PPO implementation from ppo_fast.py
+with Expert+Residual action decomposition. The agent learns residual corrections
+to expert actions for more efficient policy learning.
+
+Based on CleanRL PPO implementation: https://github.com/vwxyzjn/cleanrl
+"""
+
 import os
 
+from mani_skill.envs.wrappers.expert_residual import (
+    ExpertResidualWrapper,
+    create_expert_policy,
+)
 from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
@@ -8,7 +22,6 @@ from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 
 import math
-import os
 import random
 import time
 from collections import defaultdict
@@ -49,11 +62,11 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "ManiSkill"
+    wandb_project_name: str = "ManiSkill-ExpertResidual"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
-    wandb_group: str = "PPO"
+    wandb_group: str = "PPO-ExpertResidual"
     """the group of the run for wandb"""
     capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
@@ -97,6 +110,20 @@ class Args:
     """the control mode to use for the environment"""
     obs_mode: str = "state"
     """the observation mode to use for the environment"""
+
+    # Expert + Residual specific arguments
+    expert_type: str = "zero"
+    """type of expert policy: 'zero', 'ik', 'model'"""
+    residual_scale: float = 1.0
+    """scale factor for residual actions"""
+    expert_action_noise: float = 0.0
+    """Gaussian noise std to add to expert actions"""
+    track_action_stats: bool = False
+    """whether to track expert/residual action statistics"""
+    ik_gain: float = 2.0
+    """proportional gain for IK expert policy"""
+    model_path: Optional[str] = None
+    """path to pre-trained model for model expert policy"""
 
     # Algorithm specific arguments
     total_timesteps: int = 10000000
@@ -394,6 +421,17 @@ def rollout(obs, done):
                     step, torch.arange(args.num_envs, device=device)[done_mask]
                 ] = agent.get_value(infos["final_observation"][done_mask]).view(-1)
 
+        # Log expert+residual action statistics if available
+        if "expert_action" in infos and step % 25 == 0:  # Log every 25 steps
+            expert_norm = torch.norm(infos["expert_action"], dim=1).mean()
+            residual_norm = torch.norm(infos["residual_action"], dim=1).mean()
+            logger.add_scalar(
+                "expert_residual/expert_action_norm", expert_norm, global_step
+            )
+            logger.add_scalar(
+                "expert_residual/residual_action_norm", residual_norm, global_step
+            )
+
         ts.append(
             tensordict.TensorDict._new_unsafe(
                 obs=obs,
@@ -483,7 +521,6 @@ update = tensordict.nn.TensorDictModule(
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    # if not args.evaluate: exit()
 
     batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = batch_size // args.num_minibatches
@@ -491,7 +528,7 @@ if __name__ == "__main__":
     args.num_iterations = args.total_timesteps // args.batch_size
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"{args.env_id}__{args.exp_name}__{args.expert_type}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
 
@@ -520,46 +557,108 @@ if __name__ == "__main__":
         if args.verbose:
             print(f"Using table origin coordinate system: {args.use_table_origin}")
 
-    envs = gym.make(
-        args.env_id,
+    # Create temporary environment to get action dimension for expert policy
+    temp_env = gym.make(args.env_id, num_envs=1, **env_kwargs)
+    action_dim = temp_env.action_space.shape[0]
+
+    # Also get the base observation space to ensure consistency
+    base_obs_space = temp_env.observation_space
+    if hasattr(base_obs_space, "shape") and len(base_obs_space.shape) > 1:
+        # Vectorized observation space - use per-environment dimensions
+        base_obs_dim = base_obs_space.shape[1]
+    else:
+        # Single dimension observation space
+        base_obs_dim = base_obs_space.shape[0]
+
+    expected_extended_obs_dim = base_obs_dim + action_dim
+    temp_env.close()
+
+    if args.verbose:
+        print("Environment analysis:")
+        print(f"  Base observation dim: {base_obs_dim}")
+        print(f"  Action dim: {action_dim}")
+        print(f"  Expected extended obs dim: {expected_extended_obs_dim}")
+
+    # Create expert policy
+    expert_kwargs = {}
+    if args.expert_type == "ik":
+        expert_kwargs["gain"] = args.ik_gain
+    elif args.expert_type == "model":
+        expert_kwargs["model_path"] = args.model_path
+        expert_kwargs["device"] = str(device)
+
+    expert_policy = create_expert_policy(args.expert_type, action_dim, **expert_kwargs)
+
+    # Create training environment with Expert+Residual wrapper
+    envs = ExpertResidualWrapper(
+        env_id=args.env_id,
+        expert_policy_fn=expert_policy,
         num_envs=args.num_envs if not args.evaluate else 1,
+        residual_scale=args.residual_scale,
+        clip_final_action=True,
+        expert_action_noise=args.expert_action_noise,
+        log_actions=False,  # Disable verbose logging for training
+        track_action_stats=args.track_action_stats,
+        device=str(device),
         reconfiguration_freq=args.reconfiguration_freq,
         **env_kwargs,
     )
 
     if args.verbose:
-        print(f"Created training environment: {args.env_id}")
-        print(f"Environment kwargs: {env_kwargs}")
+        print("Created Expert+Residual training environment:")
+        print(f"  Environment: {args.env_id}")
+        print(f"  Expert type: {args.expert_type}")
+        print(f"  Residual scale: {args.residual_scale}")
         print(
-            f"Number of training environments: {args.num_envs if not args.evaluate else 1}"
+            f"  Number of training environments: {args.num_envs if not args.evaluate else 1}"
         )
-    eval_envs = gym.make(
-        args.env_id,
+
+    # Create evaluation environment with Expert+Residual wrapper
+    eval_envs = ExpertResidualWrapper(
+        env_id=args.env_id,
+        expert_policy_fn=expert_policy,
         num_envs=args.num_eval_envs,
+        residual_scale=args.residual_scale,
+        clip_final_action=True,
+        expert_action_noise=0.0,  # No noise during evaluation
+        log_actions=False,
+        track_action_stats=False,  # No stats tracking for eval
+        device=str(device),
         reconfiguration_freq=args.eval_reconfiguration_freq,
         human_render_camera_configs=dict(shader_pack="default"),
         **env_kwargs,
     )
-    if isinstance(envs.action_space, gym.spaces.Dict):
-        envs = FlattenActionSpaceWrapper(envs)
-        eval_envs = FlattenActionSpaceWrapper(eval_envs)
+
+    # Consistency check: ensure training and evaluation have same observation space
+    train_obs_shape = envs.observation_space.shape
+    eval_obs_shape = eval_envs.observation_space.shape
+
+    if train_obs_shape != eval_obs_shape:
+        raise ValueError(
+            f"Training and evaluation observation spaces must match!\n"
+            f"Training obs space: {train_obs_shape}\n"
+            f"Evaluation obs space: {eval_obs_shape}\n"
+            f"This suggests inconsistent base environment observation spaces."
+        )
+
+    if args.verbose:
+        print("✅ Observation space consistency check passed:")
+        print(f"  Training obs space: {train_obs_shape}")
+        print(f"  Evaluation obs space: {eval_obs_shape}")
+        print(
+            f"  Both environments use Expert+Residual wrapper with {args.expert_type} expert"
+        )
+
+    # NOTE: Skip additional wrappers that cause conflicts with ExpertResidualWrapper
+    # The ExpertResidualWrapper already handles vectorization efficiently
+
     if args.capture_video or args.save_trajectory:
         eval_output_dir = f"runs/{run_name}/videos"
         if args.evaluate:
             eval_output_dir = f"{os.path.dirname(args.checkpoint)}/test_videos"
         print(f"Saving eval trajectories/videos to {eval_output_dir}")
-        if args.save_train_video_freq is not None:
-            save_video_trigger = (
-                lambda x: (x // args.num_steps) % args.save_train_video_freq == 0
-            )
-            envs = RecordEpisode(
-                envs,
-                output_dir=f"runs/{run_name}/train_videos",
-                save_trajectory=False,
-                save_video_trigger=save_video_trigger,
-                max_steps_per_video=args.num_steps,
-                video_fps=30,
-            )
+
+        # Only apply RecordEpisode to eval environment to avoid wrapper conflicts
         eval_envs = RecordEpisode(
             eval_envs,
             output_dir=eval_output_dir,
@@ -569,26 +668,94 @@ if __name__ == "__main__":
             max_steps_per_video=args.num_eval_steps,
             video_fps=30,
         )
-    envs = ManiSkillVectorEnv(
-        envs,
-        args.num_envs,
-        ignore_terminations=not args.partial_reset,
-        record_metrics=True,
+        if args.verbose:
+            print("Applied RecordEpisode wrapper to evaluation environment")
+
+    # Use ExpertResidualWrapper's built-in vectorization instead of ManiSkillVectorEnv
+    # This avoids the observation space conflicts while maintaining high performance
+
+    if args.verbose:
+        print("Using Expert+Residual wrapper's native vectorization:")
+        print(f"  Training obs space: {envs.observation_space.shape}")
+        print(f"  Evaluation obs space: {eval_envs.observation_space.shape}")
+
+    # Check that environments support the expected interface
+    assert hasattr(envs, "action_space") and hasattr(envs, "observation_space"), (
+        "Environment must have action_space and observation_space attributes"
     )
-    eval_envs = ManiSkillVectorEnv(
-        eval_envs,
-        args.num_eval_envs,
-        ignore_terminations=not args.eval_partial_reset,
-        record_metrics=True,
-    )
+
+    # Create single_action_space and single_observation_space for compatibility
+    if hasattr(envs.action_space, "shape") and len(envs.action_space.shape) > 1:
+        # Vectorized action space - create single space
+        envs.single_action_space = gym.spaces.Box(
+            low=envs.action_space.low[0],
+            high=envs.action_space.high[0],
+            shape=envs.action_space.shape[1:],
+            dtype=envs.action_space.dtype,
+        )
+    else:
+        # Already single action space
+        envs.single_action_space = envs.action_space
+
+    if (
+        hasattr(envs.observation_space, "shape")
+        and len(envs.observation_space.shape) > 1
+    ):
+        # Vectorized observation space - create single space
+        envs.single_observation_space = gym.spaces.Box(
+            low=envs.observation_space.low[0]
+            if hasattr(envs.observation_space, "low")
+            else -np.inf,
+            high=envs.observation_space.high[0]
+            if hasattr(envs.observation_space, "high")
+            else np.inf,
+            shape=envs.observation_space.shape[1:],
+            dtype=envs.observation_space.dtype,
+        )
+    else:
+        # Already single observation space or per-environment space
+        envs.single_observation_space = envs.observation_space
+
+    # Same for eval_envs
+    if (
+        hasattr(eval_envs.action_space, "shape")
+        and len(eval_envs.action_space.shape) > 1
+    ):
+        eval_envs.single_action_space = gym.spaces.Box(
+            low=eval_envs.action_space.low[0],
+            high=eval_envs.action_space.high[0],
+            shape=eval_envs.action_space.shape[1:],
+            dtype=eval_envs.action_space.dtype,
+        )
+    else:
+        eval_envs.single_action_space = eval_envs.action_space
+
+    if (
+        hasattr(eval_envs.observation_space, "shape")
+        and len(eval_envs.observation_space.shape) > 1
+    ):
+        eval_envs.single_observation_space = gym.spaces.Box(
+            low=eval_envs.observation_space.low[0]
+            if hasattr(eval_envs.observation_space, "low")
+            else -np.inf,
+            high=eval_envs.observation_space.high[0]
+            if hasattr(eval_envs.observation_space, "high")
+            else np.inf,
+            shape=eval_envs.observation_space.shape[1:],
+            dtype=eval_envs.observation_space.dtype,
+        )
+
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
     )
 
-    max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
+    # Use the envs directly since ExpertResidualWrapper doesn't have _env like ManiSkillVectorEnv
+    max_episode_steps = gym_utils.find_max_episode_steps_value(envs.env)
+
+    # Initialize logger and tracking
     logger = None
     if not args.evaluate:
-        print("Running training")
+        print("Running Expert+Residual PPO training")
         if args.track:
             import wandb
 
@@ -609,6 +776,12 @@ if __name__ == "__main__":
                 env_horizon=max_episode_steps,
                 partial_reset=False,
             )
+            config["expert_residual_cfg"] = dict(
+                expert_type=args.expert_type,
+                residual_scale=args.residual_scale,
+                expert_action_noise=args.expert_action_noise,
+                track_action_stats=args.track_action_stats,
+            )
             wandb.init(
                 project=args.wandb_project_name,
                 entity=args.wandb_entity,
@@ -619,6 +792,8 @@ if __name__ == "__main__":
                 group=args.wandb_group,
                 tags=[
                     "ppo",
+                    "expert_residual",
+                    f"expert_{args.expert_type}",
                     "walltime_efficient",
                     f"GPU:{torch.cuda.get_device_name()}",
                 ],
@@ -631,23 +806,25 @@ if __name__ == "__main__":
         )
         logger = Logger(log_wandb=args.track, tensorboard=writer)
     else:
-        print("Running evaluation")
-    n_act = math.prod(envs.single_action_space.shape)
+        print("Running Expert+Residual PPO evaluation")
 
+    # Calculate observation and action dimensions from the final wrapped environments
+    n_act = math.prod(envs.single_action_space.shape)
     n_obs = math.prod(envs.single_observation_space.shape)
 
     if args.verbose:
-        print(f"\nObservation space: {envs.single_observation_space}")
-        print(f"Action space: {envs.single_action_space}")
-        print(f"Number of observations per env: {n_obs}")
-        print(f"Number of actions per env: {n_act}")
+        print("\nFinal environment specifications:")
+        print(f"  Observation space: {envs.single_observation_space}")
+        print(f"  Action space: {envs.single_action_space}")
+        print(f"  Number of observations per env: {n_obs}")
+        print(f"  Number of actions per env: {n_act}")
+        print(f"  Max episode steps: {max_episode_steps}")
 
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
     )
 
     # Register step as a special op not to graph break
-    # @torch.library.custom_op("mylib::step", mutates_args=())
     def step_func(
         action: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -736,7 +913,7 @@ if __name__ == "__main__":
                 eval_metrics_mean["return"] = torch.tensor(0.0, device=device)
 
             pbar.set_description(
-                f"success_once: {eval_metrics_mean['success_once']:.2f}, "
+                f"Expert={args.expert_type}, success_once: {eval_metrics_mean['success_once']:.2f}, "
                 f"return: {eval_metrics_mean['return']:.2f}"
             )
             if logger is not None:

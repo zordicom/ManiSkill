@@ -3,6 +3,10 @@ PickBox-v1 configuration file for different robots.
 Based on PickCube configurations but adapted for the pick-and-place task with baskets.
 """
 
+import numpy as np
+
+from .bimanual_pick_place_cfgs import ROBOT_CONFIGS as BIMANUAL_ROBOT_CONFIGS
+
 PICK_BOX_CONFIGS = {
     "panda": {
         "cube_half_size": 0.02,
@@ -14,6 +18,15 @@ PICK_BOX_CONFIGS = {
         "sensor_cam_target_pos": [-0.1, 0, 0.1],
         "human_cam_eye_pos": [0.6, 0.7, 0.6],
         "human_cam_target_pos": [0.0, 0.0, 0.35],
+        # Add bimanual arm configurations
+        "left_arm": {
+            "pose": BIMANUAL_ROBOT_CONFIGS["panda"]["left_arm"]["pose"].p,
+            "home_qpos": BIMANUAL_ROBOT_CONFIGS["panda"]["left_arm"]["home_qpos"],
+        },
+        "right_arm": {
+            "pose": BIMANUAL_ROBOT_CONFIGS["panda"]["right_arm"]["pose"].p,
+            "home_qpos": BIMANUAL_ROBOT_CONFIGS["panda"]["right_arm"]["home_qpos"],
+        },
     },
     "panda_wristcam": {
         "cube_half_size": 0.02,
@@ -25,6 +38,19 @@ PICK_BOX_CONFIGS = {
         "sensor_cam_target_pos": [-0.1, 0, 0.1],
         "human_cam_eye_pos": [0.6, 0.7, 0.6],
         "human_cam_target_pos": [0.0, 0.0, 0.35],
+        # Add bimanual arm configurations
+        "left_arm": {
+            "pose": BIMANUAL_ROBOT_CONFIGS["panda_wristcam"]["left_arm"]["pose"].p,
+            "home_qpos": BIMANUAL_ROBOT_CONFIGS["panda_wristcam"]["left_arm"][
+                "home_qpos"
+            ],
+        },
+        "right_arm": {
+            "pose": BIMANUAL_ROBOT_CONFIGS["panda_wristcam"]["right_arm"]["pose"].p,
+            "home_qpos": BIMANUAL_ROBOT_CONFIGS["panda_wristcam"]["right_arm"][
+                "home_qpos"
+            ],
+        },
     },
     "a1_galaxea": {
         # Use same tight thresholds as PickCube for A1 Galaxea
@@ -53,6 +79,15 @@ PICK_BOX_CONFIGS = {
         "static_top_cam_fovy": 1.06,  # Radians
         "static_top_cam_near": 0.1,
         "static_top_cam_far": 1000.0,
+        # Add bimanual arm configurations
+        "left_arm": {
+            "pose": BIMANUAL_ROBOT_CONFIGS["a1_galaxea"]["left_arm"]["pose"].p,
+            "home_qpos": BIMANUAL_ROBOT_CONFIGS["a1_galaxea"]["left_arm"]["home_qpos"],
+        },
+        "right_arm": {
+            "pose": BIMANUAL_ROBOT_CONFIGS["a1_galaxea"]["right_arm"]["pose"].p,
+            "home_qpos": BIMANUAL_ROBOT_CONFIGS["a1_galaxea"]["right_arm"]["home_qpos"],
+        },
     },
     "xarm6_robotiq": {
         "cube_half_size": 0.02,
@@ -64,5 +99,18 @@ PICK_BOX_CONFIGS = {
         "sensor_cam_target_pos": [-0.1, 0, 0.1],
         "human_cam_eye_pos": [0.6, 0.7, 0.6],
         "human_cam_target_pos": [0.0, 0.0, 0.35],
+        # Add bimanual arm configurations
+        "left_arm": {
+            "pose": BIMANUAL_ROBOT_CONFIGS["xarm6_robotiq"]["left_arm"]["pose"].p,
+            "home_qpos": BIMANUAL_ROBOT_CONFIGS["xarm6_robotiq"]["left_arm"][
+                "home_qpos"
+            ],
+        },
+        "right_arm": {
+            "pose": BIMANUAL_ROBOT_CONFIGS["xarm6_robotiq"]["right_arm"]["pose"].p,
+            "home_qpos": BIMANUAL_ROBOT_CONFIGS["xarm6_robotiq"]["right_arm"][
+                "home_qpos"
+            ],
+        },
     },
 }

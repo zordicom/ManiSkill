@@ -56,8 +56,8 @@ class A1Galaxea(BaseAgent):
                 np.deg2rad(80.0),  # arm_joint4
                 np.deg2rad(-35.0),  # arm_joint5
                 np.deg2rad(15.0),  # arm_joint6
-                -0.03,  # gripper1_axis (open, master joint)
-                -0.03,  # gripper2_axis (open, mimic joint - should match gripper1_axis)
+                -0.01,  # gripper1_axis (open, master joint)
+                -0.01,  # gripper2_axis (open, mimic joint - should match gripper1_axis)
             ]),
             pose=sapien.Pose(),
         ),
@@ -291,13 +291,13 @@ class A1Galaxea(BaseAgent):
 
         # Calculate the look_at pose for the camera
         # Camera position relative to galaxea_eoat_set (moved forward toward TCP)
-        camera_eye = [0.06, 0, 0.07]  # Moved closer to TCP: X reduced, Z increased
-        # TCP position relative to galaxea_eoat_set
-        tcp_target = [0, 0, 0.15]
+        camera_eye = [0.07, 0, 0.06]  # Moved closer to TCP: X reduced, Z increased
+        # # TCP position relative to galaxea_eoat_set
+        tcp_lookat_target = [0, 0, 0.13]
 
         # Use sapien_utils.look_at to calculate the correct orientation
         # This will make the camera look from camera_eye toward tcp_target
-        camera_pose = sapien_utils.look_at(eye=camera_eye, target=tcp_target)
+        camera_pose = sapien_utils.look_at(eye=camera_eye, target=tcp_lookat_target)
 
         return [
             CameraConfig(
@@ -305,7 +305,7 @@ class A1Galaxea(BaseAgent):
                 pose=camera_pose,
                 width=224,
                 height=224,
-                fov=60 * np.pi / 180,  # 60 degrees as specified in XML
+                fov=70 * np.pi / 180,  # 60 degrees as specified in XML
                 near=0.01,
                 far=100,
                 mount=self.robot.links_map[
