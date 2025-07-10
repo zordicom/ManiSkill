@@ -30,6 +30,9 @@ DEFAULT_NUM_ENVS_RGB = 32
 # Expected format: "eval_<metric_name>_mean=<value>"
 EVAL_LINE_RE = re.compile(r"eval_(\w+)_mean=([0-9eE+\.\-]+)")
 
+# Metrics we care about from stdout (the key between "eval_" and "_mean")
+METRICS_OF_INTEREST = ["success_once", "reward"]
+
 
 @dataclass(frozen=True)
 class ExperimentConfig:
@@ -73,7 +76,8 @@ def _parse_metrics_from_line(line: str, metrics: Dict[str, float]) -> None:
     match = EVAL_LINE_RE.search(line)
     if match:
         key, value_str = match.group(1), match.group(2)
-        metrics[key] = float(value_str)
+        if key in METRICS_OF_INTEREST:
+            metrics[key] = float(value_str)
 
 
 def _format_seconds(seconds: float) -> str:
@@ -158,21 +162,21 @@ def run_experiment(cfg: ExperimentConfig, dry_run: bool = False) -> ExperimentRe
 
 
 def print_summary(results: List[ExperimentResult]) -> None:
-    """Nicely formatted comparison of all experiment outcomes."""
-    header = (
-        f"\n{'Experiment':<22} | {'Wall-time':>10} | {'Metric':<18} | {'Value':>10}"
+    """Prints wall-time and selected evaluation metrics for each experiment."""
+    header = f"\n{'Experiment':<28} | {'Wall-time':>9} | " + " | ".join(
+        f"{m:<14}" for m in METRICS_OF_INTEREST
     )
     print(header)
     print("-" * len(header))
     for res in results:
         time_str = _format_seconds(res.wall_time_s)
-        if res.metrics:
-            for metric, value in res.metrics.items():
-                print(
-                    f"{res.config.name:<22} | {time_str:>10} | {metric:<18} | {value:>10.4f}"
-                )
-        else:
-            print(f"{res.config.name:<22} | {time_str:>10} | {'N/A':<18} | {'--':>10}")
+        metric_values = [
+            f"{res.metrics.get(m, float('nan')):>14.4f}"
+            if m in res.metrics
+            else f"{'--':>14}"
+            for m in METRICS_OF_INTEREST
+        ]
+        print(f"{res.config.name:<28} | {time_str:>9} | " + " | ".join(metric_values))
 
 
 # =============================================================================
