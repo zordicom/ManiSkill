@@ -4,50 +4,12 @@
 
 This directory contains a comprehensive PPO robustness study for the PickCubeNoisy environment, designed to test how well PPO agents handle various types of noise in observations, rewards, and actions.
 
-## Features
-
-- **Live Output**: Real-time PPO training progress display
-- **Noise Injection**: Configurable noise in observations, rewards, and actions
-- **Curriculum Learning**: Progressive noise scheduling over training episodes
-- **Multiple Robots**: Support for all robots from the original PickCube environment
-- **Comprehensive Evaluation**: 12 different noise configurations
-- **Video Recording**: Training and evaluation videos for analysis
-- **CSV Export**: Automated export of results to multiple CSV formats
-- **WandB Integration**: Experiment tracking and visualization with live metrics
-
 ## Files
 
 - `pick_cube_noisy_ppo.py` - Main experiment runner (12 configurations, **live output**)
 - `pick_cube_noisy_ppo_runner.py` - PPO wrapper script with noise parameter handling
-- `test_pick_cube_noisy_single.py` - Single test script for verification (**live output**)
-- `test_pick_cube_noisy_main_single.py` - Test single main experiment (**live output**)
-- `CSV_Export_Documentation.md` - Detailed CSV export documentation
 
 ## Quick Start
-
-### 1. Prerequisites
-
-```bash
-cd /home/gilwoo/workspace/ManiSkill
-conda activate maniskill
-pip install pandas  # Required for CSV export
-```
-
-### 2. Run Single Test
-
-```bash
-# Quick test with live PPO output
-python scripts/rl_tests/test_pick_cube_noisy_single.py
-```
-
-### 3. Test Single Main Experiment
-
-```bash
-# Test one configuration from main suite with live output
-python scripts/rl_tests/test_pick_cube_noisy_main_single.py
-```
-
-### 4. Run Full Experiment Suite
 
 ```bash
 # Run all 12 experiments with live output (4-6 hours)
