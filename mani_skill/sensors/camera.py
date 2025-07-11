@@ -4,18 +4,11 @@ import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
-import numpy as np
 import sapien
-import sapien.render
 import torch
 from torch._tensor import Tensor
 
-from mani_skill.render import (
-    PREBUILT_SHADER_CONFIGS,
-    SAPIEN_RENDER_SYSTEM,
-    ShaderConfig,
-    set_shader_pack,
-)
+from mani_skill.render import PREBUILT_SHADER_CONFIGS, ShaderConfig, set_shader_pack
 from mani_skill.utils.structs import Actor, Articulation, Link
 from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.structs.types import Array
@@ -23,14 +16,13 @@ from mani_skill.utils.structs.types import Array
 if TYPE_CHECKING:
     from mani_skill.envs.scene import ManiSkillScene
 
-from mani_skill.utils import sapien_utils, visualization
+from mani_skill.utils import sapien_utils
 
 from .base_sensor import BaseSensor, BaseSensorConfig
 
 
 @dataclass
 class CameraConfig(BaseSensorConfig):
-
     uid: str
     """uid (str): unique id of the camera"""
     pose: Pose
@@ -67,12 +59,11 @@ class CameraConfig(BaseSensorConfig):
         return self.__class__.__name__ + "(" + str(self.__dict__) + ")"
 
 
-def update_camera_configs_from_dict(
-    camera_configs: Dict[str, CameraConfig], config_dict: Dict[str, dict]
-):
+def update_camera_configs_from_dict(camera_configs: Dict[str, CameraConfig], config_dict: Dict[str, dict]):
     # Update CameraConfig to StereoDepthCameraConfig
     if config_dict.pop("use_stereo_depth", False):
         from .depth_camera import StereoDepthCameraConfig  # fmt: skip
+
         for name, config in camera_configs.items():
             camera_configs[name] = StereoDepthCameraConfig.fromCameraConfig(config)
 
@@ -95,6 +86,7 @@ def update_camera_configs_from_dict(
         # Update CameraConfig to StereoDepthCameraConfig
         if v.pop("use_stereo_depth", False):
             from .depth_camera import StereoDepthCameraConfig  # fmt: skip
+
             config = camera_configs[name]
             camera_configs[name] = StereoDepthCameraConfig.fromCameraConfig(config)
 
@@ -146,9 +138,7 @@ class Camera(BaseSensor):
             else:
                 # if given an articulation and entity_uid (as a string), find the correct link to mount on
                 # this is just for convenience so robot configurations can pick link to mount to by string/id
-                self.entity = sapien_utils.get_obj_by_name(
-                    articulation.get_links(), entity_uid
-                )
+                self.entity = sapien_utils.get_obj_by_name(articulation.get_links(), entity_uid)
             if self.entity is None:
                 raise RuntimeError(f"Mount entity ({entity_uid}) is not found")
 
@@ -222,9 +212,7 @@ class Camera(BaseSensor):
         output_textures = self.camera.get_picture(required_texture_names)
         for texture_name, texture in zip(required_texture_names, output_textures):
             if apply_texture_transforms:
-                images_dict |= self.config.shader_config.texture_transforms[
-                    texture_name
-                ](texture)
+                images_dict |= self.config.shader_config.texture_transforms[texture_name](texture)
             else:
                 images_dict[texture_name] = texture
         if not rgb and "rgb" in images_dict:
@@ -263,9 +251,7 @@ def normalize_depth(depth, min_depth=0, max_depth=None):
     return depth
 
 
-def camera_observations_to_images(
-    observations: Dict[str, torch.Tensor], max_depth=None
-) -> List[Array]:
+def camera_observations_to_images(observations: Dict[str, torch.Tensor], max_depth=None) -> List[Array]:
     """Parse images from camera observations."""
     images = dict()
     for key in observations:

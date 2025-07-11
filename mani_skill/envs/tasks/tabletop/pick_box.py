@@ -13,7 +13,6 @@ Success is declared when the box centre is within `goal_thresh` of the basket
 centre **and** the robot is static.
 """
 
-import math
 from typing import Any, Dict, Tuple, Union
 
 import numpy as np
@@ -25,14 +24,11 @@ from mani_skill import PACKAGE_ASSET_DIR
 from mani_skill.agents.multi_agent import MultiAgent
 from mani_skill.agents.robots import A1Galaxea, Panda, PandaWristCam, XArm6Robotiq
 from mani_skill.envs.sapien_env import BaseEnv
-from mani_skill.envs.tasks.tabletop.bimanual_pick_place_cfgs import (
-    BIMANUAL_PICK_PLACE_CONFIG,
-    ROBOT_CONFIGS,
-)
+from mani_skill.envs.tasks.tabletop.bimanual_pick_place_cfgs import BIMANUAL_PICK_PLACE_CONFIG
 from mani_skill.envs.tasks.tabletop.pick_box_cfgs import PICK_BOX_CONFIGS
-from mani_skill.envs.tasks.tabletop.pick_cube_cfgs import PICK_CUBE_CONFIGS
 from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
+from mani_skill.utils import sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.geometry.rotation_conversions import quaternion_apply
 from mani_skill.utils.registration import register_env
@@ -49,7 +45,7 @@ RIGHT_ARM_OFFSET = torch.tensor([-0.025, -0.365, 0.005])
 LEFT_ARM_OFFSET = torch.tensor([-0.025, 0.365, 0.005])
 
 
-@register_env("PickBox-v1", max_episode_steps=100)
+@register_env("PickBox-v1", max_episode_steps=200)
 class PickBoxEnv(BaseEnv):
     """Single-arm or bimanual pick-and-place task using b5box and basket assets."""
 
@@ -324,10 +320,9 @@ class PickBoxEnv(BaseEnv):
             return []  # Single-arm A1 Galaxea provides its own cameras
         else:
             # For other robots, use sensor camera configuration
-            from mani_skill.utils import sapien_utils
 
             pose = sapien_utils.look_at(eye=self.sensor_cam_eye_pos, target=self.sensor_cam_target_pos)
-            return [CameraConfig("base_camera", pose, 224, 224, 1, 0.01, 100)]
+            return [CameraConfig("base_camera", pose, 224, 224, fov=1.012, near=0.01, far=10)]
 
     @property
     def _default_human_render_camera_configs(self):
@@ -339,12 +334,9 @@ class PickBoxEnv(BaseEnv):
                 q=cfg["static_top_cam_quat"],
             )
         else:
-            # Fallback for other robots
-            from mani_skill.utils import sapien_utils
-
             pose = sapien_utils.look_at(eye=self.human_cam_eye_pos, target=self.human_cam_target_pos)
 
-        return CameraConfig("render_camera", pose, 224, 224, 1, 0.01, 100)
+        return CameraConfig("render_camera", pose, 224, 224, fov=1.012, near=0.01, far=10)
 
     # # ------------------------------------------------------------------
     # # Curriculum Learning Support -------------------------------------

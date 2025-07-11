@@ -278,26 +278,41 @@ class PlainConv(nn.Module):
         self.cnn = nn.Sequential(
             nn.Conv2d(in_channels, 16, 3, padding=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(4, 4) if image_size[0] == 128 and image_size[1] == 128 else nn.MaxPool2d(2, 2),  # [32, 32]
+            nn.MaxPool2d(4, 4)
+            if image_size[0] == 128 and image_size[1] == 128
+            else nn.MaxPool2d(2, 2),  # [32, 32] or [112, 112]
             nn.Conv2d(16, 32, 3, padding=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # [16, 16]
+            nn.MaxPool2d(2, 2),  # spatial dims /2
             nn.Conv2d(32, 64, 3, padding=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # [8, 8]
+            nn.MaxPool2d(2, 2),
             nn.Conv2d(64, 64, 3, padding=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # [4, 4]
+            nn.MaxPool2d(2, 2),
             nn.Conv2d(64, 64, 1, padding=0, bias=True),
             nn.ReLU(inplace=True),
         )
 
+        # Optional spatial pooling to make the encoder resolution-agnostic
         if pool_feature_map:
             self.pool = nn.AdaptiveMaxPool2d((1, 1))
-            self.fc = make_mlp(128, [out_dim], last_act=last_act)
         else:
             self.pool = None
-            self.fc = make_mlp(64 * 4 * 4, [out_dim], last_act=last_act)
+
+        # ------------------------------------------------------------------
+        # Dynamically determine the flattened feature size so the network
+        # works for any image resolution (e.g. 64×64, 128×128, 224×224 …).
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, image_size[0], image_size[1])
+            feat = self.cnn(dummy)
+            if self.pool is not None:
+                feat = self.pool(feat)
+            self._flatten_dim = feat.view(1, -1).size(1)
+
+        # Create the final fully-connected head
+        self.fc = make_mlp(self._flatten_dim, [out_dim], last_act=last_act)
 
         self.reset_parameters()
 
