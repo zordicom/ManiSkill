@@ -1,3 +1,12 @@
+"""
+Copyright 2025 Zordi, Inc. All rights reserved.
+
+python sac_rgbd_fix.py --env_id="PickBox-v1" --obs_mode="rgb" --num_envs=32 \
+    --utd=1.0 --buffer_size=50_000 --control-mode="pd_ee_delta_pos" \
+    --camera_width=224 --camera_height=224 --total_timesteps=1_000_000 \
+    --eval_freq=10_000 --batch-size=128 --buffer-device="cpu"
+"""
+
 import os
 import random
 import time
