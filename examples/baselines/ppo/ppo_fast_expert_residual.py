@@ -29,19 +29,19 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import gymnasium as gym
-import mani_skill.envs
 import numpy as np
 import tensordict
 import torch
 import tqdm
 import tyro
+import wandb
 from tensordict import from_module
 from tensordict.nn import CudaGraphModule
 from torch import nn, optim
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-import wandb
+import mani_skill.envs
 
 # A1 Galaxea table origin coordinate system constants
 # Right arm offset from table origin (in meters)
@@ -311,9 +311,7 @@ class Agent(nn.Module):
                     for nested_key in sorted(value.keys()):
                         nested_value = value[nested_key]
                         if isinstance(nested_value, torch.Tensor):
-                            flattened_parts.append(
-                                nested_value.view(nested_value.shape[0], -1)
-                            )
+                            flattened_parts.append(nested_value.view(nested_value.shape[0], -1))
             return torch.cat(flattened_parts, dim=1)
         return obs
 
@@ -366,13 +364,9 @@ def gae(next_obs, next_done, container, final_values):
     for t in range(args.num_steps - 1, -1, -1):
         cur_val = vals_unbind[t]
         # real_next_values = nextvalues * nextnonterminal
-        real_next_values = (
-            nextnonterminal * nextvalues + final_values[t]
-        )  # t instead of t+1
+        real_next_values = nextnonterminal * nextvalues + final_values[t]  # t instead of t+1
         delta = rewards[t] + args.gamma * real_next_values - cur_val
-        advantages.append(
-            delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-        )
+        advantages.append(delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam)
         lastgaelam = advantages[-1]
 
         nextnonterminal = nextnonterminals[t]
@@ -395,9 +389,7 @@ def rollout(obs, done):
 
         # ================= NaN / Inf Guard =================
         if torch.isnan(next_obs).any() or torch.isinf(next_obs).any():
-            bad_mask = torch.isnan(next_obs).any(dim=1) | torch.isinf(next_obs).any(
-                dim=1
-            )
+            bad_mask = torch.isnan(next_obs).any(dim=1) | torch.isinf(next_obs).any(dim=1)
             bad_indices = bad_mask.nonzero(as_tuple=True)[0]
             print(f"[NaN/Inf detected] Resetting env indices: {bad_indices}")
             try:
@@ -413,24 +405,18 @@ def rollout(obs, done):
             final_info = infos["final_info"]
             done_mask = infos["_final_info"]
             for k, v in final_info["episode"].items():
-                logger.add_scalar(
-                    f"train/{k}", v[done_mask].float().mean(), global_step
-                )
+                logger.add_scalar(f"train/{k}", v[done_mask].float().mean(), global_step)
             with torch.no_grad():
-                final_values[
-                    step, torch.arange(args.num_envs, device=device)[done_mask]
-                ] = agent.get_value(infos["final_observation"][done_mask]).view(-1)
+                final_values[step, torch.arange(args.num_envs, device=device)[done_mask]] = agent.get_value(
+                    infos["final_observation"][done_mask]
+                ).view(-1)
 
         # Log expert+residual action statistics if available
         if "expert_action" in infos and step % 25 == 0:  # Log every 25 steps
             expert_norm = torch.norm(infos["expert_action"], dim=1).mean()
             residual_norm = torch.norm(infos["residual_action"], dim=1).mean()
-            logger.add_scalar(
-                "expert_residual/expert_action_norm", expert_norm, global_step
-            )
-            logger.add_scalar(
-                "expert_residual/residual_action_norm", residual_norm, global_step
-            )
+            logger.add_scalar("expert_residual/expert_action_norm", expert_norm, global_step)
+            logger.add_scalar("expert_residual/residual_action_norm", residual_norm, global_step)
 
         ts.append(
             tensordict.TensorDict._new_unsafe(
@@ -541,9 +527,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # Environment setup #######
-    env_kwargs = dict(
-        obs_mode=args.obs_mode, render_mode="rgb_array", sim_backend="physx_cuda"
-    )
+    env_kwargs = dict(obs_mode=args.obs_mode, render_mode="rgb_array", sim_backend="physx_cuda")
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
     if args.robot_uids is not None:
@@ -609,9 +593,7 @@ if __name__ == "__main__":
         print(f"  Environment: {args.env_id}")
         print(f"  Expert type: {args.expert_type}")
         print(f"  Residual scale: {args.residual_scale}")
-        print(
-            f"  Number of training environments: {args.num_envs if not args.evaluate else 1}"
-        )
+        print(f"  Number of training environments: {args.num_envs if not args.evaluate else 1}")
 
     # Create evaluation environment with Expert+Residual wrapper
     eval_envs = ExpertResidualWrapper(
@@ -645,9 +627,7 @@ if __name__ == "__main__":
         print("✅ Observation space consistency check passed:")
         print(f"  Training obs space: {train_obs_shape}")
         print(f"  Evaluation obs space: {eval_obs_shape}")
-        print(
-            f"  Both environments use Expert+Residual wrapper with {args.expert_type} expert"
-        )
+        print(f"  Both environments use Expert+Residual wrapper with {args.expert_type} expert")
 
     # NOTE: Skip additional wrappers that cause conflicts with ExpertResidualWrapper
     # The ExpertResidualWrapper already handles vectorization efficiently
@@ -697,18 +677,11 @@ if __name__ == "__main__":
         # Already single action space
         envs.single_action_space = envs.action_space
 
-    if (
-        hasattr(envs.observation_space, "shape")
-        and len(envs.observation_space.shape) > 1
-    ):
+    if hasattr(envs.observation_space, "shape") and len(envs.observation_space.shape) > 1:
         # Vectorized observation space - create single space
         envs.single_observation_space = gym.spaces.Box(
-            low=envs.observation_space.low[0]
-            if hasattr(envs.observation_space, "low")
-            else -np.inf,
-            high=envs.observation_space.high[0]
-            if hasattr(envs.observation_space, "high")
-            else np.inf,
+            low=envs.observation_space.low[0] if hasattr(envs.observation_space, "low") else -np.inf,
+            high=envs.observation_space.high[0] if hasattr(envs.observation_space, "high") else np.inf,
             shape=envs.observation_space.shape[1:],
             dtype=envs.observation_space.dtype,
         )
@@ -717,10 +690,7 @@ if __name__ == "__main__":
         envs.single_observation_space = envs.observation_space
 
     # Same for eval_envs
-    if (
-        hasattr(eval_envs.action_space, "shape")
-        and len(eval_envs.action_space.shape) > 1
-    ):
+    if hasattr(eval_envs.action_space, "shape") and len(eval_envs.action_space.shape) > 1:
         eval_envs.single_action_space = gym.spaces.Box(
             low=eval_envs.action_space.low[0],
             high=eval_envs.action_space.high[0],
@@ -730,24 +700,15 @@ if __name__ == "__main__":
     else:
         eval_envs.single_action_space = eval_envs.action_space
 
-    if (
-        hasattr(eval_envs.observation_space, "shape")
-        and len(eval_envs.observation_space.shape) > 1
-    ):
+    if hasattr(eval_envs.observation_space, "shape") and len(eval_envs.observation_space.shape) > 1:
         eval_envs.single_observation_space = gym.spaces.Box(
-            low=eval_envs.observation_space.low[0]
-            if hasattr(eval_envs.observation_space, "low")
-            else -np.inf,
-            high=eval_envs.observation_space.high[0]
-            if hasattr(eval_envs.observation_space, "high")
-            else np.inf,
+            low=eval_envs.observation_space.low[0] if hasattr(eval_envs.observation_space, "low") else -np.inf,
+            high=eval_envs.observation_space.high[0] if hasattr(eval_envs.observation_space, "high") else np.inf,
             shape=eval_envs.observation_space.shape[1:],
             dtype=eval_envs.observation_space.dtype,
         )
 
-    assert isinstance(envs.single_action_space, gym.spaces.Box), (
-        "only continuous action space is supported"
-    )
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     # Use the envs directly since ExpertResidualWrapper doesn't have _env like ManiSkillVectorEnv
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs.env)
@@ -801,8 +762,7 @@ if __name__ == "__main__":
         writer = SummaryWriter(f"runs/{run_name}")
         writer.add_text(
             "hyperparameters",
-            "|param|value|\n|-|-|\n%s"
-            % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
         )
         logger = Logger(log_wandb=args.track, tensorboard=writer)
     else:
@@ -820,9 +780,7 @@ if __name__ == "__main__":
         print(f"  Number of actions per env: {n_act}")
         print(f"  Max episode steps: {max_episode_steps}")
 
-    assert isinstance(envs.single_action_space, gym.spaces.Box), (
-        "only continuous action space is supported"
-    )
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     # Register step as a special op not to graph break
     def step_func(
@@ -838,9 +796,7 @@ if __name__ == "__main__":
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint))
     # Make a version of agent with detached params
-    agent_inference = Agent(
-        n_obs, n_act, device=device, use_table_origin=args.use_table_origin
-    )
+    agent_inference = Agent(n_obs, n_act, device=device, use_table_origin=args.use_table_origin)
     agent_inference_p = from_module(agent).data
     agent_inference_p.to_module(agent_inference)
 
@@ -926,9 +882,7 @@ if __name__ == "__main__":
             model_path = f"runs/{run_name}/ckpt_{iteration}.pt"
             torch.save(agent.state_dict(), model_path)
             if args.verbose:
-                print(
-                    f"Model checkpoint saved to {model_path} at iteration {iteration}"
-                )
+                print(f"Model checkpoint saved to {model_path} at iteration {iteration}")
             else:
                 print(f"model saved to {model_path}")
         # Annealing the rate if instructed to do so.
@@ -951,9 +905,7 @@ if __name__ == "__main__":
         # Optimizing the policy and value network
         clipfracs = []
         for epoch in range(args.update_epochs):
-            b_inds = torch.randperm(container_flat.shape[0], device=device).split(
-                args.minibatch_size
-            )
+            b_inds = torch.randperm(container_flat.shape[0], device=device).split(args.minibatch_size)
             for b in b_inds:
                 container_local = container_flat[b]
 
@@ -967,22 +919,14 @@ if __name__ == "__main__":
         update_time = time.perf_counter() - update_time
         cumulative_times["update_time"] += update_time
 
-        logger.add_scalar(
-            "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
-        )
+        logger.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         logger.add_scalar("losses/value_loss", out["v_loss"].item(), global_step)
         logger.add_scalar("losses/policy_loss", out["pg_loss"].item(), global_step)
         logger.add_scalar("losses/entropy", out["entropy_loss"].item(), global_step)
-        logger.add_scalar(
-            "losses/old_approx_kl", out["old_approx_kl"].item(), global_step
-        )
+        logger.add_scalar("losses/old_approx_kl", out["old_approx_kl"].item(), global_step)
         logger.add_scalar("losses/approx_kl", out["approx_kl"].item(), global_step)
-        logger.add_scalar(
-            "losses/clipfrac", torch.stack(clipfracs).mean().cpu().item(), global_step
-        )
-        logger.add_scalar(
-            "charts/SPS", int(global_step / (time.time() - start_time)), global_step
-        )
+        logger.add_scalar("losses/clipfrac", torch.stack(clipfracs).mean().cpu().item(), global_step)
+        logger.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
         logger.add_scalar("time/step", global_step, global_step)
         logger.add_scalar("time/update_time", update_time, global_step)
         logger.add_scalar("time/rollout_time", rollout_time, global_step)

@@ -694,9 +694,13 @@ if __name__ == "__main__":
                 eval_metrics_mean[k] = mean
                 if logger is not None:
                     logger.add_scalar(f"eval/{k}", mean, global_step)
-            pbar.set_description(
-                f"success_once: {eval_metrics_mean['success_once']:.2f}, return: {eval_metrics_mean['return']:.2f}"
-            )
+            # Safely fetch metrics that may be absent for certain environments
+            success_metric = eval_metrics_mean.get("success_once", torch.tensor(0.0, device=device))
+            return_metric = eval_metrics_mean.get("return", torch.tensor(0.0, device=device))
+            # Ensure values are Python floats for string formatting
+            success_val = success_metric.item() if isinstance(success_metric, torch.Tensor) else float(success_metric)
+            return_val = return_metric.item() if isinstance(return_metric, torch.Tensor) else float(return_metric)
+            pbar.set_description(f"success_once: {success_val:.2f}, return: {return_val:.2f}")
             if logger is not None:
                 eval_time = time.perf_counter() - stime
                 cumulative_times["eval_time"] += eval_time

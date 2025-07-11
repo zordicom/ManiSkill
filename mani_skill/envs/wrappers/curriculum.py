@@ -77,9 +77,7 @@ class SuccessRateCurriculumWrapper(gym.Wrapper):
             })
 
         if self.verbose:
-            print(
-                f"Curriculum wrapper initialized with {len(curriculum_levels)} levels"
-            )
+            print(f"Curriculum wrapper initialized with {len(curriculum_levels)} levels")
             print(f"Success threshold: {success_threshold}")
             print(f"Window size: {window_size}")
             print(f"Min episodes per level: {min_episodes_per_level}")
@@ -90,9 +88,7 @@ class SuccessRateCurriculumWrapper(gym.Wrapper):
     def _get_current_max_episode_steps(self) -> int:
         """Get the max episode steps for the current curriculum level."""
         current_config = self.curriculum_levels[self.current_level]
-        return current_config.get(
-            "max_episode_steps", 50
-        )  # Default to 50 if not specified
+        return current_config.get("max_episode_steps", 50)  # Default to 50 if not specified
 
     def _print_curriculum_levels(self):
         """Print curriculum level descriptions."""
@@ -129,15 +125,26 @@ class SuccessRateCurriculumWrapper(gym.Wrapper):
 
         return obs, info
 
-    def step(self, action) -> Tuple[Any, float, bool, bool, Dict[str, Any]]:
+    def step(self, action) -> Tuple[Any, Any, Any, Any, Dict[str, Any]]:
         """Step the environment and track curriculum progress."""
         obs, reward, terminated, truncated, info = self.env.step(action)
+
+        # Convert reward to a Python scalar for statistics tracking
+        if isinstance(reward, torch.Tensor):
+            reward_scalar = reward.item()
+        elif isinstance(reward, np.ndarray):
+            reward_scalar = reward.item()
+        else:
+            reward_scalar = reward
+
+        # Use scalar reward for the remainder of the function to satisfy type hints
+        reward = reward_scalar
 
         # Track steps
         self.total_steps += 1
         self.steps_at_current_level += 1
         self.level_stats[self.current_level]["steps"] += 1
-        self.level_stats[self.current_level]["total_reward"] += reward
+        self.level_stats[self.current_level]["total_reward"] += reward_scalar
 
         # Track episode steps and apply curriculum-based time limit
         self._episode_steps += 1
@@ -160,7 +167,7 @@ class SuccessRateCurriculumWrapper(gym.Wrapper):
                 success = success.any()
 
             self.success_history.append(success)
-            self.episode_rewards.append(reward)
+            self.episode_rewards.append(reward_scalar)
 
             if success:
                 self.level_stats[self.current_level]["successes"] += 1
@@ -198,16 +205,8 @@ class SuccessRateCurriculumWrapper(gym.Wrapper):
 
         # Calculate final stats for current level
         current_stats = self.level_stats[self.current_level]
-        success_rate = (
-            current_stats["successes"] / current_stats["episodes"]
-            if current_stats["episodes"] > 0
-            else 0.0
-        )
-        avg_reward = (
-            current_stats["total_reward"] / current_stats["episodes"]
-            if current_stats["episodes"] > 0
-            else 0.0
-        )
+        success_rate = current_stats["successes"] / current_stats["episodes"] if current_stats["episodes"] > 0 else 0.0
+        avg_reward = current_stats["total_reward"] / current_stats["episodes"] if current_stats["episodes"] > 0 else 0.0
 
         if self.verbose:
             print("\n🎓 CURRICULUM ADVANCEMENT 🎓")
@@ -236,24 +235,14 @@ class SuccessRateCurriculumWrapper(gym.Wrapper):
                 f"Advanced to Level {self.current_level + 1}: {self.curriculum_levels[self.current_level].get('name', '')}"
             )
             if "description" in self.curriculum_levels[self.current_level]:
-                print(
-                    f"Description: {self.curriculum_levels[self.current_level]['description']}"
-                )
+                print(f"Description: {self.curriculum_levels[self.current_level]['description']}")
             print(f"New max episode steps: {self._max_episode_steps}")
             print()
 
     def get_curriculum_info(self) -> Dict[str, Any]:
         """Get current curriculum information."""
-        current_success_rate = (
-            sum(self.success_history) / len(self.success_history)
-            if self.success_history
-            else 0.0
-        )
-        current_avg_reward = (
-            sum(self.episode_rewards) / len(self.episode_rewards)
-            if self.episode_rewards
-            else 0.0
-        )
+        current_success_rate = sum(self.success_history) / len(self.success_history) if self.success_history else 0.0
+        current_avg_reward = sum(self.episode_rewards) / len(self.episode_rewards) if self.episode_rewards else 0.0
 
         return {
             "current_level": self.current_level,
@@ -271,15 +260,9 @@ class SuccessRateCurriculumWrapper(gym.Wrapper):
             "level_stats": self.level_stats.copy(),
             "max_episode_steps": self._max_episode_steps,
             "progress_to_next_level": {
-                "episodes_progress": min(
-                    1.0, self.episodes_at_current_level / self.min_episodes_per_level
-                ),
-                "steps_progress": min(
-                    1.0, self.steps_at_current_level / self.steps_per_level
-                ),
-                "success_rate_progress": min(
-                    1.0, current_success_rate / self.success_threshold
-                ),
+                "episodes_progress": min(1.0, self.episodes_at_current_level / self.min_episodes_per_level),
+                "steps_progress": min(1.0, self.steps_at_current_level / self.steps_per_level),
+                "success_rate_progress": min(1.0, current_success_rate / self.success_threshold),
             },
         }
 
@@ -287,16 +270,23 @@ class SuccessRateCurriculumWrapper(gym.Wrapper):
         """Print current curriculum status."""
         info = self.get_curriculum_info()
 
+        # Ensure scalar values for safe formatting
+        def _scalar(val):
+            if isinstance(val, torch.Tensor):
+                return val.item()
+            if isinstance(val, np.ndarray):
+                return val.item()
+            return val
+
+        info["current_success_rate"] = _scalar(info["current_success_rate"])
+        info["current_avg_reward"] = _scalar(info["current_avg_reward"])
+
         print("\n📚 CURRICULUM STATUS 📚")
-        print(
-            f"Current Level: {info['current_level'] + 1}/{info['total_levels']} - {info['current_level_name']}"
-        )
+        print(f"Current Level: {info['current_level'] + 1}/{info['total_levels']} - {info['current_level_name']}")
         print(f"Episodes at Level: {info['episodes_at_current_level']:,}")
         print(f"Steps at Level: {info['steps_at_current_level']:,}")
         print(f"Max Episode Steps: {info['max_episode_steps']}")
-        print(
-            f"Success Rate: {info['current_success_rate']:.3f} (need {self.success_threshold:.3f})"
-        )
+        print(f"Success Rate: {info['current_success_rate']:.3f} (need {self.success_threshold:.3f})")
         print(f"Average Reward: {info['current_avg_reward']:.3f}")
 
         progress = info["progress_to_next_level"]
@@ -308,18 +298,12 @@ class SuccessRateCurriculumWrapper(gym.Wrapper):
         print("\nLevel Summary:")
         for i, stats in enumerate(info["level_stats"]):
             status = (
-                "✅ Completed"
-                if stats["completed"]
-                else ("🔄 Current" if i == info["current_level"] else "⏳ Pending")
+                "✅ Completed" if stats["completed"] else ("🔄 Current" if i == info["current_level"] else "⏳ Pending")
             )
-            success_rate = (
-                stats["successes"] / stats["episodes"] if stats["episodes"] > 0 else 0.0
-            )
-            avg_reward = (
-                stats["total_reward"] / stats["episodes"]
-                if stats["episodes"] > 0
-                else 0.0
-            )
+            success_rate = stats["successes"] / stats["episodes"] if stats["episodes"] > 0 else 0.0
+            avg_reward = stats["total_reward"] / stats["episodes"] if stats["episodes"] > 0 else 0.0
+            success_rate = _scalar(success_rate)
+            avg_reward = _scalar(avg_reward)
             print(
                 f"  Level {i + 1}: {status} - {stats['episodes']:,} episodes, {success_rate:.3f} success rate, {avg_reward:.3f} avg reward"
             )
@@ -348,9 +332,7 @@ class SuccessRateCurriculumWrapper(gym.Wrapper):
             self._max_episode_steps = self._get_current_max_episode_steps()
 
             if self.verbose:
-                print(
-                    f"🔧 Curriculum level manually set from {old_level + 1} to {level + 1}"
-                )
+                print(f"🔧 Curriculum level manually set from {old_level + 1} to {level + 1}")
                 print(f"New max episode steps: {self._max_episode_steps}")
         else:
             raise ValueError(

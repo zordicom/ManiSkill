@@ -1,0 +1,109 @@
+target-version = "py310"
+line-length = 120
+force-exclude = true
+output-format = "concise"
+
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+    "data",
+    "*_pb2.py",
+    "*_pb2_grpc.py",
+    "*.pyi",
+]
+
+[lint]
+preview = true
+select = [
+    "A",
+    "B",
+    "C901",
+    "CPY001",
+    "D",
+    "E",
+    "ERA",
+    "F",
+    "FURB",
+    "G",
+    "I",
+    "N",
+    "NPY",
+    "PERF",
+    "PL",
+    "RUF",
+    "W",
+]
+
+ignore = [
+    "A005",
+    "B905",
+    "PLR0904",
+    "PLR0912",
+    "PLR0913",
+    "PLR0917",
+    "D105",
+    "D107",
+    "D200",
+    "D203",
+    "D205",
+    "D212",
+    "D213",
+    "D400",
+    "D401",
+    "D403",
+    "D406",
+    "D407",
+    "D415",
+    "G004"
+]
+
+unfixable = ["B", "C901", "ERA", "F401", "F841", "W"]
+
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[lint.mccabe]
+max-complexity = 50
+
+[lint.pylint]
+max-locals = 75
+max-statements = 75
+max-returns = 10
+max-nested-blocks = 7
+
+[lint.pydocstyle]
+convention = "google"
+
+[lint.per-file-ignores]
+"test_*.py" = [
+    "D101",    # Missing docstring in public class
+    "D102",    # Missing docstring in public method
+    "D103",    # Missing docstring in public function
+    "PLR2004", # Magic numbers
+    "PLR6301", # Method could be a function
+    "PLC2701", # import-private-name
+    "PLC1901", # compare-to-empty-string
+]
+
+
+[format]
+preview = true
+docstring-code-format = true

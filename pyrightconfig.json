@@ -1,6 +1,44 @@
 {
+    "pythonVersion": "3.10",
+    "pythonPlatform": "Linux",
+    "include": ["./**/*.py"],
     "exclude": [
-        "**/__pycache__",
-        "mani_skill/assets",
+      "**/__pycache__",
+      "**/build/**",
+      "**/.venv/**",
+      "**/venv/**",
+      "**/data/**",
+      "**/outputs/**",
+      "**/logs/**",
+      "**/docs/**",
+      "**/examples/**",
+      "**/tmp/**",
+      "**/pb2/**",
+      "**/node_modules",
+      ".pytest_cache",
+      ".venv",
+      "data",
+      "episodes",
+      "bimanual_episodes",
+      "converted",
+      "converted_data",
+      "sample_images",
+      "visualizations",
+      "output",
+      "outputs",
+      "logs",
+      ".vite",
+      "build",
+      "dist",
+      "wheels",
+      "**/*.egg-info",
+      "mani_skill/assets"
     ],
-}
+    "reportMissingImports": false,
+    "reportMissingTypeStubs": false,
+    "typeCheckingMode": "basic",
+    "useLibraryCodeForTypes": false,
+    "extraPaths": [
+      "/opt/external/sam2"
+    ]
+  }

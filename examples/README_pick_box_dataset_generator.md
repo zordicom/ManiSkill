@@ -16,7 +16,7 @@ This generator creates high-quality training datasets by recording A1 Galaxea ro
 
 ## Generated Data Structure
 
-```
+```text
 ~/training_data/galaxea_box_pnp_sim/
 └── galaxea_box_pnp/
     └── galaxea-16hz_box_pnp/
@@ -37,6 +37,7 @@ This generator creates high-quality training datasets by recording A1 Galaxea ro
 ## Quick Start
 
 ### Basic Usage
+
 ```bash
 # Generate 3 episodes with default settings
 python pick_box_dataset_generator.py
@@ -48,19 +49,21 @@ python pick_box_dataset_generator.py \
 ```
 
 ### Environment Options
+
 ```bash
 # Single-arm mode
 python pick_box_dataset_generator.py \
     --env-id PickBox-v1 \
     --robot-uids a1_galaxea
 
-# Bimanual mode  
+# Bimanual mode
 python pick_box_dataset_generator.py \
     --env-id PickBoxBimanual-v1 \
     --robot-uids a1_galaxea
 ```
 
 ### Data Format Options
+
 ```bash
 # Use world coordinates
 python pick_box_dataset_generator.py \
@@ -91,6 +94,7 @@ python pick_box_dataset_generator.py \
 ## Data Format
 
 ### Episode JSON Structure
+
 ```json
 {
   "metadata": {
@@ -140,17 +144,20 @@ python pick_box_dataset_generator.py \
 ### Coordinate Systems
 
 #### Table-Origin Coordinates (Default)
+
 - Origin at table center between robot arms
 - Right arm at `[-0.025, -0.365, 0.005]` relative to table origin
 - Left arm at `[-0.025, 0.365, 0.005]` relative to table origin
 - Better for learning arm-relative policies
 
 #### World Coordinates
+
 - Standard ManiSkill world coordinate system
 - Direct from environment without transformation
 - Better for absolute positioning tasks
 
 ### Segmentation Mapping
+
 - **ID 0**: Background
 - **ID 1**: Object to pick (box/cube)
 - **ID 2**: Target container (basket)
@@ -161,6 +168,7 @@ python pick_box_dataset_generator.py \
 ## Examples
 
 ### Generate Development Dataset
+
 ```bash
 python pick_box_dataset_generator.py \
     --n-episodes 5 \
@@ -170,6 +178,7 @@ python pick_box_dataset_generator.py \
 ```
 
 ### Generate Production Dataset
+
 ```bash
 python pick_box_dataset_generator.py \
     --n-episodes 100 \
@@ -179,6 +188,7 @@ python pick_box_dataset_generator.py \
 ```
 
 ### Generate Bimanual Dataset
+
 ```bash
 python pick_box_dataset_generator.py \
     --env-id PickBoxBimanual-v1 \
@@ -205,17 +215,20 @@ python pick_box_dataset_generator.py \
 
 ### Common Issues
 
-**Motion Planning Fails**
+#### Motion Planning Fails
+
 - Check robot configuration and environment setup
 - Verify grasping pose computation
 - Enable `--debug` for detailed output
 
-**Missing Camera Data**
+#### Missing Camera Data
+
 - Ensure observation mode includes required sensors
 - Check camera configurations in environment
 
-**File Permission Errors**
+#### File Permission Errors
+
 - Verify write permissions for output directory
 - Use absolute paths for reliability
 
-Happy dataset generation! 🤖📊 
+Happy dataset generation! 🤖📊

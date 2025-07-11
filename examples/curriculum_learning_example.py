@@ -5,9 +5,10 @@ Example script demonstrating curriculum learning with PickBox environment.
 """
 
 import gymnasium as gym
-import mani_skill.envs
 import numpy as np
 import torch
+
+import mani_skill.envs
 from mani_skill.envs.tasks.tabletop.pick_box_curriculum import create_curriculum_wrapper
 
 
@@ -28,7 +29,7 @@ def main():
     curriculum_env = create_curriculum_wrapper(
         env,
         success_threshold=0.8,
-        window_size=50,  # Smaller window for demo
+        window_size=100,  # Smaller window for demo
         min_episodes_per_level=10,  # Fewer episodes for demo
         steps_per_level=1000,  # Fewer steps for demo
         verbose=True,
@@ -36,12 +37,10 @@ def main():
 
     print("🎯 Starting curriculum learning demonstration...")
     print("This demo will run through curriculum levels automatically.")
-    print(
-        "In real training, you would use your RL algorithm instead of random actions.\n"
-    )
+    print("In real training, you would use your RL algorithm instead of random actions.\n")
 
     # Simulate training episodes
-    total_episodes = 100
+    total_episodes = 1000
     episode_count = 0
 
     while episode_count < total_episodes:
@@ -75,10 +74,18 @@ def main():
         elif isinstance(success, np.ndarray):
             success = success.item()
 
+        # Ensure episode_reward is a Python float for formatting
+        if isinstance(episode_reward, torch.Tensor):
+            episode_reward_value = episode_reward.item()
+        elif isinstance(episode_reward, np.ndarray):
+            episode_reward_value = episode_reward.item()
+        else:
+            episode_reward_value = episode_reward
+
         print(
             f"Episode {episode_count}: "
             f"{'✅ Success' if success else '❌ Failed'} "
-            f"(reward: {episode_reward:.3f}, steps: {episode_steps})"
+            f"(reward: {episode_reward_value:.3f}, steps: {episode_steps})"
         )
 
         # Print curriculum status every 10 episodes
@@ -98,9 +105,7 @@ def main():
     print("\nFinal Statistics:")
     print(f"Total Episodes: {final_info['total_episodes']}")
     print(f"Total Steps: {final_info['total_steps']}")
-    print(
-        f"Highest Level Reached: {final_info['current_level'] + 1}/{final_info['total_levels']}"
-    )
+    print(f"Highest Level Reached: {final_info['current_level'] + 1}/{final_info['total_levels']}")
 
     # Close environment
     curriculum_env.close()
@@ -133,9 +138,7 @@ def test_curriculum_levels():
 
     # Test each level
     for level in range(len(curriculum_env.curriculum_levels)):
-        print(
-            f"\n📚 Testing Level {level + 1}: {curriculum_env.curriculum_levels[level]['name']}"
-        )
+        print(f"\n📚 Testing Level {level + 1}: {curriculum_env.curriculum_levels[level]['name']}")
         print(f"Description: {curriculum_env.curriculum_levels[level]['description']}")
 
         # Set to specific level
@@ -160,9 +163,7 @@ def test_curriculum_levels():
             elif isinstance(success, np.ndarray):
                 success = success.item()
 
-            print(
-                f"  Episode {episode + 1}: {'✅' if success else '❌'} ({episode_steps} steps)"
-            )
+            print(f"  Episode {episode + 1}: {'✅' if success else '❌'} ({episode_steps} steps)")
 
     curriculum_env.close()
     print("\n✅ All curriculum levels tested successfully!")
