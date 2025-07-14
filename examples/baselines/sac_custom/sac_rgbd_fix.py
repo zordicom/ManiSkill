@@ -2,9 +2,10 @@
 Copyright 2025 Zordi, Inc. All rights reserved.
 
 python sac_rgbd_fix.py --env_id="PickBox-v1" --obs_mode="rgb" --num_envs=32 \
-    --utd=1.0 --buffer_size=50_000 --control-mode="pd_ee_delta_pos" \
+    --utd=1.0 --buffer_size=30_000 --control-mode="pd_ee_delta_pos" \
     --camera_width=224 --camera_height=224 --total_timesteps=1_000_000 \
-    --eval_freq=10_000 --batch-size=128 --buffer-device="cpu"
+    --eval_freq=10_000 --batch-size=128 --buffer-device="cpu" \
+    --num-steps=150 --num-eval-steps=150
 """
 
 import os
@@ -17,7 +18,7 @@ from typing import Optional
 import gymnasium as gym
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 import tqdm
 import tyro
 from torch import nn, optim
@@ -33,7 +34,7 @@ from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 class Args:
     exp_name: Optional[str] = None
     """the name of this experiment"""
-    seed: int = 1
+    seed: int = 42
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
@@ -51,7 +52,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_trajectory: bool = False
     """whether to save trajectory data into the `videos` folder"""
-    save_model: bool = True
+    save_model: bool = False
     """whether to save model into the `runs/{run_name}` folder"""
     evaluate: bool = False
     """if toggled, only runs evaluation with the given model checkpoint and saves the evaluation trajectories"""
@@ -61,7 +62,7 @@ class Args:
     """logging frequency in terms of environment steps"""
 
     # Environment specific arguments
-    env_id: str = "PickCube-v1"
+    env_id: str = "PickBox-v1"
     """the id of the environment"""
     obs_mode: str = "rgb"
     """the observation mode to use"""
@@ -77,9 +78,9 @@ class Args:
     """whether to let parallel environments reset upon termination instead of truncation"""
     eval_partial_reset: bool = False
     """whether to let parallel evaluation environments reset upon termination instead of truncation"""
-    num_steps: int = 50
+    num_steps: int = 150
     """the number of steps to run in each environment per policy rollout"""
-    num_eval_steps: int = 50
+    num_eval_steps: int = 150
     """the number of steps to run in each evaluation environment during evaluation"""
     reconfiguration_freq: Optional[int] = None
     """how often to reconfigure the environment during training"""
@@ -101,9 +102,9 @@ class Args:
     """the replay memory buffer size"""
     buffer_device: str = "cuda"
     """where the replay buffer is stored. Can be 'cpu' or 'cuda' for GPU"""
-    gamma: float = 0.8
+    gamma: float = 0.99
     """the discount factor gamma"""
-    tau: float = 0.01
+    tau: float = 0.005
     """target smoothing coefficient"""
     batch_size: int = 512
     """the batch size of sample from the replay memory"""
@@ -116,7 +117,7 @@ class Args:
     policy_frequency: int = 1
     """the frequency of training policy (delayed)"""
     target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
-    """the frequency of updates for the target nerworks"""
+    """the frequency of updates for the target networks"""
     alpha: float = 0.2
     """Entropy regularization coefficient."""
     autotune: bool = True
@@ -311,7 +312,7 @@ class PlainConv(nn.Module):
 
         # ------------------------------------------------------------------
         # Dynamically determine the flattened feature size so the network
-        # works for any image resolution (e.g. 64×64, 128×128, 224×224 …).
+        # works for any image resolution (e.g. 64x64, 128x128, 224x224 …).
         # ------------------------------------------------------------------
         with torch.no_grad():
             dummy = torch.zeros(1, in_channels, image_size[0], image_size[1])
@@ -340,58 +341,6 @@ class PlainConv(nn.Module):
         return x
 
 
-# class Encoder(nn.Module):
-#     def __init__(self, sample_obs):
-#         super().__init__()
-
-#         extractors = {}
-
-#         self.out_features = 0
-#         feature_size = 256
-#         in_channels=sample_obs["rgb"].shape[-1]
-#         image_size=(sample_obs["rgb"].shape[1], sample_obs["rgb"].shape[2])
-
-
-#         # here we use a NatureCNN architecture to process images, but any architecture is permissble here
-#         cnn = nn.Sequential(
-#             nn.Conv2d(
-#                 in_channels=in_channels,
-#                 out_channels=32,
-#                 kernel_size=8,
-#                 stride=4,
-#                 padding=0,
-#             ),
-#             nn.ReLU(),
-#             nn.Conv2d(
-#                 in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=0
-#             ),
-#             nn.ReLU(),
-#             nn.Conv2d(
-#                 in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0
-#             ),
-#             nn.ReLU(),
-#             nn.Flatten(),
-#         )
-
-#         # to easily figure out the dimensions after flattening, we pass a test tensor
-#         with torch.no_grad():
-#             n_flatten = cnn(sample_obs["rgb"].float().permute(0,3,1,2).cpu()).shape[1]
-#             fc = nn.Sequential(nn.Linear(n_flatten, feature_size), nn.ReLU())
-#         extractors["rgb"] = nn.Sequential(cnn, fc)
-#         self.out_features += feature_size
-#         self.extractors = nn.ModuleDict(extractors)
-
-
-#     def forward(self, observations) -> torch.Tensor:
-#         encoded_tensor_list = []
-#         # self.extractors contain nn.Modules that do all the processing.
-#         for key, extractor in self.extractors.items():
-#             obs = observations[key]
-#             if key == "rgb":
-#                 obs = obs.float().permute(0,3,1,2)
-#                 obs = obs / 255
-#             encoded_tensor_list.append(extractor(obs))
-#         return torch.cat(encoded_tensor_list, dim=1)
 class EncoderObsWrapper(nn.Module):
     def __init__(self, encoder):
         super().__init__()
@@ -681,7 +630,7 @@ if __name__ == "__main__":
     if args.autotune:
         target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        alpha = log_alpha.exp().item()
+        alpha = log_alpha.detach().exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
         alpha = args.alpha
@@ -841,7 +790,7 @@ if __name__ == "__main__":
                     a_optimizer.zero_grad()
                     alpha_loss.backward()
                     a_optimizer.step()
-                    alpha = log_alpha.exp().item()
+                    alpha = log_alpha.detach().exp().item()
 
             # update the target networks
             if global_update % args.target_network_frequency == 0:
@@ -854,12 +803,12 @@ if __name__ == "__main__":
 
         # Log training-related data
         if (global_step - args.training_freq) // args.log_freq < global_step // args.log_freq:
-            logger.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-            logger.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
-            logger.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-            logger.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-            logger.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-            logger.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+            logger.add_scalar("losses/qf1_values", qf1_a_values.mean().detach().item(), global_step)
+            logger.add_scalar("losses/qf2_values", qf2_a_values.mean().detach().item(), global_step)
+            logger.add_scalar("losses/qf1_loss", qf1_loss.detach().item(), global_step)
+            logger.add_scalar("losses/qf2_loss", qf2_loss.detach().item(), global_step)
+            logger.add_scalar("losses/qf_loss", qf_loss.detach().item() / 2.0, global_step)
+            logger.add_scalar("losses/actor_loss", actor_loss.detach().item(), global_step)
             logger.add_scalar("losses/alpha", alpha, global_step)
             logger.add_scalar("time/update_time", update_time, global_step)
             logger.add_scalar("time/rollout_time", rollout_time, global_step)
@@ -872,7 +821,7 @@ if __name__ == "__main__":
                 global_step,
             )
             if args.autotune:
-                logger.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+                logger.add_scalar("losses/alpha_loss", alpha_loss.detach().item(), global_step)
 
     if not args.evaluate and args.save_model:
         model_path = f"runs/{run_name}/final_ckpt.pt"

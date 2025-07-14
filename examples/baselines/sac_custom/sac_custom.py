@@ -108,9 +108,9 @@ class Args:
     """the replay memory buffer size"""
     buffer_device: str = "cuda"
     """where the replay buffer is stored. Can be 'cpu' or 'cuda' for GPU"""
-    gamma: float = 0.99
+    gamma: float = 0.8
     """the discount factor gamma"""
-    tau: float = 0.005
+    tau: float = 0.01
     """target smoothing coefficient"""
     batch_size: int = 512
     """the batch size of sample from the replay memory"""
@@ -130,7 +130,7 @@ class Args:
     """automatic tuning of the entropy coefficient"""
     training_freq: int = 64
     """training frequency (in steps)"""
-    utd: float = 1.0
+    utd: float = 0.25
     """update to data ratio"""
     bootstrap_at_done: str = "always"
     """the bootstrap method to use when a done signal is received. Can be 'always' or 'never'"""
