@@ -8,6 +8,7 @@ from typing import Optional
 
 import torch
 from torch import nn
+from torchvision import models
 from transformers.models.dinov2.modeling_dinov2 import Dinov2Model
 
 
@@ -77,6 +78,63 @@ class DINOv2Encoder(nn.Module):
         return self.projection(pooled_features)
 
 
+class EfficientNetB0Encoder(nn.Module):
+    """EfficientNet-B0 encoder with pre-trained weights."""
+
+    def __init__(self, in_channels: int = 3, output_dim: int = 256):
+        super().__init__()
+
+        # Load pre-trained EfficientNet-B0
+        self.efficientnet = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+
+        # Adjust first layer if needed for different input channels
+        if in_channels != 3:
+            # Replace first conv layer
+            orig_conv = self.efficientnet.features[0][0]
+            new_conv = nn.Conv2d(
+                in_channels,
+                orig_conv.out_channels,
+                kernel_size=orig_conv.kernel_size,
+                stride=orig_conv.stride,
+                padding=orig_conv.padding,
+                bias=orig_conv.bias is not None,
+            )
+
+            # Initialize with pre-trained weights for first 3 channels
+            with torch.no_grad():
+                if in_channels >= 3:
+                    new_conv.weight[:, :3] = orig_conv.weight
+                    if in_channels > 3:
+                        # Initialize extra channels with mean of RGB weights
+                        mean_weight = orig_conv.weight.mean(dim=1, keepdim=True)
+                        for i in range(3, in_channels):
+                            new_conv.weight[:, i : i + 1] = mean_weight
+                else:
+                    # If fewer than 3 channels, use subset of weights
+                    new_conv.weight = orig_conv.weight[:, :in_channels]
+
+                if new_conv.bias is not None and orig_conv.bias is not None:
+                    new_conv.bias.data = orig_conv.bias.data.clone()
+
+            self.efficientnet.features[0][0] = new_conv
+
+        # Remove the classifier head (we'll add our own)
+        self.efficientnet.classifier = nn.Identity()
+
+        # Add custom projection layer
+        # EfficientNet-B0 outputs 1280 features
+        self.projection = nn.Sequential(nn.Linear(1280, 512), nn.ReLU(), nn.Linear(512, output_dim))
+
+        # Apply weight initialization to projection layer
+        self.projection.apply(_init_weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass returning features [B, output_dim]."""
+        x = x.float() / 255.0  # Normalize to [0, 1]
+        features = self.efficientnet(x)  # [B, 1280]
+        return self.projection(features)
+
+
 class SimpleConvEncoder(nn.Module):
     """Simple CNN encoder for RGB images."""
 
@@ -120,6 +178,7 @@ class MultimodalEncoder(nn.Module):
         image_size: tuple = (64, 64),
         output_dim: int = 512,
         use_dinov2: bool = True,
+        use_efficientnet: bool = False,
         image_encoder: Optional[nn.Module] = None,
         state_encoder_dims: list = [256, 256],
         fusion_dims: list = [512, 512],
@@ -143,13 +202,35 @@ class MultimodalEncoder(nn.Module):
 
         # Image encoder (optionally shared across networks)
         image_output_dim = 256  # Both DINOv2Encoder and SimpleConvEncoder output 256-D features
+
+        # Determine number of cameras based on image channels
+        if (use_dinov2 or use_efficientnet) and image_channels % 3 == 0:
+            self.num_cameras = image_channels // 3
+        else:
+            self.num_cameras = 1
+
         if image_encoder is not None:
             # Reuse the provided encoder to avoid redundant initialisation (e.g. heavy DINOv2 model)
             self.image_encoder = image_encoder
+        elif use_efficientnet:
+            if image_channels % 3 == 0:
+                # Multi-camera setup: split channels and process each camera separately
+                self.image_encoder = EfficientNetB0Encoder(3, image_output_dim)  # Process 3 channels at a time
+                print(f"📷 Multi-camera setup detected: {self.num_cameras} cameras, using EfficientNet-B0 for each")
+            else:
+                print(f"⚠️ Warning: EfficientNet-B0 works best with 3 channels, but got {image_channels}. Using anyway.")
+                self.image_encoder = EfficientNetB0Encoder(image_channels, image_output_dim)
         elif use_dinov2:
-            self.image_encoder = DINOv2Encoder(image_channels, image_output_dim)
+            if image_channels % 3 == 0:
+                # Multi-camera setup: split channels and process each camera separately
+                self.image_encoder = DINOv2Encoder(3, image_output_dim)  # Process 3 channels at a time
+                print(f"📷 Multi-camera setup detected: {self.num_cameras} cameras, using DINOv2 for each")
+            else:
+                print(
+                    f"⚠️ Warning: DINOv2 requires channels divisible by 3, but got {image_channels}. Falling back to SimpleConvEncoder"
+                )
+                self.image_encoder = SimpleConvEncoder(image_channels, image_output_dim, image_size)
         else:
-            print("⚠️ Warning: transformers not available, falling back to SimpleConvEncoder")
             self.image_encoder = SimpleConvEncoder(image_channels, image_output_dim, image_size)
 
         # Fusion layer
@@ -185,12 +266,31 @@ class MultimodalEncoder(nn.Module):
 
         # Encode RGB image
         rgb = obs["rgb"]
-        if rgb.dim() == 4 and rgb.shape[1] == 3:  # [B, C, H, W]
-            img_feat = self.image_encoder(rgb)
-        elif rgb.dim() == 4 and rgb.shape[3] == 3:  # [B, H, W, C]
-            img_feat = self.image_encoder(rgb.permute(0, 3, 1, 2))
+        if rgb.dim() == 4 and len(rgb.shape) == 4:
+            if rgb.shape[1] == rgb.shape[2] and rgb.shape[1] > rgb.shape[3]:
+                # Likely [B, H, W, C] format
+                rgb = rgb.permute(0, 3, 1, 2)  # Convert to [B, C, H, W]
+
+            # Handle multi-camera processing
+            if self.num_cameras > 1:
+                # Split channels into groups of 3 for each camera
+                batch_size, channels, height, width = rgb.shape
+                rgb_split = rgb.view(batch_size, self.num_cameras, 3, height, width)
+
+                # Process each camera separately
+                camera_features = []
+                for i in range(self.num_cameras):
+                    camera_rgb = rgb_split[:, i, :, :, :]  # [B, 3, H, W]
+                    camera_feat = self.image_encoder(camera_rgb)
+                    camera_features.append(camera_feat)
+
+                # Combine features from all cameras (mean pooling)
+                img_feat = torch.stack(camera_features, dim=1).mean(dim=1)  # [B, output_dim]
+            else:
+                # Single camera processing
+                img_feat = self.image_encoder(rgb)
         else:
-            raise ValueError(f"Unexpected RGB shape: {rgb.shape}")
+            raise ValueError(f"Unexpected RGB shape: {rgb.shape}. Expected 4D tensor.")
         features.append(img_feat)
 
         # Fuse features

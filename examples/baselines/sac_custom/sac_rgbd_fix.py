@@ -78,9 +78,9 @@ class Args:
     """whether to let parallel environments reset upon termination instead of truncation"""
     eval_partial_reset: bool = False
     """whether to let parallel evaluation environments reset upon termination instead of truncation"""
-    num_steps: int = 100
+    num_steps: int = 150
     """the number of steps to run in each environment per policy rollout"""
-    num_eval_steps: int = 100
+    num_eval_steps: int = 150
     """the number of steps to run in each evaluation environment during evaluation"""
     reconfiguration_freq: Optional[int] = None
     """how often to reconfigure the environment during training"""
@@ -102,9 +102,9 @@ class Args:
     """the replay memory buffer size"""
     buffer_device: str = "cpu"
     """where the replay buffer is stored. Can be 'cpu' or 'cuda' for GPU"""
-    gamma: float = 0.95
+    gamma: float = 0.8
     """the discount factor gamma"""
-    tau: float = 0.005
+    tau: float = 0.01
     """target smoothing coefficient"""
     batch_size: int = 128
     """the batch size of sample from the replay memory"""
@@ -124,7 +124,7 @@ class Args:
     """automatic tuning of the entropy coefficient"""
     training_freq: int = 64
     """training frequency (in steps)"""
-    utd: float = 0.25
+    utd: float = 2.0
     """update to data ratio"""
     partial_reset: bool = False
     """whether to let parallel environments reset upon termination instead of truncation"""

@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 import tqdm
 import tyro
-from multimodal_encoders import DINOv2Encoder, MultimodalEncoder, SimpleConvEncoder
+from multimodal_encoders import DINOv2Encoder, EfficientNetB0Encoder, MultimodalEncoder, SimpleConvEncoder
 from torch import nn, optim
 
 # AMP for mixed-precision training
@@ -58,7 +58,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_trajectory: bool = False
     """whether to save trajectory data into the `videos` folder"""
-    save_model: bool = True
+    save_model: bool = False
     """whether to save model into the `runs/{run_name}` folder"""
     evaluate: bool = False
     """if toggled, only runs evaluation with the given model checkpoint and saves the evaluation trajectories"""
@@ -68,7 +68,7 @@ class Args:
     """logging frequency in terms of environment steps"""
 
     # Environment specific arguments
-    env_id: str = "PickCube-v1"
+    env_id: str = "PickBox-v1"
     """the id of the environment"""
     obs_mode: str = "rgb"
     """the observation mode to use"""
@@ -78,21 +78,21 @@ class Args:
     """the type of environment vectorization to use"""
     num_envs: int = 16
     """the number of parallel environments"""
-    num_eval_envs: int = 16
+    num_eval_envs: int = 8
     """the number of parallel evaluation environments"""
     partial_reset: bool = False
     """whether to let parallel environments reset upon termination instead of truncation"""
     eval_partial_reset: bool = False
     """whether to let parallel evaluation environments reset upon termination instead of truncation"""
-    num_steps: int = 50
+    num_steps: int = 100
     """the number of steps to run in each environment per policy rollout"""
-    num_eval_steps: int = 50
+    num_eval_steps: int = 100
     """the number of steps to run in each evaluation environment during evaluation"""
     reconfiguration_freq: Optional[int] = None
     """how often to reconfigure the environment during training"""
     eval_reconfiguration_freq: Optional[int] = 1
     """for benchmarking purposes we want to reconfigure the eval environment each reset to ensure objects are randomized in some tasks"""
-    eval_freq: int = 25
+    eval_freq: int = 10_000
     """evaluation frequency in terms of iterations"""
     save_train_video_freq: Optional[int] = None
     """frequency to save training videos in terms of iterations"""
@@ -104,7 +104,7 @@ class Args:
     # Algorithm specific arguments
     total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
-    buffer_size: int = 1_000_000
+    buffer_size: int = 12_000
     """the replay memory buffer size"""
     buffer_device: str = "cuda"
     """where the replay buffer is stored. Can be 'cpu' or 'cuda' for GPU"""
@@ -112,7 +112,7 @@ class Args:
     """the discount factor gamma"""
     tau: float = 0.01
     """target smoothing coefficient"""
-    batch_size: int = 512
+    batch_size: int = 64
     """the batch size of sample from the replay memory"""
     learning_starts: int = 4_000
     """timestep to start learning"""
@@ -134,14 +134,16 @@ class Args:
     """update to data ratio"""
     bootstrap_at_done: str = "always"
     """the bootstrap method to use when a done signal is received. Can be 'always' or 'never'"""
-    camera_width: Optional[int] = 128
+    camera_width: Optional[int] = 112
     """the width of the camera image. If none it will use the default the environment specifies"""
-    camera_height: Optional[int] = 128
+    camera_height: Optional[int] = 112
     """the height of the camera image. If none it will use the default the environment specifies."""
 
     # Custom encoder arguments
     use_dinov2: bool = False
     """whether to use DINOv2 encoder for images (otherwise uses simple CNN)"""
+    use_efficientnet: bool = True
+    """whether to use EfficientNet-B0 encoder for images (trainable, lighter than DINOv2)"""
 
     # to be filled in runtime
     grad_steps_per_iteration: int = 0
@@ -532,8 +534,24 @@ if __name__ == "__main__":
     # Build ONE shared image encoder (heavy part) and reuse it across all
     # actor / critic networks to save memory and initialization time.
     # ---------------------------------------------------------------------
-    if args.use_dinov2:
-        shared_image_encoder = DINOv2Encoder(image_channels, 256).to(device)
+    if args.use_efficientnet:
+        if image_channels % 3 == 0:
+            # Multi-camera setup: use EfficientNet-B0 for processing each camera
+            shared_image_encoder = EfficientNetB0Encoder(3, 256).to(device)  # Process 3 channels at a time
+            print(f"📷 Multi-camera setup detected: {image_channels // 3} cameras, using EfficientNet-B0 for each")
+        else:
+            print(f"⚠️ Warning: EfficientNet-B0 works best with 3 channels, but got {image_channels}. Using anyway.")
+            shared_image_encoder = EfficientNetB0Encoder(image_channels, 256).to(device)
+    elif args.use_dinov2:
+        if image_channels % 3 == 0:
+            # Multi-camera setup: use DINOv2 for processing each camera
+            shared_image_encoder = DINOv2Encoder(3, 256).to(device)  # Process 3 channels at a time
+            print(f"📷 Multi-camera setup detected: {image_channels // 3} cameras, using DINOv2 for each")
+        else:
+            print(
+                f"⚠️ Warning: DINOv2 requires channels divisible by 3, but got {image_channels}. Using SimpleConvEncoder instead."
+            )
+            shared_image_encoder = SimpleConvEncoder(image_channels, 256, image_size).to(device)
     else:
         shared_image_encoder = SimpleConvEncoder(image_channels, 256, image_size).to(device)
 
@@ -545,6 +563,7 @@ if __name__ == "__main__":
             image_size=image_size,
             output_dim=512,
             use_dinov2=args.use_dinov2,
+            use_efficientnet=args.use_efficientnet,
             image_encoder=shared_image_encoder,
         )
 
