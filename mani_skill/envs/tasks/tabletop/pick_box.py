@@ -86,16 +86,16 @@ class PickBoxEnv(BaseEnv):
 
     # Visual variation parameters
     box_color_ranges = {
-        "red": (0.6, 1.0),  # Red channel range (higher values)
-        "green": (0.0, 0.5),  # Green channel range (lower max)
-        "blue": (0.0, 0.5),  # Blue channel range (lower max)
+        "red": (0.2, 0.95),  # Red channel range (higher values)
+        "green": (0.2, 0.95),  # Green channel range (lower max)
+        "blue": (0.2, 0.95),  # Blue channel range (lower max)
         "alpha": (1.0, 1.0),  # Alpha channel (keep opaque)
     }
 
     table_color_ranges = {
-        "red": (0.0, 1.0),  # Full red range for dramatic color variations
-        "green": (0.0, 1.0),  # Full green range
-        "blue": (0.0, 1.0),  # Full blue range
+        "red": (0.1, 0.95),  # Full red range for dramatic color variations
+        "green": (0.1, 0.95),  # Full green range
+        "blue": (0.1, 0.95),  # Full blue range
         "alpha": (1.0, 1.0),  # Alpha channel (keep opaque)
     }
 
@@ -584,7 +584,7 @@ class PickBoxEnv(BaseEnv):
             self.agent.sensor_configs = new_sensor_configs
 
     def _load_scene(self, options: dict):
-        # Table, b5box, basket, and goal site (for visualisation) ----------
+        # Table, b5box, basket, and goal site (for visualization) ----------
         self.table = self._create_table()
         self.b5box = self._load_b5box()
         self.basket = self._load_basket()
@@ -1000,9 +1000,9 @@ class PickBoxEnv(BaseEnv):
             basket_qs[:, 3] = torch.sin(z_rot / 2)
             self.basket.set_pose(Pose.create_from_pq(basket_xyz, basket_qs))
 
-            # Goal site for visualisation ------------------------------
+            # Goal site for visualization ------------------------------
             goal_xyz = basket_xyz.clone()
-            goal_xyz[:, 2] = table_surface_z + 0.25
+            goal_xyz[:, 2] = table_surface_z + 0.10
             self.goal_site.set_pose(Pose.create_from_pq(goal_xyz))
 
             # Per-episode visual randomization (table color and lighting)

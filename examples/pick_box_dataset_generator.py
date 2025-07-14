@@ -11,9 +11,7 @@ from typing import Any, Dict, List
 import cv2
 import numpy as np
 import sapien
-import torch
 
-from mani_skill.envs.tasks.tabletop.pick_box import PickBoxEnv
 from mani_skill.examples.motionplanning.a1_galaxea.motionplanner import (
     A1GalaxeaMotionPlanningSolver,
 )
@@ -93,11 +91,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
             right_base_pos = right_robot.pose.p.cpu().numpy().flatten()
 
             # For single arm, estimate left arm position using bimanual config offsets
-            cfg = (
-                self.env.unwrapped.pick_box_configs
-                if hasattr(self.env.unwrapped, "pick_box_configs")
-                else None
-            )
+            cfg = self.env.unwrapped.pick_box_configs if hasattr(self.env.unwrapped, "pick_box_configs") else None
             if cfg and "left_arm" in cfg:
                 left_base_pos = cfg["left_arm"]["pose"].p
             else:
@@ -121,12 +115,8 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
         print(f"🔧 Table origin computed: {self.table_origin}")
         print(f"🔧 Right arm world pos: {right_arm_world_pos}")
         print(f"🔧 Left arm world pos: {left_arm_world_pos}")
-        print(
-            f"🔧 Expected right arm table-relative: {self.table_origin + RIGHT_ARM_OFFSET}"
-        )
-        print(
-            f"🔧 Expected left arm table-relative: {self.table_origin + LEFT_ARM_OFFSET}"
-        )
+        print(f"🔧 Expected right arm table-relative: {self.table_origin + RIGHT_ARM_OFFSET}")
+        print(f"🔧 Expected left arm table-relative: {self.table_origin + LEFT_ARM_OFFSET}")
 
         return self.table_origin
 
@@ -177,55 +167,34 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
         # Create episode directory structure
         date_str = self.start_time.strftime("%Y/%m/%d")
         self.episode_dir = (
-            self.output_root_dir
-            / "galaxea_box_pnp"
-            / "galaxea-16hz_box_pnp"
-            / "data"
-            / date_str
-            / episode_name
+            self.output_root_dir / "galaxea_box_pnp" / "galaxea-16hz_box_pnp" / "data" / date_str / episode_name
         )
 
         # Create camera directories
         (self.episode_dir / "static_top_rgb").mkdir(parents=True, exist_ok=True)
         (self.episode_dir / "static_top_depth").mkdir(parents=True, exist_ok=True)
-        (self.episode_dir / "static_top_segmentation").mkdir(
-            parents=True, exist_ok=True
-        )
-        (self.episode_dir / "static_top_segmentation_raw").mkdir(
-            parents=True, exist_ok=True
-        )
-        (self.episode_dir / "eoat_left_top_rgb").mkdir(parents=True, exist_ok=True)
+        (self.episode_dir / "static_top_segmentation").mkdir(parents=True, exist_ok=True)
+        (self.episode_dir / "static_top_segmentation_raw").mkdir(parents=True, exist_ok=True)
+
         (self.episode_dir / "eoat_right_top_rgb").mkdir(parents=True, exist_ok=True)
         (self.episode_dir / "eoat_right_top_depth").mkdir(parents=True, exist_ok=True)
-        (self.episode_dir / "eoat_right_top_segmentation").mkdir(
-            parents=True, exist_ok=True
-        )
-        (self.episode_dir / "eoat_right_top_segmentation_raw").mkdir(
-            parents=True, exist_ok=True
-        )
-        # Additional directories for left end effector camera (bimanual support)
+        (self.episode_dir / "eoat_right_top_segmentation").mkdir(parents=True, exist_ok=True)
+        (self.episode_dir / "eoat_right_top_segmentation_raw").mkdir(parents=True, exist_ok=True)
+        (self.episode_dir / "eoat_left_top_rgb").mkdir(parents=True, exist_ok=True)
         (self.episode_dir / "eoat_left_top_depth").mkdir(parents=True, exist_ok=True)
-        (self.episode_dir / "eoat_left_top_segmentation").mkdir(
-            parents=True, exist_ok=True
-        )
-        (self.episode_dir / "eoat_left_top_segmentation_raw").mkdir(
-            parents=True, exist_ok=True
-        )
+        (self.episode_dir / "eoat_left_top_segmentation").mkdir(parents=True, exist_ok=True)
+        (self.episode_dir / "eoat_left_top_segmentation_raw").mkdir(parents=True, exist_ok=True)
 
         # Create video directory if video recording is enabled
         if self.save_video:
-            (self.episode_dir / "default_camera_video").mkdir(
-                parents=True, exist_ok=True
-            )
+            (self.episode_dir / "default_camera_video").mkdir(parents=True, exist_ok=True)
 
         # Extract segmentation mapping from environment
         self._extract_segmentation_mapping()
 
         print(f"Started episode: {episode_name}")
         print(f"Episode directory: {self.episode_dir}")
-        print(
-            f"Segmentation mapping extracted: {len(self.segmentation_mapping)} entities"
-        )
+        print(f"Segmentation mapping extracted: {len(self.segmentation_mapping)} entities")
         if self.save_video:
             print("Video recording enabled - frames will be saved from default camera")
 
@@ -265,11 +234,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                     "description": f"Actor: {entity.name}",
                 }
                 # Assign predetermined colors based on name patterns
-                if (
-                    "box" in entity.name.lower()
-                    or "b5box" in entity.name.lower()
-                    or "cube" in entity.name.lower()
-                ):
+                if "box" in entity.name.lower() or "b5box" in entity.name.lower() or "cube" in entity.name.lower():
                     self.color_mapping[seg_id] = predefined_colors["b5box"]
                 elif "basket" in entity.name.lower():
                     self.color_mapping[seg_id] = predefined_colors["basket"]
@@ -292,9 +257,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                     self.color_mapping[seg_id] = predefined_colors["table"]
                 else:
                     # Use hash-based color for other links
-                    np.random.seed(
-                        int(seg_id + 1000)
-                    )  # Offset to avoid collision with actors
+                    np.random.seed(int(seg_id + 1000))  # Offset to avoid collision with actors
                     self.color_mapping[seg_id] = np.random.randint(50, 255, 3).tolist()
             else:
                 entity_info = {
@@ -316,9 +279,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
         for seg_id, info in sorted(self.segmentation_mapping.items()):
             color = self.color_mapping[seg_id]
             simple_id = self.id_remapping.get(seg_id, 0)
-            print(
-                f"  ID {seg_id}: {info['name']} ({info['type']}) -> Color: {color}, Simple ID: {simple_id}"
-            )
+            print(f"  ID {seg_id}: {info['name']} ({info['type']}) -> Color: {color}, Simple ID: {simple_id}")
 
     def _create_id_remapping(self):
         """Create simplified ID remapping (1-5 for key objects, 0 for background)."""
@@ -568,15 +529,11 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
         if self.is_bimanual:
             # Get left arm joint states (agent 0)
             left_robot = self.base_env.agent.agents[0].robot
-            joint_states_left = (
-                left_robot.get_qpos()[0, :7].cpu().numpy()
-            )  # 6 arm joints + 1 gripper
+            joint_states_left = left_robot.get_qpos()[0, :7].cpu().numpy()  # 6 arm joints + 1 gripper
 
             # Get right arm joint states (agent 1)
             right_robot = self.base_env.agent.agents[1].robot
-            joint_states_right = (
-                right_robot.get_qpos()[0, :7].cpu().numpy()
-            )  # 6 arm joints + 1 gripper
+            joint_states_right = right_robot.get_qpos()[0, :7].cpu().numpy()  # 6 arm joints + 1 gripper
 
             # Get tool poses for both arms
             tool_pose_left = self._get_tool_pose(left_robot)
@@ -661,9 +618,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                     rgb_image = (rgb_image * 255).astype(np.uint8)
 
                 bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
-                static_rgb_path = (
-                    self.episode_dir / "static_top_rgb" / f"{frame_str}.jpg"
-                )
+                static_rgb_path = self.episode_dir / "static_top_rgb" / f"{frame_str}.jpg"
                 cv2.imwrite(str(static_rgb_path), bgr_image)
                 image_paths["static_top_rgb"] = f"static_top_rgb/{frame_str}.jpg"
 
@@ -682,13 +637,9 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                 # Convert depth to colorized format using Intel's HUE-based technique
                 # ManiSkill depth is already in millimeters, just convert to uint16
                 depth_mm = depth_image.astype(np.uint16)
-                colorized_depth = colorize_depth_image(
-                    depth_mm, min_depth=0.05, max_depth=2.0
-                )
+                colorized_depth = colorize_depth_image(depth_mm, min_depth=0.05, max_depth=2.0)
 
-                static_depth_path = (
-                    self.episode_dir / "static_top_depth" / f"{frame_str}.jpg"
-                )
+                static_depth_path = self.episode_dir / "static_top_depth" / f"{frame_str}.jpg"
                 cv2.imwrite(str(static_depth_path), colorized_depth)
                 image_paths["static_top_depth"] = f"static_top_depth/{frame_str}.jpg"
 
@@ -696,10 +647,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                     self.static_top_depth_video_frames.append(colorized_depth)
 
             # Save static top segmentation
-            if (
-                "static_top" in sensor_data
-                and "segmentation" in sensor_data["static_top"]
-            ):
+            if "static_top" in sensor_data and "segmentation" in sensor_data["static_top"]:
                 seg_image = sensor_data["static_top"]["segmentation"].cpu().numpy()
                 if seg_image.ndim == 4:
                     seg_image = seg_image[0]
@@ -711,35 +659,22 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                 # We'll create a colorized version for visualization
                 seg_colorized = self._colorize_segmentation(seg_image)
 
-                static_seg_path = (
-                    self.episode_dir / "static_top_segmentation" / f"{frame_str}.jpg"
-                )
+                static_seg_path = self.episode_dir / "static_top_segmentation" / f"{frame_str}.jpg"
                 cv2.imwrite(str(static_seg_path), seg_colorized)
-                image_paths["static_top_segmentation"] = (
-                    f"static_top_segmentation/{frame_str}.jpg"
-                )
+                image_paths["static_top_segmentation"] = f"static_top_segmentation/{frame_str}.jpg"
 
                 # Save raw segmentation mask as PNG with simplified IDs (1-5)
                 seg_raw = self._convert_to_simple_ids(seg_image)
-                static_seg_raw_path = (
-                    self.episode_dir
-                    / "static_top_segmentation_raw"
-                    / f"{frame_str}.png"
-                )
+                static_seg_raw_path = self.episode_dir / "static_top_segmentation_raw" / f"{frame_str}.png"
                 cv2.imwrite(str(static_seg_raw_path), seg_raw)
-                image_paths["static_top_segmentation_raw"] = (
-                    f"static_top_segmentation_raw/{frame_str}.png"
-                )
+                image_paths["static_top_segmentation_raw"] = f"static_top_segmentation_raw/{frame_str}.png"
 
                 if self.save_video:
                     self.static_top_seg_video_frames.append(seg_colorized)
 
             # Save end effector camera RGB (eoat_right_top & eoat_left_top)
             # Handle right gripper camera
-            if (
-                "eoat_right_top" in sensor_data
-                and "rgb" in sensor_data["eoat_right_top"]
-            ):
+            if "eoat_right_top" in sensor_data and "rgb" in sensor_data["eoat_right_top"]:
                 rgb_image = sensor_data["eoat_right_top"]["rgb"].cpu().numpy()
                 if rgb_image.ndim == 4:
                     rgb_image = rgb_image[0]
@@ -750,13 +685,9 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                 bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
 
                 # Save as eoat_right_top_rgb (main end effector camera)
-                eoat_right_path = (
-                    self.episode_dir / "eoat_right_top_rgb" / f"{frame_str}.jpg"
-                )
+                eoat_right_path = self.episode_dir / "eoat_right_top_rgb" / f"{frame_str}.jpg"
                 cv2.imwrite(str(eoat_right_path), bgr_image)
-                image_paths["eoat_right_top_rgb"] = (
-                    f"eoat_right_top_rgb/{frame_str}.jpg"
-                )
+                image_paths["eoat_right_top_rgb"] = f"eoat_right_top_rgb/{frame_str}.jpg"
 
                 if self.save_video:
                     self.eoat_right_video_frames.append(bgr_image)
@@ -772,9 +703,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
 
                 bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
 
-                eoat_left_path = (
-                    self.episode_dir / "eoat_left_top_rgb" / f"{frame_str}.jpg"
-                )
+                eoat_left_path = self.episode_dir / "eoat_left_top_rgb" / f"{frame_str}.jpg"
                 cv2.imwrite(str(eoat_left_path), bgr_image)
                 image_paths["eoat_left_top_rgb"] = f"eoat_left_top_rgb/{frame_str}.jpg"
 
@@ -782,10 +711,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                     self.eoat_left_video_frames.append(bgr_image)
 
             # Save depth for right & left gripper cameras
-            if (
-                "eoat_right_top" in sensor_data
-                and "depth" in sensor_data["eoat_right_top"]
-            ):
+            if "eoat_right_top" in sensor_data and "depth" in sensor_data["eoat_right_top"]:
                 depth_image = sensor_data["eoat_right_top"]["depth"].cpu().numpy()
                 if depth_image.ndim == 4:
                     depth_image = depth_image[0]
@@ -793,25 +719,16 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                     depth_image = depth_image[:, :, 0]
 
                 depth_mm = depth_image.astype(np.uint16)
-                colorized_depth = colorize_depth_image(
-                    depth_mm, min_depth=0.05, max_depth=2.0
-                )
+                colorized_depth = colorize_depth_image(depth_mm, min_depth=0.05, max_depth=2.0)
 
-                eoat_depth_path = (
-                    self.episode_dir / "eoat_right_top_depth" / f"{frame_str}.jpg"
-                )
+                eoat_depth_path = self.episode_dir / "eoat_right_top_depth" / f"{frame_str}.jpg"
                 cv2.imwrite(str(eoat_depth_path), colorized_depth)
-                image_paths["eoat_right_top_depth"] = (
-                    f"eoat_right_top_depth/{frame_str}.jpg"
-                )
+                image_paths["eoat_right_top_depth"] = f"eoat_right_top_depth/{frame_str}.jpg"
 
                 if self.save_video:
                     self.eoat_right_depth_video_frames.append(colorized_depth)
 
-            if (
-                "eoat_left_top" in sensor_data
-                and "depth" in sensor_data["eoat_left_top"]
-            ):
+            if "eoat_left_top" in sensor_data and "depth" in sensor_data["eoat_left_top"]:
                 depth_image = sensor_data["eoat_left_top"]["depth"].cpu().numpy()
                 if depth_image.ndim == 4:
                     depth_image = depth_image[0]
@@ -819,26 +736,17 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                     depth_image = depth_image[:, :, 0]
 
                 depth_mm = depth_image.astype(np.uint16)
-                colorized_depth = colorize_depth_image(
-                    depth_mm, min_depth=0.05, max_depth=2.0
-                )
+                colorized_depth = colorize_depth_image(depth_mm, min_depth=0.05, max_depth=2.0)
 
-                eoat_depth_path = (
-                    self.episode_dir / "eoat_left_top_depth" / f"{frame_str}.jpg"
-                )
+                eoat_depth_path = self.episode_dir / "eoat_left_top_depth" / f"{frame_str}.jpg"
                 cv2.imwrite(str(eoat_depth_path), colorized_depth)
-                image_paths["eoat_left_top_depth"] = (
-                    f"eoat_left_top_depth/{frame_str}.jpg"
-                )
+                image_paths["eoat_left_top_depth"] = f"eoat_left_top_depth/{frame_str}.jpg"
 
                 if self.save_video:
                     self.eoat_left_depth_video_frames.append(colorized_depth)
 
             # Save segmentation for right & left gripper cameras
-            if (
-                "eoat_right_top" in sensor_data
-                and "segmentation" in sensor_data["eoat_right_top"]
-            ):
+            if "eoat_right_top" in sensor_data and "segmentation" in sensor_data["eoat_right_top"]:
                 seg_image = sensor_data["eoat_right_top"]["segmentation"].cpu().numpy()
                 if seg_image.ndim == 4:
                     seg_image = seg_image[0]
@@ -847,34 +755,19 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
 
                 seg_colorized = self._colorize_segmentation(seg_image)
 
-                eoat_seg_path = (
-                    self.episode_dir
-                    / "eoat_right_top_segmentation"
-                    / f"{frame_str}.jpg"
-                )
+                eoat_seg_path = self.episode_dir / "eoat_right_top_segmentation" / f"{frame_str}.jpg"
                 cv2.imwrite(str(eoat_seg_path), seg_colorized)
-                image_paths["eoat_right_top_segmentation"] = (
-                    f"eoat_right_top_segmentation/{frame_str}.jpg"
-                )
+                image_paths["eoat_right_top_segmentation"] = f"eoat_right_top_segmentation/{frame_str}.jpg"
 
                 seg_raw = self._convert_to_simple_ids(seg_image)
-                eoat_seg_raw_path = (
-                    self.episode_dir
-                    / "eoat_right_top_segmentation_raw"
-                    / f"{frame_str}.png"
-                )
+                eoat_seg_raw_path = self.episode_dir / "eoat_right_top_segmentation_raw" / f"{frame_str}.png"
                 cv2.imwrite(str(eoat_seg_raw_path), seg_raw)
-                image_paths["eoat_right_top_segmentation_raw"] = (
-                    f"eoat_right_top_segmentation_raw/{frame_str}.png"
-                )
+                image_paths["eoat_right_top_segmentation_raw"] = f"eoat_right_top_segmentation_raw/{frame_str}.png"
 
                 if self.save_video:
                     self.eoat_right_seg_video_frames.append(seg_colorized)
 
-            if (
-                "eoat_left_top" in sensor_data
-                and "segmentation" in sensor_data["eoat_left_top"]
-            ):
+            if "eoat_left_top" in sensor_data and "segmentation" in sensor_data["eoat_left_top"]:
                 seg_image = sensor_data["eoat_left_top"]["segmentation"].cpu().numpy()
                 if seg_image.ndim == 4:
                     seg_image = seg_image[0]
@@ -883,24 +776,14 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
 
                 seg_colorized = self._colorize_segmentation(seg_image)
 
-                eoat_seg_path = (
-                    self.episode_dir / "eoat_left_top_segmentation" / f"{frame_str}.jpg"
-                )
+                eoat_seg_path = self.episode_dir / "eoat_left_top_segmentation" / f"{frame_str}.jpg"
                 cv2.imwrite(str(eoat_seg_path), seg_colorized)
-                image_paths["eoat_left_top_segmentation"] = (
-                    f"eoat_left_top_segmentation/{frame_str}.jpg"
-                )
+                image_paths["eoat_left_top_segmentation"] = f"eoat_left_top_segmentation/{frame_str}.jpg"
 
                 seg_raw = self._convert_to_simple_ids(seg_image)
-                eoat_seg_raw_path = (
-                    self.episode_dir
-                    / "eoat_left_top_segmentation_raw"
-                    / f"{frame_str}.png"
-                )
+                eoat_seg_raw_path = self.episode_dir / "eoat_left_top_segmentation_raw" / f"{frame_str}.png"
                 cv2.imwrite(str(eoat_seg_raw_path), seg_raw)
-                image_paths["eoat_left_top_segmentation_raw"] = (
-                    f"eoat_left_top_segmentation_raw/{frame_str}.png"
-                )
+                image_paths["eoat_left_top_segmentation_raw"] = f"eoat_left_top_segmentation_raw/{frame_str}.png"
 
                 if self.save_video:
                     self.eoat_left_seg_video_frames.append(seg_colorized)
@@ -929,13 +812,9 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                         video_frame = cv2.cvtColor(video_frame, cv2.COLOR_RGB2BGR)
 
                     # Save individual video frame
-                    video_frame_path = (
-                        self.episode_dir / "default_camera_video" / f"{frame_str}.jpg"
-                    )
+                    video_frame_path = self.episode_dir / "default_camera_video" / f"{frame_str}.jpg"
                     cv2.imwrite(str(video_frame_path), video_frame)
-                    image_paths["default_camera_video"] = (
-                        f"default_camera_video/{frame_str}.jpg"
-                    )
+                    image_paths["default_camera_video"] = f"default_camera_video/{frame_str}.jpg"
 
                     # Store frame for video compilation
                     self.video_frames.append(video_frame)
@@ -1031,9 +910,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
 
                 # Define codec and create VideoWriter
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                video_writer = cv2.VideoWriter(
-                    str(video_path), fourcc, self.video_fps, (width, height)
-                )
+                video_writer = cv2.VideoWriter(str(video_path), fourcc, self.video_fps, (width, height))
 
                 # Write frames to video
                 for frame in frames:
@@ -1075,9 +952,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
 
             self.elapsed_steps += 1
             if self.print_env_info:
-                print(
-                    f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}"
-                )
+                print(f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}")
             if self.vis:
                 self.base_env.render_human()
 
@@ -1096,11 +971,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                 action_np = np.hstack([qpos, np.zeros_like(qpos), self.gripper_state])
 
             # Format for bimanual
-            action = (
-                action_np
-                if hasattr(self.base_env.agent, "robot")
-                else self._format_action_for_bimanual(action_np)
-            )
+            action = action_np if hasattr(self.base_env.agent, "robot") else self._format_action_for_bimanual(action_np)
 
             obs, reward, terminated, truncated, info = self.env.step(action)
 
@@ -1109,9 +980,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
 
             self.elapsed_steps += 1
             if self.print_env_info:
-                print(
-                    f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}"
-                )
+                print(f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}")
             if self.vis:
                 self.base_env.render_human()
 
@@ -1130,11 +999,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
             else:
                 action_np = np.hstack([qpos, np.zeros_like(qpos), self.gripper_state])
 
-            action = (
-                action_np
-                if hasattr(self.base_env.agent, "robot")
-                else self._format_action_for_bimanual(action_np)
-            )
+            action = action_np if hasattr(self.base_env.agent, "robot") else self._format_action_for_bimanual(action_np)
 
             obs, reward, terminated, truncated, info = self.env.step(action)
 
@@ -1143,9 +1008,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
 
             self.elapsed_steps += 1
             if self.print_env_info:
-                print(
-                    f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}"
-                )
+                print(f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}")
             if self.vis:
                 self.base_env.render_human()
 
@@ -1176,9 +1039,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                     # Convert from tensor to list (flatten 3x3 matrix row-wise)
                     if hasattr(intrinsic_cv, "cpu"):
                         intrinsic_cv = intrinsic_cv.cpu().numpy()
-                    k_matrix = (
-                        intrinsic_cv[0].flatten().tolist()
-                    )  # Take first batch element
+                    k_matrix = intrinsic_cv[0].flatten().tolist()  # Take first batch element
 
                     camera_metadata["k_mats"][sensor_name] = k_matrix
 
@@ -1204,9 +1065,7 @@ class A1GalaxeaDatasetGenerator(A1GalaxeaMotionPlanningSolver):
                     "id_remapping": "Maps original segmentation IDs to simplified IDs (0=background, 1-5=key objects)",
                 },
             }
-            print(
-                f"✅ Added segmentation legend with {len(self.segmentation_mapping)} entities"
-            )
+            print(f"✅ Added segmentation legend with {len(self.segmentation_mapping)} entities")
 
         return camera_metadata
 
@@ -1330,14 +1189,10 @@ def generate_pick_box_dataset(
         if isinstance(robot_uids, tuple):
             # Bimanual mode - check if all robots are a1_galaxea
             if not all(uid == "a1_galaxea" for uid in robot_uids):
-                raise ValueError(
-                    f"This generator only supports 'a1_galaxea', but got {robot_uids}."
-                )
+                raise ValueError(f"This generator only supports 'a1_galaxea', but got {robot_uids}.")
         # Single robot mode
         elif robot_uids != "a1_galaxea":
-            raise ValueError(
-                f"This generator only supports 'a1_galaxea', but got {robot_uids}."
-            )
+            raise ValueError(f"This generator only supports 'a1_galaxea', but got {robot_uids}.")
 
         # Get base pose from active agent (right arm in bimanual mode)
         if hasattr(env.unwrapped.agent, "robot"):
@@ -1377,19 +1232,10 @@ def generate_pick_box_dataset(
             # Get target_closing from active agent (right arm in bimanual mode)
             if hasattr(env.agent, "tcp"):
                 # Single robot mode
-                target_closing = (
-                    env.agent.tcp.pose.to_transformation_matrix()[0, :3, 1]
-                    .cpu()
-                    .numpy()
-                )
+                target_closing = env.agent.tcp.pose.to_transformation_matrix()[0, :3, 1].cpu().numpy()
             else:
                 # Bimanual mode - use right arm (active agent, index 1)
-                target_closing = (
-                    env.agent.agents[1]
-                    .tcp.pose.to_transformation_matrix()[0, :3, 1]
-                    .cpu()
-                    .numpy()
-                )
+                target_closing = env.agent.agents[1].tcp.pose.to_transformation_matrix()[0, :3, 1].cpu().numpy()
 
             grasp_info = compute_grasp_info_by_obb(
                 obb,
@@ -1401,14 +1247,10 @@ def generate_pick_box_dataset(
             # Build grasp pose using active agent (right arm in bimanual mode)
             if hasattr(env.agent, "build_grasp_pose"):
                 # Single robot mode
-                grasp_pose = env.agent.build_grasp_pose(
-                    approaching, closing, env.b5box.pose.sp.p
-                )
+                grasp_pose = env.agent.build_grasp_pose(approaching, closing, env.b5box.pose.sp.p)
             else:
                 # Bimanual mode - use right arm (active agent, index 1)
-                grasp_pose = env.agent.agents[1].build_grasp_pose(
-                    approaching, closing, env.b5box.pose.sp.p
-                )
+                grasp_pose = env.agent.agents[1].build_grasp_pose(approaching, closing, env.b5box.pose.sp.p)
 
             # Execute pick and place sequence
             print("Moving to pre-grasp pose...")

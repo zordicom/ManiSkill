@@ -78,9 +78,9 @@ class Args:
     """whether to let parallel environments reset upon termination instead of truncation"""
     eval_partial_reset: bool = False
     """whether to let parallel evaluation environments reset upon termination instead of truncation"""
-    num_steps: int = 150
+    num_steps: int = 100
     """the number of steps to run in each environment per policy rollout"""
-    num_eval_steps: int = 150
+    num_eval_steps: int = 100
     """the number of steps to run in each evaluation environment during evaluation"""
     reconfiguration_freq: Optional[int] = None
     """how often to reconfigure the environment during training"""
@@ -90,7 +90,7 @@ class Args:
     """evaluation frequency in terms of iterations"""
     save_train_video_freq: Optional[int] = None
     """frequency to save training videos in terms of iterations"""
-    control_mode: Optional[str] = "pd_ee_delta_pose"
+    control_mode: Optional[str] = "pd_joint_delta_pos"
     """the control mode to use for the environment"""
     render_mode: str = "all"
     """the environment rendering mode"""
@@ -98,15 +98,15 @@ class Args:
     # Algorithm specific arguments
     total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
-    buffer_size: int = 100_000
+    buffer_size: int = 50_000
     """the replay memory buffer size"""
     buffer_device: str = "cpu"
     """where the replay buffer is stored. Can be 'cpu' or 'cuda' for GPU"""
-    gamma: float = 0.9
+    gamma: float = 0.95
     """the discount factor gamma"""
-    tau: float = 0.01
+    tau: float = 0.005
     """target smoothing coefficient"""
-    batch_size: int = 256
+    batch_size: int = 128
     """the batch size of sample from the replay memory"""
     learning_starts: int = 4_000
     """timestep to start learning"""
@@ -124,15 +124,15 @@ class Args:
     """automatic tuning of the entropy coefficient"""
     training_freq: int = 64
     """training frequency (in steps)"""
-    utd: float = 0.5
+    utd: float = 0.25
     """update to data ratio"""
     partial_reset: bool = False
     """whether to let parallel environments reset upon termination instead of truncation"""
     bootstrap_at_done: str = "always"
     """the bootstrap method to use when a done signal is received. Can be 'always' or 'never'"""
-    camera_width: Optional[int] = 64
+    camera_width: Optional[int] = 112
     """the width of the camera image. If none it will use the default the environment specifies"""
-    camera_height: Optional[int] = 64
+    camera_height: Optional[int] = 112
     """the height of the camera image. If none it will use the default the environment specifies."""
 
     # to be filled in runtime
