@@ -126,7 +126,7 @@ class PickBoxEnv(BaseEnv):
 
     # Shadow box parameters for floating overhead obstacle
     shadow_box_ranges = {  # noqa: RUF012
-        "probability": 0.7,  # 70% chance to spawn shadow box
+        "probability": 0.5,  # 50% chance to spawn shadow box
         "width": (0.15, 0.35),  # Box width (x-axis)
         "depth": (0.15, 0.35),  # Box depth (y-axis)
         "height": (0.02, 0.08),  # Box thickness (z-axis)
@@ -140,7 +140,7 @@ class PickBoxEnv(BaseEnv):
     _total_environments_created = 0
 
     # B5box asset usage parameters
-    use_real_b5box_probability = 1.0  # 30% chance to use real b5box assets instead of primitive box
+    use_real_b5box_probability = 0.8  # 80% chance to use real b5box assets instead of primitive box
 
     def __init__(
         self,
@@ -336,7 +336,7 @@ class PickBoxEnv(BaseEnv):
         else:
             pose = sapien_utils.look_at(eye=self.human_cam_eye_pos, target=self.human_cam_target_pos)
 
-        return CameraConfig("render_camera", pose, 224, 224, fov=1.012, near=0.01, far=10)
+        return CameraConfig("render_camera", pose, 448, 448, fov=1.012, near=0.01, far=10)
 
     # # ------------------------------------------------------------------
     # # Curriculum Learning Support -------------------------------------

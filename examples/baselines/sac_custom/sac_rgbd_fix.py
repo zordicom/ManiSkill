@@ -58,7 +58,7 @@ class Args:
     """if toggled, only runs evaluation with the given model checkpoint and saves the evaluation trajectories"""
     checkpoint: Optional[str] = None
     """path to a pretrained checkpoint file to start evaluation/training from"""
-    log_freq: int = 1_000
+    log_freq: int = 10_000
     """logging frequency in terms of environment steps"""
 
     # Environment specific arguments
@@ -70,7 +70,7 @@ class Args:
     """whether to include the state in the observation"""
     env_vectorization: str = "gpu"
     """the type of environment vectorization to use"""
-    num_envs: int = 16
+    num_envs: int = 32
     """the number of parallel environments"""
     num_eval_envs: int = 16
     """the number of parallel evaluation environments"""
@@ -86,11 +86,11 @@ class Args:
     """how often to reconfigure the environment during training"""
     eval_reconfiguration_freq: Optional[int] = 1
     """for benchmarking purposes we want to reconfigure the eval environment each reset to ensure objects are randomized in some tasks"""
-    eval_freq: int = 25
+    eval_freq: int = 10_000
     """evaluation frequency in terms of iterations"""
     save_train_video_freq: Optional[int] = None
     """frequency to save training videos in terms of iterations"""
-    control_mode: Optional[str] = "pd_joint_delta_pos"
+    control_mode: Optional[str] = "pd_ee_delta_pose"
     """the control mode to use for the environment"""
     render_mode: str = "all"
     """the environment rendering mode"""
@@ -98,15 +98,15 @@ class Args:
     # Algorithm specific arguments
     total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
-    buffer_size: int = 1_000_000
+    buffer_size: int = 100_000
     """the replay memory buffer size"""
-    buffer_device: str = "cuda"
+    buffer_device: str = "cpu"
     """where the replay buffer is stored. Can be 'cpu' or 'cuda' for GPU"""
-    gamma: float = 0.99
+    gamma: float = 0.9
     """the discount factor gamma"""
-    tau: float = 0.005
+    tau: float = 0.01
     """target smoothing coefficient"""
-    batch_size: int = 512
+    batch_size: int = 256
     """the batch size of sample from the replay memory"""
     learning_starts: int = 4_000
     """timestep to start learning"""
@@ -124,15 +124,15 @@ class Args:
     """automatic tuning of the entropy coefficient"""
     training_freq: int = 64
     """training frequency (in steps)"""
-    utd: float = 0.25
+    utd: float = 0.5
     """update to data ratio"""
     partial_reset: bool = False
     """whether to let parallel environments reset upon termination instead of truncation"""
     bootstrap_at_done: str = "always"
     """the bootstrap method to use when a done signal is received. Can be 'always' or 'never'"""
-    camera_width: Optional[int] = None
+    camera_width: Optional[int] = 64
     """the width of the camera image. If none it will use the default the environment specifies"""
-    camera_height: Optional[int] = None
+    camera_height: Optional[int] = 64
     """the height of the camera image. If none it will use the default the environment specifies."""
 
     # to be filled in runtime
