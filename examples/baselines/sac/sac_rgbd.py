@@ -1,28 +1,75 @@
-
-from collections import defaultdict
-from dataclasses import dataclass
 import os
 import random
 import time
+from collections import defaultdict
+from dataclasses import dataclass
 from typing import Optional
 
-import tqdm
-
-from mani_skill.utils import gym_utils
-from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper, FlattenRGBDObservationWrapper
-from mani_skill.utils.wrappers.record import RecordEpisode
-from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
-
 import gymnasium as gym
+import mani_skill.envs
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
+import tqdm
 import tyro
+from mani_skill.utils import gym_utils
+from mani_skill.utils.wrappers.flatten import (
+    FlattenActionSpaceWrapper,
+    FlattenRGBDObservationWrapper,
+)
+from mani_skill.utils.wrappers.record import RecordEpisode
+from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+from torch import nn, optim
+from torch.utils.tensorboard import SummaryWriter
 
-import mani_skill.envs
+# Expert+Residual wrapper utility
+try:
+    from util import create_expert_residual_envs
+except ImportError:
+    create_expert_residual_envs = None
+
+# PPO RGB Fast expert utility
+try:
+    import sys
+
+    sys.path.append("examples/baselines/ppo")
+    from ppo_rgb_fast import Agent as PPORGBFastAgent
+    from ppo_rgb_fast import NatureCNN
+except ImportError:
+    PPORGBFastAgent = None
+    NatureCNN = None
+
+
+def create_ppo_rgb_fast_expert(
+    checkpoint_path: str, sample_obs, n_act: int, device: str = "cuda"
+):
+    """Create PPO RGB Fast expert policy from checkpoint."""
+    if PPORGBFastAgent is None:
+        raise ImportError(
+            "PPO RGB Fast agent not available. Please ensure ppo_rgb_fast.py is accessible."
+        )
+
+    print(f"Loading PPO RGB Fast expert from: {checkpoint_path}")
+
+    # Create agent
+    agent = PPORGBFastAgent(n_act, sample_obs, device=device)
+
+    # Load checkpoint
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    agent.load_state_dict(state_dict, strict=True)
+    agent.eval()
+
+    print(f"PPO RGB Fast expert loaded successfully with {n_act} action dimensions")
+
+    def ppo_rgb_fast_expert(obs):
+        """Expert policy function that uses PPO RGB Fast model."""
+        with torch.no_grad():
+            # Get features and then mean action (deterministic)
+            features = agent.get_features(obs)
+            action = agent.actor_mean(features)
+            return action
+
+    return ppo_rgb_fast_expert
 
 
 @dataclass
@@ -130,11 +177,33 @@ class Args:
     camera_height: Optional[int] = None
     """the height of the camera image. If none it will use the default the environment specifies."""
 
+    # Expert+Residual parameters (optional)
+    expert_type: str = "none"
+    """type of expert policy: 'none' (regular SAC), 'zero', 'ik', 'model', 'ppo_rgb_fast'"""
+    residual_scale: float = 1.0
+    """scale factor for residual actions"""
+    expert_action_noise: float = 0.0
+    """Gaussian noise std to add to expert actions"""
+    track_action_stats: bool = False
+    """whether to track expert/residual action statistics"""
+    ik_gain: float = 2.0
+    """proportional gain for IK expert policy"""
+    model_path: Optional[str] = None
+    """path to pre-trained model for model expert policy"""
+
+    # PPO RGB Fast expert parameters
+    ppo_rgb_fast_path: Optional[str] = (
+        "/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo_rgb_fast__1__1752546740/ckpt_326.pt"
+    )
+    """path to pre-trained PPO RGB Fast model checkpoint"""
+
     # to be filled in runtime
     grad_steps_per_iteration: int = 0
     """the number of gradient updates per iteration"""
     steps_per_env: int = 0
     """the number of steps each parallel env takes per iteration"""
+
+
 class DictArray(object):
     def __init__(self, buffer_shape, element_space, data_dict=None, device=None):
         self.buffer_shape = buffer_shape
@@ -147,12 +216,20 @@ class DictArray(object):
                 if isinstance(v, gym.spaces.dict.Dict):
                     self.data[k] = DictArray(buffer_shape, v, device=device)
                 else:
-                    dtype = (torch.float32 if v.dtype in (np.float32, np.float64) else
-                            torch.uint8 if v.dtype == np.uint8 else
-                            torch.int16 if v.dtype == np.int16 else
-                            torch.int32 if v.dtype == np.int32 else
-                            v.dtype)
-                    self.data[k] = torch.zeros(buffer_shape + v.shape, dtype=dtype, device=device)
+                    dtype = (
+                        torch.float32
+                        if v.dtype in (np.float32, np.float64)
+                        else torch.uint8
+                        if v.dtype == np.uint8
+                        else torch.int16
+                        if v.dtype == np.int16
+                        else torch.int32
+                        if v.dtype == np.int32
+                        else v.dtype
+                    )
+                    self.data[k] = torch.zeros(
+                        buffer_shape + v.shape, dtype=dtype, device=device
+                    )
 
     def keys(self):
         return self.data.keys()
@@ -160,9 +237,7 @@ class DictArray(object):
     def __getitem__(self, index):
         if isinstance(index, str):
             return self.data[index]
-        return {
-            k: v[index] for k, v in self.data.items()
-        }
+        return {k: v[index] for k, v in self.data.items()}
 
     def __setitem__(self, index, value):
         if isinstance(index, str):
@@ -177,13 +252,15 @@ class DictArray(object):
     def reshape(self, shape):
         t = len(self.buffer_shape)
         new_dict = {}
-        for k,v in self.data.items():
+        for k, v in self.data.items():
             if isinstance(v, DictArray):
                 new_dict[k] = v.reshape(shape)
             else:
                 new_dict[k] = v.reshape(shape + v.shape[t:])
-        new_buffer_shape = next(iter(new_dict.values())).shape[:len(shape)]
+        new_buffer_shape = next(iter(new_dict.values())).shape[: len(shape)]
         return DictArray(new_buffer_shape, None, data_dict=new_dict)
+
+
 @dataclass
 class ReplayBufferSample:
     obs: torch.Tensor
@@ -191,8 +268,17 @@ class ReplayBufferSample:
     actions: torch.Tensor
     rewards: torch.Tensor
     dones: torch.Tensor
+
+
 class ReplayBuffer:
-    def __init__(self, env, num_envs: int, buffer_size: int, storage_device: torch.device, sample_device: torch.device):
+    def __init__(
+        self,
+        env,
+        num_envs: int,
+        buffer_size: int,
+        storage_device: torch.device,
+        sample_device: torch.device,
+    ):
         self.buffer_size = buffer_size
         self.pos = 0
         self.full = False
@@ -202,16 +288,42 @@ class ReplayBuffer:
         self.per_env_buffer_size = buffer_size // num_envs
         # note 128x128x3 RGB data with replay buffer size 100_000 takes up around 4.7GB of GPU memory
         # 32 parallel envs with rendering uses up around 2.2GB of GPU memory.
-        self.obs = DictArray((self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device)
+        self.obs = DictArray(
+            (self.per_env_buffer_size, num_envs),
+            env.single_observation_space,
+            device=storage_device,
+        )
         # TODO (stao): optimize final observation storage
-        self.next_obs = DictArray((self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device)
-        self.actions = torch.zeros((self.per_env_buffer_size, num_envs) + env.single_action_space.shape, device=storage_device)
-        self.logprobs = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.rewards = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.dones = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
-        self.values = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
+        self.next_obs = DictArray(
+            (self.per_env_buffer_size, num_envs),
+            env.single_observation_space,
+            device=storage_device,
+        )
+        self.actions = torch.zeros(
+            (self.per_env_buffer_size, num_envs) + env.single_action_space.shape,
+            device=storage_device,
+        )
+        self.logprobs = torch.zeros(
+            (self.per_env_buffer_size, num_envs), device=storage_device
+        )
+        self.rewards = torch.zeros(
+            (self.per_env_buffer_size, num_envs), device=storage_device
+        )
+        self.dones = torch.zeros(
+            (self.per_env_buffer_size, num_envs), device=storage_device
+        )
+        self.values = torch.zeros(
+            (self.per_env_buffer_size, num_envs), device=storage_device
+        )
 
-    def add(self, obs: torch.Tensor, next_obs: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, done: torch.Tensor):
+    def add(
+        self,
+        obs: torch.Tensor,
+        next_obs: torch.Tensor,
+        action: torch.Tensor,
+        reward: torch.Tensor,
+        done: torch.Tensor,
+    ):
         if self.storage_device == torch.device("cpu"):
             obs = {k: v.cpu() for k, v in obs.items()}
             next_obs = {k: v.cpu() for k, v in next_obs.items()}
@@ -230,47 +342,59 @@ class ReplayBuffer:
         if self.pos == self.per_env_buffer_size:
             self.full = True
             self.pos = 0
+
     def sample(self, batch_size: int):
         if self.full:
-            batch_inds = torch.randint(0, self.per_env_buffer_size, size=(batch_size, ))
+            batch_inds = torch.randint(0, self.per_env_buffer_size, size=(batch_size,))
         else:
-            batch_inds = torch.randint(0, self.pos, size=(batch_size, ))
-        env_inds = torch.randint(0, self.num_envs, size=(batch_size, ))
+            batch_inds = torch.randint(0, self.pos, size=(batch_size,))
+        env_inds = torch.randint(0, self.num_envs, size=(batch_size,))
         obs_sample = self.obs[batch_inds, env_inds]
         next_obs_sample = self.next_obs[batch_inds, env_inds]
         obs_sample = {k: v.to(self.sample_device) for k, v in obs_sample.items()}
-        next_obs_sample = {k: v.to(self.sample_device) for k, v in next_obs_sample.items()}
+        next_obs_sample = {
+            k: v.to(self.sample_device) for k, v in next_obs_sample.items()
+        }
         return ReplayBufferSample(
             obs=obs_sample,
             next_obs=next_obs_sample,
             actions=self.actions[batch_inds, env_inds].to(self.sample_device),
             rewards=self.rewards[batch_inds, env_inds].to(self.sample_device),
-            dones=self.dones[batch_inds, env_inds].to(self.sample_device)
+            dones=self.dones[batch_inds, env_inds].to(self.sample_device),
         )
+
 
 # ALGO LOGIC: initialize agent here:
 class PlainConv(nn.Module):
-    def __init__(self,
-                 in_channels=3,
-                 out_dim=256,
-                 pool_feature_map=False,
-                 last_act=True, # True for ConvBody, False for CNN
-                 image_size=[128, 128]
-                 ):
+    def __init__(
+        self,
+        in_channels=3,
+        out_dim=256,
+        pool_feature_map=False,
+        last_act=True,  # True for ConvBody, False for CNN
+        image_size=[128, 128],
+    ):
         super().__init__()
         # assume input image size is 128x128 or 64x64
 
         self.out_dim = out_dim
         self.cnn = nn.Sequential(
-            nn.Conv2d(in_channels, 16, 3, padding=1, bias=True), nn.ReLU(inplace=True),
-            nn.MaxPool2d(4, 4) if image_size[0] == 128 and image_size[1] == 128 else nn.MaxPool2d(2, 2),  # [32, 32]
-            nn.Conv2d(16, 32, 3, padding=1, bias=True), nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 16, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(4, 4)
+            if image_size[0] == 128 and image_size[1] == 128
+            else nn.MaxPool2d(2, 2),  # [32, 32]
+            nn.Conv2d(16, 32, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),  # [16, 16]
-            nn.Conv2d(32, 64, 3, padding=1, bias=True), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),  # [8, 8]
-            nn.Conv2d(64, 64, 3, padding=1, bias=True), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),  # [4, 4]
-            nn.Conv2d(64, 64, 1, padding=0, bias=True), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
         )
 
         if pool_feature_map:
@@ -295,6 +419,7 @@ class PlainConv(nn.Module):
         x = x.flatten(1)
         x = self.fc(x)
         return x
+
 
 # class Encoder(nn.Module):
 #     def __init__(self, sample_obs):
@@ -337,6 +462,7 @@ class PlainConv(nn.Module):
 #         self.out_features += feature_size
 #         self.extractors = nn.ModuleDict(extractors)
 
+
 #     def forward(self, observations) -> torch.Tensor:
 #         encoded_tensor_list = []
 #         # self.extractors contain nn.Modules that do all the processing.
@@ -354,19 +480,20 @@ class EncoderObsWrapper(nn.Module):
 
     def forward(self, obs):
         if "rgb" in obs:
-            rgb = obs['rgb'].float() / 255.0 # (B, H, W, 3*k)
+            rgb = obs["rgb"].float() / 255.0  # (B, H, W, 3*k)
         if "depth" in obs:
-            depth = obs['depth'].float() # (B, H, W, 1*k)
+            depth = obs["depth"].float()  # (B, H, W, 1*k)
         if "rgb" and "depth" in obs:
-            img = torch.cat([rgb, depth], dim=3) # (B, H, W, C)
+            img = torch.cat([rgb, depth], dim=3)  # (B, H, W, C)
         elif "rgb" in obs:
             img = rgb
         elif "depth" in obs:
             img = depth
         else:
-            raise ValueError(f"Observation dict must contain 'rgb' or 'depth'")
-        img = img.permute(0, 3, 1, 2) # (B, C, H, W)
+            raise ValueError("Observation dict must contain 'rgb' or 'depth'")
+        img = img.permute(0, 3, 1, 2)  # (B, C, H, W)
         return self.encoder(img)
+
 
 def make_mlp(in_channels, mlp_channels, act_builder=nn.ReLU, last_act=True):
     c_in = in_channels
@@ -378,13 +505,18 @@ def make_mlp(in_channels, mlp_channels, act_builder=nn.ReLU, last_act=True):
         c_in = c_out
     return nn.Sequential(*module_list)
 
+
 class SoftQNetwork(nn.Module):
     def __init__(self, envs, encoder: EncoderObsWrapper):
         super().__init__()
         self.encoder = encoder
         action_dim = np.prod(envs.single_action_space.shape)
-        state_dim = envs.single_observation_space['state'].shape[0]
-        self.mlp = make_mlp(encoder.encoder.out_dim+action_dim+state_dim, [512, 256, 1], last_act=False)
+        state_dim = envs.single_observation_space["state"].shape[0]
+        self.mlp = make_mlp(
+            encoder.encoder.out_dim + action_dim + state_dim,
+            [512, 256, 1],
+            last_act=False,
+        )
 
     def forward(self, obs, action, visual_feature=None, detach_encoder=False):
         if visual_feature is None:
@@ -398,11 +530,12 @@ class SoftQNetwork(nn.Module):
 LOG_STD_MAX = 2
 LOG_STD_MIN = -5
 
+
 class Actor(nn.Module):
     def __init__(self, envs, sample_obs):
         super().__init__()
         action_dim = np.prod(envs.single_action_space.shape)
-        state_dim = envs.single_observation_space['state'].shape[0]
+        state_dim = envs.single_observation_space["state"].shape[0]
         # count number of channels and image size
         in_channels = 0
         if "rgb" in sample_obs:
@@ -413,20 +546,28 @@ class Actor(nn.Module):
             image_size = sample_obs["depth"].shape[1:3]
 
         self.encoder = EncoderObsWrapper(
-            PlainConv(in_channels=in_channels, out_dim=256, image_size=image_size) # assume image is 64x64
+            PlainConv(
+                in_channels=in_channels, out_dim=256, image_size=image_size
+            )  # assume image is 64x64
         )
-        self.mlp = make_mlp(self.encoder.encoder.out_dim+state_dim, [512, 256], last_act=True)
+        self.mlp = make_mlp(
+            self.encoder.encoder.out_dim + state_dim, [512, 256], last_act=True
+        )
         self.fc_mean = nn.Linear(256, action_dim)
         self.fc_logstd = nn.Linear(256, action_dim)
         # action rescaling
-        self.action_scale = torch.FloatTensor((envs.single_action_space.high - envs.single_action_space.low) / 2.0)
-        self.action_bias = torch.FloatTensor((envs.single_action_space.high + envs.single_action_space.low) / 2.0)
+        self.action_scale = torch.FloatTensor(
+            (envs.single_action_space.high - envs.single_action_space.low) / 2.0
+        )
+        self.action_bias = torch.FloatTensor(
+            (envs.single_action_space.high + envs.single_action_space.low) / 2.0
+        )
 
     def get_feature(self, obs, detach_encoder=False):
         visual_feature = self.encoder(obs)
         if detach_encoder:
             visual_feature = visual_feature.detach()
-        x = torch.cat([visual_feature, obs['state']], dim=1)
+        x = torch.cat([visual_feature, obs["state"]], dim=1)
         return self.mlp(x), visual_feature
 
     def forward(self, obs, detach_encoder=False):
@@ -434,7 +575,9 @@ class Actor(nn.Module):
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
-        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
+            log_std + 1
+        )  # From SpinUp / Denis Yarats
 
         return mean, log_std, visual_feature
 
@@ -462,16 +605,20 @@ class Actor(nn.Module):
         self.action_bias = self.action_bias.to(device)
         return super().to(device)
 
+
 class Logger:
     def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
         self.writer = tensorboard
         self.log_wandb = log_wandb
+
     def add_scalar(self, tag, scalar_value, step):
         if self.log_wandb:
             wandb.log({tag: scalar_value}, step=step)
         self.writer.add_scalar(tag, scalar_value, step)
+
     def close(self):
         self.writer.close()
+
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -491,8 +638,13 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    ####### Environment setup #######
-    env_kwargs = dict(obs_mode=args.obs_mode, render_mode=args.render_mode, sim_backend="gpu", sensor_configs=dict())
+    # Environment setup #######
+    env_kwargs = dict(
+        obs_mode=args.obs_mode,
+        render_mode=args.render_mode,
+        sim_backend="gpu",
+        sensor_configs=dict(),
+    )
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
     if args.camera_width is not None:
@@ -500,28 +652,121 @@ if __name__ == "__main__":
         env_kwargs["sensor_configs"]["width"] = args.camera_width
     if args.camera_height is not None:
         env_kwargs["sensor_configs"]["height"] = args.camera_height
-    envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
-    eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, human_render_camera_configs=dict(shader_pack="default"), **env_kwargs)
 
-    # rgbd obs mode returns a dict of data, we flatten it so there is just a rgbd key and state key
-    envs = FlattenRGBDObservationWrapper(envs, rgb=True, depth=False, state=args.include_state)
-    eval_envs = FlattenRGBDObservationWrapper(eval_envs, rgb=True, depth=False, state=args.include_state)
+    # Create environments conditionally based on expert mode
+    if args.expert_type != "none":
+        print(
+            f"Creating Expert+Residual environments with expert type: {args.expert_type}"
+        )
 
-    if isinstance(envs.action_space, gym.spaces.Dict):
-        envs = FlattenActionSpaceWrapper(envs)
-        eval_envs = FlattenActionSpaceWrapper(eval_envs)
+        # Handle PPO RGB Fast expert specially
+        if args.expert_type == "ppo_rgb_fast":
+            if args.ppo_rgb_fast_path is None:
+                args.ppo_rgb_fast_path = args.model_path  # Fallback to model_path
+            if args.ppo_rgb_fast_path is None:
+                raise ValueError(
+                    "PPO RGB Fast expert requires --ppo-rgb-fast-path or --model-path"
+                )
+
+            # Create temporary environment to get sample obs and action dims
+            temp_env = gym.make(args.env_id, num_envs=1, **env_kwargs)
+            temp_env = FlattenRGBDObservationWrapper(
+                temp_env, rgb=True, depth=False, state=args.include_state
+            )
+            if isinstance(temp_env.action_space, gym.spaces.Dict):
+                temp_env = FlattenActionSpaceWrapper(temp_env)
+
+            sample_obs = temp_env.reset()[0]
+            action_dim = temp_env.action_space.shape[0]
+            temp_env.close()
+
+            # Create PPO RGB Fast expert
+            from mani_skill.envs.wrappers.experts import register_expert_policy
+
+            expert_policy = create_ppo_rgb_fast_expert(
+                args.ppo_rgb_fast_path, sample_obs, action_dim, str(device)
+            )
+
+            # Register as 'ppo_rgb_fast' expert type
+            register_expert_policy(
+                "ppo_rgb_fast", lambda action_dim, **kwargs: expert_policy
+            )
+
+            # Update args for wrapper creation
+            args.model_path = args.ppo_rgb_fast_path
+
+        if create_expert_residual_envs is None:
+            raise ImportError(
+                "Expert+Residual wrapper not available. Please ensure util.py is importable."
+            )
+        envs, eval_envs = create_expert_residual_envs(args, env_kwargs, device)
+    else:
+        envs = gym.make(
+            args.env_id,
+            num_envs=args.num_envs if not args.evaluate else 1,
+            reconfiguration_freq=args.reconfiguration_freq,
+            **env_kwargs,
+        )
+        eval_envs = gym.make(
+            args.env_id,
+            num_envs=args.num_eval_envs,
+            reconfiguration_freq=args.eval_reconfiguration_freq,
+            human_render_camera_configs=dict(shader_pack="default"),
+            **env_kwargs,
+        )
+
+        # rgbd obs mode returns a dict of data, we flatten it so there is just a rgbd key and state key
+        envs = FlattenRGBDObservationWrapper(
+            envs, rgb=True, depth=False, state=args.include_state
+        )
+        eval_envs = FlattenRGBDObservationWrapper(
+            eval_envs, rgb=True, depth=False, state=args.include_state
+        )
+
+        if isinstance(envs.action_space, gym.spaces.Dict):
+            envs = FlattenActionSpaceWrapper(envs)
+            eval_envs = FlattenActionSpaceWrapper(eval_envs)
     if args.capture_video or args.save_trajectory:
         eval_output_dir = f"runs/{run_name}/videos"
         if args.evaluate:
             eval_output_dir = f"{os.path.dirname(args.checkpoint)}/test_videos"
         print(f"Saving eval trajectories/videos to {eval_output_dir}")
         if args.save_train_video_freq is not None:
-            save_video_trigger = lambda x : (x // args.num_steps) % args.save_train_video_freq == 0
-            envs = RecordEpisode(envs, output_dir=f"runs/{run_name}/train_videos", save_trajectory=False, save_video_trigger=save_video_trigger, max_steps_per_video=args.num_steps, video_fps=30)
-        eval_envs = RecordEpisode(eval_envs, output_dir=eval_output_dir, save_trajectory=args.save_trajectory, save_video=args.capture_video, trajectory_name="trajectory", max_steps_per_video=args.num_eval_steps, video_fps=30)
-    envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=not args.partial_reset, record_metrics=True)
-    eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+            save_video_trigger = (
+                lambda x: (x // args.num_steps) % args.save_train_video_freq == 0
+            )
+            envs = RecordEpisode(
+                envs,
+                output_dir=f"runs/{run_name}/train_videos",
+                save_trajectory=False,
+                save_video_trigger=save_video_trigger,
+                max_steps_per_video=args.num_steps,
+                video_fps=30,
+            )
+        eval_envs = RecordEpisode(
+            eval_envs,
+            output_dir=eval_output_dir,
+            save_trajectory=args.save_trajectory,
+            save_video=args.capture_video,
+            trajectory_name="trajectory",
+            max_steps_per_video=args.num_eval_steps,
+            video_fps=30,
+        )
+    envs = ManiSkillVectorEnv(
+        envs,
+        args.num_envs,
+        ignore_terminations=not args.partial_reset,
+        record_metrics=True,
+    )
+    eval_envs = ManiSkillVectorEnv(
+        eval_envs,
+        args.num_eval_envs,
+        ignore_terminations=not args.eval_partial_reset,
+        record_metrics=True,
+    )
+    assert isinstance(envs.single_action_space, gym.spaces.Box), (
+        "only continuous action space is supported"
+    )
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
     logger = None
@@ -529,9 +774,24 @@ if __name__ == "__main__":
         print("Running training")
         if args.track:
             import wandb
+
             config = vars(args)
-            config["env_cfg"] = dict(**env_kwargs, num_envs=args.num_envs, env_id=args.env_id, reward_mode="normalized_dense", env_horizon=max_episode_steps, partial_reset=args.partial_reset)
-            config["eval_env_cfg"] = dict(**env_kwargs, num_envs=args.num_eval_envs, env_id=args.env_id, reward_mode="normalized_dense", env_horizon=max_episode_steps, partial_reset=False)
+            config["env_cfg"] = dict(
+                **env_kwargs,
+                num_envs=args.num_envs,
+                env_id=args.env_id,
+                reward_mode="normalized_dense",
+                env_horizon=max_episode_steps,
+                partial_reset=args.partial_reset,
+            )
+            config["eval_env_cfg"] = dict(
+                **env_kwargs,
+                num_envs=args.num_eval_envs,
+                env_id=args.env_id,
+                reward_mode="normalized_dense",
+                env_horizon=max_episode_steps,
+                partial_reset=False,
+            )
             wandb.init(
                 project=args.wandb_project_name,
                 entity=args.wandb_entity,
@@ -540,12 +800,13 @@ if __name__ == "__main__":
                 name=run_name,
                 save_code=True,
                 group=args.wandb_group,
-                tags=["sac", "walltime_efficient"]
+                tags=["sac", "walltime_efficient"],
             )
         writer = SummaryWriter(f"runs/{run_name}")
         writer.add_text(
             "hyperparameters",
-            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+            "|param|value|\n|-|-|\n%s"
+            % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
         )
         logger = Logger(log_wandb=args.track, tensorboard=writer)
     else:
@@ -557,12 +818,13 @@ if __name__ == "__main__":
         num_envs=args.num_envs,
         buffer_size=args.buffer_size,
         storage_device=torch.device(args.buffer_device),
-        sample_device=device
+        sample_device=device,
     )
 
-
     # TRY NOT TO MODIFY: start the game
-    obs, info = envs.reset(seed=args.seed) # in Gymnasium, seed is given to reset() instead of seed()
+    obs, info = envs.reset(
+        seed=args.seed
+    )  # in Gymnasium, seed is given to reset() instead of seed()
     eval_obs, _ = eval_envs.reset(seed=args.seed)
 
     # architecture is all actor, q-networks share the same vision encoder. Output of encoder is concatenates with any state data followed by separate MLPs.
@@ -573,21 +835,24 @@ if __name__ == "__main__":
     qf2_target = SoftQNetwork(envs, actor.encoder).to(device)
     if args.checkpoint is not None:
         ckpt = torch.load(args.checkpoint)
-        actor.load_state_dict(ckpt['actor'])
-        qf1.load_state_dict(ckpt['qf1'])
-        qf2.load_state_dict(ckpt['qf2'])
+        actor.load_state_dict(ckpt["actor"])
+        qf1.load_state_dict(ckpt["qf1"])
+        qf2.load_state_dict(ckpt["qf2"])
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.Adam(
-        list(qf1.mlp.parameters()) +
-        list(qf2.mlp.parameters()) +
-        list(qf1.encoder.parameters()),
-        lr=args.q_lr)
+        list(qf1.mlp.parameters())
+        + list(qf2.mlp.parameters())
+        + list(qf1.encoder.parameters()),
+        lr=args.q_lr,
+    )
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
     # Automatic entropy tuning
     if args.autotune:
-        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
+        target_entropy = -torch.prod(
+            torch.Tensor(envs.single_action_space.shape).to(device)
+        ).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
@@ -603,7 +868,11 @@ if __name__ == "__main__":
     cumulative_times = defaultdict(float)
 
     while global_step < args.total_timesteps:
-        if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
+        if (
+            args.eval_freq > 0
+            and (global_step - args.training_freq) // args.eval_freq
+            < global_step // args.eval_freq
+        ):
             # evaluate
             actor.eval()
             stime = time.perf_counter()
@@ -612,7 +881,13 @@ if __name__ == "__main__":
             num_episodes = 0
             for _ in range(args.num_eval_steps):
                 with torch.no_grad():
-                    eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(actor.get_eval_action(eval_obs))
+                    (
+                        eval_obs,
+                        eval_rew,
+                        eval_terminations,
+                        eval_truncations,
+                        eval_infos,
+                    ) = eval_envs.step(actor.get_eval_action(eval_obs))
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
                         num_episodes += mask.sum()
@@ -638,12 +913,15 @@ if __name__ == "__main__":
 
             if args.save_model:
                 model_path = f"runs/{run_name}/ckpt_{global_step}.pt"
-                torch.save({
-                    'actor': actor.state_dict(),
-                    'qf1': qf1_target.state_dict(),
-                    'qf2': qf2_target.state_dict(),
-                    'log_alpha': log_alpha,
-                }, model_path)
+                torch.save(
+                    {
+                        "actor": actor.state_dict(),
+                        "qf1": qf1_target.state_dict(),
+                        "qf2": qf2_target.state_dict(),
+                        "log_alpha": log_alpha,
+                    },
+                    model_path,
+                )
                 print(f"model saved to {model_path}")
 
         # Collect samples from environemnts
@@ -653,31 +931,44 @@ if __name__ == "__main__":
 
             # ALGO LOGIC: put action logic here
             if not learning_has_started:
-                actions = torch.tensor(envs.action_space.sample(), dtype=torch.float32, device=device)
+                actions = torch.tensor(
+                    envs.action_space.sample(), dtype=torch.float32, device=device
+                )
             else:
                 actions, _, _, _ = actor.get_action(obs)
                 actions = actions.detach()
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-            real_next_obs = {k:v.clone() for k, v in next_obs.items()}
-            if args.bootstrap_at_done == 'never':
+            real_next_obs = {k: v.clone() for k, v in next_obs.items()}
+            if args.bootstrap_at_done == "never":
                 need_final_obs = torch.ones_like(terminations, dtype=torch.bool)
-                stop_bootstrap = truncations | terminations # always stop bootstrap when episode ends
-            else:
-                if args.bootstrap_at_done == 'always':
-                    need_final_obs = truncations | terminations # always need final obs when episode ends
-                    stop_bootstrap = torch.zeros_like(terminations, dtype=torch.bool) # never stop bootstrap
-                else: # bootstrap at truncated
-                    need_final_obs = truncations & (~terminations) # only need final obs when truncated and not terminated
-                    stop_bootstrap = terminations # only stop bootstrap when terminated, don't stop when truncated
+                stop_bootstrap = (
+                    truncations | terminations
+                )  # always stop bootstrap when episode ends
+            elif args.bootstrap_at_done == "always":
+                need_final_obs = (
+                    truncations | terminations
+                )  # always need final obs when episode ends
+                stop_bootstrap = torch.zeros_like(
+                    terminations, dtype=torch.bool
+                )  # never stop bootstrap
+            else:  # bootstrap at truncated
+                need_final_obs = truncations & (
+                    ~terminations
+                )  # only need final obs when truncated and not terminated
+                stop_bootstrap = terminations  # only stop bootstrap when terminated, don't stop when truncated
             if "final_info" in infos:
                 final_info = infos["final_info"]
                 done_mask = infos["_final_info"]
                 for k in real_next_obs.keys():
-                    real_next_obs[k][need_final_obs] = infos["final_observation"][k][need_final_obs].clone()
+                    real_next_obs[k][need_final_obs] = infos["final_observation"][k][
+                        need_final_obs
+                    ].clone()
                 for k, v in final_info["episode"].items():
-                    logger.add_scalar(f"train/{k}", v[done_mask].float().mean(), global_step)
+                    logger.add_scalar(
+                        f"train/{k}", v[done_mask].float().mean(), global_step
+                    )
 
             rb.add(obs, real_next_obs, actions, rewards, stop_bootstrap)
 
@@ -699,11 +990,22 @@ if __name__ == "__main__":
 
             # update the value networks
             with torch.no_grad():
-                next_state_actions, next_state_log_pi, _, visual_feature = actor.get_action(data.next_obs)
-                qf1_next_target = qf1_target(data.next_obs, next_state_actions, visual_feature)
-                qf2_next_target = qf2_target(data.next_obs, next_state_actions, visual_feature)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
+                next_state_actions, next_state_log_pi, _, visual_feature = (
+                    actor.get_action(data.next_obs)
+                )
+                qf1_next_target = qf1_target(
+                    data.next_obs, next_state_actions, visual_feature
+                )
+                qf2_next_target = qf2_target(
+                    data.next_obs, next_state_actions, visual_feature
+                )
+                min_qf_next_target = (
+                    torch.min(qf1_next_target, qf2_next_target)
+                    - alpha * next_state_log_pi
+                )
+                next_q_value = data.rewards.flatten() + (
+                    1 - data.dones.flatten()
+                ) * args.gamma * (min_qf_next_target).view(-1)
                 # data.dones is "stop_bootstrap", which is computed earlier according to args.bootstrap_at_done
             visual_feature = actor.encoder(data.obs)
             qf1_a_values = qf1(data.obs, data.actions, visual_feature).view(-1)
@@ -717,7 +1019,9 @@ if __name__ == "__main__":
             q_optimizer.step()
 
             # update the policy network
-            if global_update % args.policy_frequency == 0:  # TD 3 Delayed update support
+            if (
+                global_update % args.policy_frequency == 0
+            ):  # TD 3 Delayed update support
                 pi, log_pi, _, visual_feature = actor.get_action(data.obs)
                 qf1_pi = qf1(data.obs, pi, visual_feature, detach_encoder=True)
                 qf2_pi = qf2(data.obs, pi, visual_feature, detach_encoder=True)
@@ -744,17 +1048,31 @@ if __name__ == "__main__":
 
             # update the target networks
             if global_update % args.target_network_frequency == 0:
-                for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-                for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                for param, target_param in zip(
+                    qf1.parameters(), qf1_target.parameters()
+                ):
+                    target_param.data.copy_(
+                        args.tau * param.data + (1 - args.tau) * target_param.data
+                    )
+                for param, target_param in zip(
+                    qf2.parameters(), qf2_target.parameters()
+                ):
+                    target_param.data.copy_(
+                        args.tau * param.data + (1 - args.tau) * target_param.data
+                    )
         update_time = time.perf_counter() - update_time
         cumulative_times["update_time"] += update_time
 
         # Log training-related data
-        if (global_step - args.training_freq) // args.log_freq < global_step // args.log_freq:
-            logger.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-            logger.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
+        if (
+            global_step - args.training_freq
+        ) // args.log_freq < global_step // args.log_freq:
+            logger.add_scalar(
+                "losses/qf1_values", qf1_a_values.mean().item(), global_step
+            )
+            logger.add_scalar(
+                "losses/qf2_values", qf2_a_values.mean().item(), global_step
+            )
             logger.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
             logger.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
             logger.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
@@ -762,21 +1080,32 @@ if __name__ == "__main__":
             logger.add_scalar("losses/alpha", alpha, global_step)
             logger.add_scalar("time/update_time", update_time, global_step)
             logger.add_scalar("time/rollout_time", rollout_time, global_step)
-            logger.add_scalar("time/rollout_fps", global_steps_per_iteration / rollout_time, global_step)
+            logger.add_scalar(
+                "time/rollout_fps",
+                global_steps_per_iteration / rollout_time,
+                global_step,
+            )
             for k, v in cumulative_times.items():
                 logger.add_scalar(f"time/total_{k}", v, global_step)
-            logger.add_scalar("time/total_rollout+update_time", cumulative_times["rollout_time"] + cumulative_times["update_time"], global_step)
+            logger.add_scalar(
+                "time/total_rollout+update_time",
+                cumulative_times["rollout_time"] + cumulative_times["update_time"],
+                global_step,
+            )
             if args.autotune:
                 logger.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
 
     if not args.evaluate and args.save_model:
         model_path = f"runs/{run_name}/final_ckpt.pt"
-        torch.save({
-            'actor': actor.state_dict(),
-            'qf1': qf1_target.state_dict(),
-            'qf2': qf2_target.state_dict(),
-            'log_alpha': log_alpha,
-        }, model_path)
+        torch.save(
+            {
+                "actor": actor.state_dict(),
+                "qf1": qf1_target.state_dict(),
+                "qf2": qf2_target.state_dict(),
+                "log_alpha": log_alpha,
+            },
+            model_path,
+        )
         print(f"model saved to {model_path}")
         writer.close()
     envs.close()

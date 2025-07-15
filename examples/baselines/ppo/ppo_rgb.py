@@ -79,9 +79,9 @@ class Args:
     """whether to let parallel environments reset upon termination instead of truncation"""
     eval_partial_reset: bool = False
     """whether to let parallel evaluation environments reset upon termination instead of truncation"""
-    num_steps: int = 50
+    num_steps: int = 100
     """the number of steps to run in each environment per policy rollout"""
-    num_eval_steps: int = 50
+    num_eval_steps: int = 100
     """the number of steps to run in each evaluation environment during evaluation"""
     reconfiguration_freq: Optional[int] = None
     """how often to reconfigure the environment during training"""
@@ -128,7 +128,7 @@ class Args:
     """scale factor for residual actions"""
     expert_action_noise: float = 0.0
     """Gaussian noise std to add to expert actions"""
-    track_action_stats: bool = False
+    track_action_stats: bool = True
     """whether to track expert/residual action statistics"""
     ik_gain: float = 2.0
     """proportional gain for IK expert policy"""
@@ -392,7 +392,7 @@ if __name__ == "__main__":
         )
 
     # Apply observation and action wrappers only for regular environments
-    # Expert environments handle their own observation formatting
+    # Expert environments handle their own observation formatting internally
     if args.expert_type == "none":
         # rgbd obs mode returns a dict of data, we flatten it so there is just a rgbd key and state key
         envs = FlattenRGBDObservationWrapper(
@@ -402,9 +402,9 @@ if __name__ == "__main__":
             eval_envs, rgb=True, depth=False, state=args.include_state
         )
 
-        if isinstance(envs.action_space, gym.spaces.Dict):
-            envs = FlattenActionSpaceWrapper(envs)
-            eval_envs = FlattenActionSpaceWrapper(eval_envs)
+    if isinstance(envs.action_space, gym.spaces.Dict):
+        envs = FlattenActionSpaceWrapper(envs)
+        eval_envs = FlattenActionSpaceWrapper(eval_envs)
     if args.capture_video:
         eval_output_dir = f"runs/{run_name}/videos"
         if args.evaluate:
@@ -772,6 +772,75 @@ if __name__ == "__main__":
             cumulative_times["rollout_time"] + cumulative_times["update_time"],
             global_step,
         )
+
+        # Log action statistics for Expert+Residual mode
+        if args.expert_type != "none" and hasattr(envs._env, "get_action_stats"):
+            try:
+                action_stats = envs._env.get_action_stats()
+                if action_stats.get("track_action_stats", False):
+                    if iteration % 10 == 1:  # Print every 10 iterations to avoid spam
+                        print(f"Logging action statistics at iteration {iteration}")
+                    # Log expert action statistics
+                    if "expert_action" in action_stats and isinstance(
+                        action_stats["expert_action"], dict
+                    ):
+                        expert_stats = action_stats["expert_action"]
+                        for stat_name, stat_value in expert_stats.items():
+                            if isinstance(stat_value, torch.Tensor):
+                                # Log per-dimension statistics
+                                for dim_idx in range(stat_value.shape[0]):
+                                    logger.add_scalar(
+                                        f"expert_actions/{stat_name}_dim_{dim_idx}",
+                                        stat_value[dim_idx].item(),
+                                        global_step,
+                                    )
+                                # Log mean across dimensions
+                                logger.add_scalar(
+                                    f"expert_actions/{stat_name}_mean",
+                                    stat_value.mean().item(),
+                                    global_step,
+                                )
+
+                    # Log residual action statistics
+                    if "residual_action" in action_stats and isinstance(
+                        action_stats["residual_action"], dict
+                    ):
+                        residual_stats = action_stats["residual_action"]
+                        for stat_name, stat_value in residual_stats.items():
+                            if isinstance(stat_value, torch.Tensor):
+                                # Log per-dimension statistics
+                                for dim_idx in range(stat_value.shape[0]):
+                                    logger.add_scalar(
+                                        f"residual_actions/{stat_name}_dim_{dim_idx}",
+                                        stat_value[dim_idx].item(),
+                                        global_step,
+                                    )
+                                # Log mean across dimensions
+                                logger.add_scalar(
+                                    f"residual_actions/{stat_name}_mean",
+                                    stat_value.mean().item(),
+                                    global_step,
+                                )
+
+                    # Log general action statistics
+                    for key in ["episode_count", "step_count", "num_envs"]:
+                        if key in action_stats:
+                            logger.add_scalar(
+                                f"action_stats/{key}", action_stats[key], global_step
+                            )
+            except Exception as e:
+                print(f"Warning: Could not log action statistics: {e}")
+
+        # Log residual scale parameter
+        if args.expert_type != "none":
+            logger.add_scalar(
+                "expert_residual/residual_scale", args.residual_scale, global_step
+            )
+            logger.add_scalar(
+                "expert_residual/expert_action_noise",
+                args.expert_action_noise,
+                global_step,
+            )
     if args.save_model and not args.evaluate:
         model_path = f"runs/{run_name}/final_ckpt.pt"
         torch.save(agent.state_dict(), model_path)

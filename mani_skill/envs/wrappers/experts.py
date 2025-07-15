@@ -127,6 +127,9 @@ def create_model_expert_policy(
     """
     Create expert policy from pre-trained model.
 
+    Supports both PPO state models and PPO RGB models.
+    Automatically detects model type from checkpoint structure.
+
     Args:
         model_path: Path to pre-trained model
         action_dim: Action space dimension
@@ -135,23 +138,227 @@ def create_model_expert_policy(
     Returns:
         Expert policy function that returns torch.Tensor
     """
-    # This would load a pre-trained model
-    # Implementation depends on your model format
+    import os
+    import sys
+    from pathlib import Path
 
-    def model_expert_policy(obs: torch.Tensor) -> torch.Tensor:
-        """Expert policy from pre-trained model."""
-        # Ensure we return tensor on same device as input
-        device = obs.device
+    import torch
+    from torch import nn
+    from torch.distributions.normal import Normal
 
-        # Load model and get action
-        # This is a placeholder implementation
-        if obs.dim() == 1:
-            return torch.zeros(action_dim, device=device, dtype=torch.float32)
+    # Check if model file exists
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+
+    # Load checkpoint to inspect its structure
+    checkpoint = torch.load(model_path, map_location=device)
+
+    # Detect model type based on checkpoint keys
+    checkpoint_keys = list(checkpoint.keys())
+    is_rgb_model = any("cnn" in key for key in checkpoint_keys)
+
+    # Detect action dimension from checkpoint for RGB models
+    if is_rgb_model:
+        # Get action dimension from the actor_mean output layer
+        if "actor_mean.4.weight" in checkpoint:
+            actual_action_dim = checkpoint["actor_mean.4.weight"].shape[0]
+        elif "actor_mean.6.weight" in checkpoint:
+            actual_action_dim = checkpoint["actor_mean.6.weight"].shape[0]
         else:
-            batch_size = obs.shape[0]
-            return torch.zeros(
-                batch_size, action_dim, device=device, dtype=torch.float32
+            # Fallback to provided action_dim
+            actual_action_dim = action_dim
+
+        if actual_action_dim != action_dim:
+            print(
+                f"🔧 Detected action dimension mismatch: checkpoint has {actual_action_dim}, environment expects {action_dim}"
             )
+            print(f"   Using checkpoint action dimension: {actual_action_dim}")
+            action_dim = actual_action_dim
+
+    print(f"🔍 Detected model type: {'RGB' if is_rgb_model else 'State'}")
+    print(f"📊 Action dimension: {action_dim}")
+
+    if is_rgb_model:
+        # Load PPO RGB model using the actual RGBFastAgent like in dataset generator
+        # Add path to import from ppo_rgb_fast
+        ppo_path = (
+            Path(__file__).parent.parent.parent.parent
+            / "examples"
+            / "baselines"
+            / "ppo"
+        )
+        sys.path.append(str(ppo_path))
+
+        try:
+            from ppo_rgb_fast import Agent as RGBFastAgent
+        except ImportError as e:
+            raise ImportError(
+                f"Could not import RGBFastAgent from ppo_rgb_fast. "
+                f"Make sure the path is correct: {ppo_path}. Error: {e}"
+            )
+
+        # Create environment to get sample observation - match dataset generator approach
+        from mani_skill.utils.wrappers.flatten import (
+            FlattenActionSpaceWrapper,
+            FlattenRGBDObservationWrapper,
+        )
+
+        try:
+            # Create environment exactly like the dataset generator
+            env_config = {
+                "id": "PickCube-v1",
+                "robot_uids": "panda_wristcam",
+                "control_mode": "pd_ee_delta_pos",
+                "obs_mode": "rgb",
+                "render_mode": "all",
+                "sim_backend": "physx_cuda",
+            }
+            temp_env = gym.make(**env_config)
+
+            # Apply wrappers exactly like dataset generator
+            temp_env = FlattenRGBDObservationWrapper(temp_env, rgb=True, state=True)
+            if isinstance(temp_env.action_space, gym.spaces.Dict):
+                temp_env = FlattenActionSpaceWrapper(temp_env)
+
+            sample_obs = temp_env.reset()[0]
+            temp_env.close()
+        except Exception as e:
+            print(f"Warning: Could not create sample observation from environment: {e}")
+            # Fallback to hardcoded observation structure
+            sample_obs = {
+                "rgb": torch.zeros(128, 128, 6, dtype=torch.uint8),  # Common RGB shape
+                "state": torch.zeros(29, dtype=torch.float32),  # Common state shape
+            }
+
+        # Create agent exactly like the dataset generator
+        import math
+
+        n_act = math.prod((action_dim,))  # Handle single dimension case
+        agent = RGBFastAgent(n_act, sample_obs, device=device)
+
+        def model_expert_policy(obs: torch.Tensor) -> torch.Tensor:
+            """Expert policy from pre-trained RGB model."""
+            with torch.no_grad():
+                # RGB model expects dictionary observations
+                if not isinstance(obs, dict):
+                    raise ValueError(
+                        f"RGB model expects dictionary observation, got {type(obs)}"
+                    )
+
+                # Prepare observation for agent - match dataset generator exactly
+                obs_device = {}
+                single_env = False
+
+                for key, value in obs.items():
+                    if isinstance(value, torch.Tensor):
+                        obs_device[key] = value.to(device)
+                    else:
+                        obs_device[key] = torch.from_numpy(value).to(device)
+
+                    # Convert RGB to float - match dataset generator exactly
+                    if "rgb" in key:
+                        obs_device[key] = obs_device[key].float()
+
+                    # Handle single environment case
+                    if obs_device[key].dim() == 1 and key == "state":
+                        obs_device[key] = obs_device[key].unsqueeze(0)
+                        single_env = True
+                    elif obs_device[key].dim() == 3 and key == "rgb":
+                        obs_device[key] = obs_device[key].unsqueeze(0)
+                        single_env = True
+
+                # Get action from agent - match dataset generator exactly
+                features = agent.get_features(obs_device)
+                action = agent.actor_mean(features)  # Deterministic action
+
+                # Remove batch dimension if we added it
+                if single_env:
+                    action = action.squeeze(0)
+
+                return action.float()
+
+    else:
+        # Load regular PPO state model
+        # Create a dummy environment to get observation space info
+        class DummyEnv:
+            def __init__(self):
+                self.single_observation_space = gym.spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(42,),
+                    dtype=np.float32,  # Common state dim
+                )
+                self.single_action_space = gym.spaces.Box(
+                    low=-1, high=1, shape=(action_dim,), dtype=np.float32
+                )
+
+        # Import the regular PPO Agent
+        ppo_path = (
+            Path(__file__).parent.parent.parent.parent
+            / "examples"
+            / "baselines"
+            / "ppo"
+        )
+        sys.path.append(str(ppo_path))
+
+        try:
+            from ppo import Agent as PPOAgent
+        except ImportError as e:
+            raise ImportError(
+                f"Could not import PPOAgent from ppo. "
+                f"Make sure the path is correct: {ppo_path}. Error: {e}"
+            )
+
+        dummy_env = DummyEnv()
+        agent = PPOAgent(dummy_env).to(device)
+
+        def model_expert_policy(obs: torch.Tensor) -> torch.Tensor:
+            """Expert policy from pre-trained state model."""
+            with torch.no_grad():
+                # Ensure obs is on the correct device
+                obs = obs.to(device).float()
+
+                # Handle both single and batched observations
+                if obs.dim() == 1:
+                    obs = obs.unsqueeze(0)
+                    single_env = True
+                else:
+                    single_env = False
+
+                # For state observations, flatten if needed
+                if isinstance(obs, dict):
+                    # Flatten dictionary observations
+                    obs_parts = []
+                    for k in sorted(obs.keys()):
+                        v = obs[k]
+                        if isinstance(v, torch.Tensor):
+                            v = v.to(device).float()
+                        else:
+                            v = torch.tensor(v, device=device).float()
+                        obs_parts.append(v.flatten(start_dim=1))
+                    obs = torch.cat(obs_parts, dim=-1)
+                else:
+                    obs = obs.flatten(start_dim=1) if obs.dim() > 1 else obs
+
+                # Get deterministic action from trained agent
+                action = agent.get_action(obs, deterministic=True)
+
+                # Return to original shape if needed
+                if single_env:
+                    action = action.squeeze(0)
+
+                return action.float()
+
+    # Load the trained weights
+    try:
+        agent.load_state_dict(checkpoint, strict=True)
+        agent.eval()
+        print(
+            f"✅ Successfully loaded {'RGB' if is_rgb_model else 'State'} PPO model from {model_path}"
+        )
+    except Exception as e:
+        print(f"❌ Error loading PPO model: {e}")
+        raise
 
     return model_expert_policy
 

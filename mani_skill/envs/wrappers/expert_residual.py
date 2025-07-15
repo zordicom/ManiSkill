@@ -6,6 +6,8 @@ Enables hybrid control where expert policy provides base actions and learned pol
 """
 
 import logging
+import math
+import os
 from collections.abc import Callable
 from typing import Any, Dict, Union
 
@@ -13,8 +15,396 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium import spaces
+from torch import nn
+from torch.distributions.normal import Normal
 
 from mani_skill.utils import common
+
+
+# PPO Model loading support
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    """Initialize layer weights for PPO models."""
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
+class PPOAgent(nn.Module):
+    """PPO Agent for state-based observations (from ppo.py)."""
+
+    def __init__(self, envs):
+        super().__init__()
+        self.critic = nn.Sequential(
+            layer_init(
+                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 256)
+            ),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 1)),
+        )
+        self.actor_mean = nn.Sequential(
+            layer_init(
+                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 256)
+            ),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(
+                nn.Linear(256, np.prod(envs.single_action_space.shape)),
+                std=0.01 * np.sqrt(2),
+            ),
+        )
+        self.actor_logstd = nn.Parameter(
+            torch.ones(1, np.prod(envs.single_action_space.shape)) * -0.5
+        )
+
+    def get_value(self, x):
+        return self.critic(x)
+
+    def get_action(self, x, deterministic=False):
+        action_mean = self.actor_mean(x)
+        if deterministic:
+            return action_mean
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
+        return probs.sample()
+
+    def get_action_and_value(self, x, action=None):
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
+        if action is None:
+            action = probs.sample()
+        return (
+            action,
+            probs.log_prob(action).sum(1),
+            probs.entropy().sum(1),
+            self.critic(x),
+        )
+
+
+class NatureCNN(nn.Module):
+    """Optimized CNN for processing RGB observations (from ppo_rgb_fast.py)."""
+
+    def __init__(self, sample_obs, device=None):
+        super().__init__()
+
+        extractors = {}
+        self.out_features = 0
+        feature_size = 256
+
+        # Handle RGB observations
+        if "rgb" in sample_obs:
+            in_channels = sample_obs["rgb"].shape[-1]
+            image_size = (sample_obs["rgb"].shape[1], sample_obs["rgb"].shape[2])
+
+            extractors["rgb"] = nn.Sequential(
+                layer_init(
+                    nn.Conv2d(in_channels, 32, kernel_size=8, stride=4, device=device)
+                ),
+                nn.ReLU(),
+                layer_init(nn.Conv2d(32, 64, kernel_size=4, stride=2, device=device)),
+                nn.ReLU(),
+                layer_init(nn.Conv2d(64, 64, kernel_size=3, stride=1, device=device)),
+                nn.ReLU(),
+                nn.Flatten(),
+                layer_init(
+                    nn.Linear(
+                        self._get_conv_output_size(image_size, in_channels),
+                        feature_size,
+                        device=device,
+                    )
+                ),
+                nn.ReLU(),
+            )
+            self.out_features += feature_size
+
+        # Handle additional RGB cameras (e.g., wrist camera)
+        for key in sample_obs.keys():
+            if key.endswith("_rgb") or (key.startswith("rgb") and key != "rgb"):
+                in_channels = sample_obs[key].shape[-1]
+                image_size = (sample_obs[key].shape[1], sample_obs[key].shape[2])
+
+                extractors[key] = nn.Sequential(
+                    layer_init(
+                        nn.Conv2d(
+                            in_channels, 32, kernel_size=8, stride=4, device=device
+                        )
+                    ),
+                    nn.ReLU(),
+                    layer_init(
+                        nn.Conv2d(32, 64, kernel_size=4, stride=2, device=device)
+                    ),
+                    nn.ReLU(),
+                    layer_init(
+                        nn.Conv2d(64, 64, kernel_size=3, stride=1, device=device)
+                    ),
+                    nn.ReLU(),
+                    nn.Flatten(),
+                    layer_init(
+                        nn.Linear(
+                            self._get_conv_output_size(image_size, in_channels),
+                            feature_size,
+                            device=device,
+                        )
+                    ),
+                    nn.ReLU(),
+                )
+                self.out_features += feature_size
+
+        # Handle state observations
+        if "state" in sample_obs:
+            state_size = sample_obs["state"].shape[-1]
+            extractors["state"] = nn.Sequential(
+                layer_init(nn.Linear(state_size, 256, device=device)),
+                nn.ReLU(),
+                layer_init(nn.Linear(256, 256, device=device)),
+                nn.ReLU(),
+            )
+            self.out_features += 256
+
+        self.extractors = nn.ModuleDict(extractors)
+
+    def _get_conv_output_size(self, image_size, in_channels):
+        """Calculate the output size of convolutional layers."""
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, in_channels, *image_size)
+            dummy_output = nn.Sequential(
+                nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1),
+                nn.Flatten(),
+            )(dummy_input)
+            return dummy_output.shape[1]
+
+    def forward(self, observations) -> torch.Tensor:
+        encoded_tensor_list = []
+
+        for key, extractor in self.extractors.items():
+            if key in observations:
+                # Handle RGB observations (need channel permutation)
+                if "rgb" in key:
+                    # Convert from (B, H, W, C) to (B, C, H, W)
+                    obs = observations[key].permute(0, 3, 1, 2) / 255.0
+                else:
+                    obs = observations[key]
+
+                encoded_tensor_list.append(extractor(obs))
+
+        return torch.cat(encoded_tensor_list, dim=1)
+
+
+class PPORGBAgent(nn.Module):
+    """PPO Agent with RGB observations (from ppo_rgb_fast.py)."""
+
+    def __init__(self, n_act, sample_obs, device=None):
+        super().__init__()
+
+        # CNN feature extractor
+        self.cnn = NatureCNN(sample_obs, device=device)
+
+        # Policy and value networks
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(self.cnn.out_features, 256, device=device)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256, device=device)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 1, device=device)),
+        )
+
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(self.cnn.out_features, 256, device=device)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256, device=device)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, n_act, device=device), std=0.01 * np.sqrt(2)),
+        )
+
+        self.actor_logstd = nn.Parameter(torch.zeros(1, n_act, device=device))
+
+    def get_features(self, x):
+        return self.cnn(x)
+
+    def get_value(self, x):
+        features = self.get_features(x)
+        return self.critic(features)
+
+    def get_action(self, x, deterministic=False):
+        features = self.get_features(x)
+        action_mean = self.actor_mean(features)
+        if deterministic:
+            return action_mean
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
+        return probs.sample()
+
+    def get_action_and_value(self, obs, action=None):
+        features = self.get_features(obs)
+        action_mean = self.actor_mean(features)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
+
+        if action is None:
+            action = action_mean + action_std * torch.randn_like(action_mean)
+
+        return (
+            action,
+            probs.log_prob(action).sum(1),
+            probs.entropy().sum(1),
+            self.critic(features),
+        )
+
+
+def load_ppo_expert(
+    model_path: str,
+    env_id: str,
+    obs_mode: str = "state",
+    deterministic: bool = True,
+    device: str = "cuda",
+    **env_kwargs,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """
+    Load a trained PPO model as an expert policy.
+
+    Args:
+        model_path: Path to the saved model checkpoint
+        env_id: Environment ID used for training
+        obs_mode: Observation mode ("state" or "rgb")
+        deterministic: Whether to use deterministic actions
+        device: Device to load the model on
+        **env_kwargs: Additional environment arguments
+
+    Returns:
+        Expert policy function that takes observations and returns actions
+    """
+    # Create a dummy environment to get observation/action space info
+    dummy_env = gym.make(env_id, num_envs=1, obs_mode=obs_mode, **env_kwargs)
+
+    # Apply the same wrappers that would be used during training
+    if obs_mode == "rgb":
+        from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
+
+        dummy_env = FlattenRGBDObservationWrapper(dummy_env, rgb=True, state=True)
+
+    if isinstance(dummy_env.action_space, gym.spaces.Dict):
+        from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
+
+        dummy_env = FlattenActionSpaceWrapper(dummy_env)
+
+    # Create the appropriate agent
+    if obs_mode == "state":
+        agent = PPOAgent(dummy_env)
+    else:  # RGB mode
+        n_act = math.prod(dummy_env.single_action_space.shape)
+        sample_obs = dummy_env.reset()[0]
+        agent = PPORGBAgent(n_act, sample_obs, device=device)
+
+    # Load the trained weights
+    agent.load_state_dict(torch.load(model_path, map_location=device))
+    agent.to(device)
+    agent.eval()
+
+    dummy_env.close()
+
+    def expert_policy(obs: torch.Tensor) -> torch.Tensor:
+        """Expert policy function that takes observations and returns actions."""
+        with torch.no_grad():
+            # Ensure obs is a tensor and on the correct device
+            if isinstance(obs, dict):
+                # Convert numpy arrays to tensors if needed
+                obs_processed = {}
+                for k, v in obs.items():
+                    if isinstance(v, np.ndarray):
+                        obs_processed[k] = torch.from_numpy(v).to(device).float()
+                    else:
+                        obs_processed[k] = v.to(device).float()
+                obs = obs_processed
+            elif isinstance(obs, np.ndarray):
+                obs = torch.from_numpy(obs).to(device).float()
+            else:
+                obs = obs.to(device).float()
+
+            # Handle batch dimension
+            if obs_mode == "state":
+                # For state observations, flatten if needed
+                if isinstance(obs, dict):
+                    # Flatten dictionary observations
+                    obs_parts = []
+                    for k in sorted(obs.keys()):  # Sort for consistent ordering
+                        if k == "rgb":
+                            # Flatten RGB: (B, H, W, C) -> (B, H*W*C)
+                            obs_parts.append(obs[k].flatten(start_dim=1))
+                        else:
+                            # Flatten other observations
+                            obs_parts.append(obs[k].flatten(start_dim=1))
+                    obs_flat = torch.cat(obs_parts, dim=-1)
+                else:
+                    obs_flat = obs.flatten(start_dim=1) if obs.dim() > 1 else obs
+                action = agent.get_action(obs_flat, deterministic=deterministic)
+            else:
+                # For RGB observations, pass dict directly
+                if not isinstance(obs, dict):
+                    raise ValueError(
+                        f"RGB mode expects dict observations, got {type(obs)}"
+                    )
+                action = agent.get_action(obs, deterministic=deterministic)
+
+            return action.float()
+
+    return expert_policy
+
+
+def create_ppo_expert_policy(
+    expert_type: str,
+    model_path: str,
+    env_id: str,
+    device: str = "cuda",
+    deterministic: bool = True,
+    **kwargs,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """
+    Create a PPO expert policy based on the expert type.
+
+    Args:
+        expert_type: Type of expert ("ppo" or "ppo_rgb")
+        model_path: Path to the saved model checkpoint
+        env_id: Environment ID
+        device: Device to load the model on
+        deterministic: Whether to use deterministic actions
+        **kwargs: Additional arguments
+
+    Returns:
+        Expert policy function
+    """
+    if expert_type == "ppo":
+        return load_ppo_expert(
+            model_path=model_path,
+            env_id=env_id,
+            obs_mode="state",
+            device=device,
+            deterministic=deterministic,
+            **kwargs,
+        )
+    elif expert_type == "ppo_rgb":
+        return load_ppo_expert(
+            model_path=model_path,
+            env_id=env_id,
+            obs_mode="rgb",
+            device=device,
+            deterministic=deterministic,
+            **kwargs,
+        )
+    else:
+        raise ValueError(f"Unsupported expert type: {expert_type}")
 
 
 class ExpertResidualWrapper(gym.Wrapper):
@@ -33,11 +423,13 @@ class ExpertResidualWrapper(gym.Wrapper):
     - Receives residual actions from the agent
     - Combines expert + residual actions before sending to environment
     - Uses torch tensors throughout for ManiSkill3 compatibility
+    - Supports loading trained PPO models as expert policies
 
     Args:
         env_id: ManiSkill environment ID (e.g., "PickBox-v1")
         expert_policy_fn: Callable that takes observation tensor and returns expert action tensor.
             The expert policy MUST return torch.Tensor on the same device as the input observation.
+            If None and expert_type is "ppo" or "ppo_rgb", will load from model_path.
         num_envs: Number of parallel environments (default: 1)
         residual_scale: Scale factor for residual actions (default: 1.0)
         clip_final_action: Whether to clip final action to action space bounds (default: True)
@@ -45,11 +437,32 @@ class ExpertResidualWrapper(gym.Wrapper):
         log_actions: Whether to log action decomposition for debugging (default: False)
         track_action_stats: Whether to track expert/residual action statistics (default: False)
         device: Device to place environments on (default: "cuda")
+        expert_type: Type of expert policy ("none", "ppo", "ppo_rgb") (default: "none")
+        model_path: Path to saved PPO model checkpoint (required for "ppo" and "ppo_rgb" types)
+        deterministic_expert: Whether to use deterministic actions from expert policy (default: True)
         **env_kwargs: Additional arguments for environment creation
 
     Usage Examples:
-        # Single environment
-        >>> wrapper = ExpertResidualWrapper("PickBox-v1", expert_policy)
+        # Single environment with custom expert policy
+        >>> wrapper = ExpertResidualWrapper(
+        ...     "PickBox-v1", expert_policy_fn=custom_expert
+        ... )
+
+        # Load PPO state expert from checkpoint
+        >>> wrapper = ExpertResidualWrapper(
+        ...     "PickCube-v1",
+        ...     expert_type="ppo",
+        ...     model_path="runs/model/final_ckpt.pt",
+        ...     num_envs=100,
+        ... )
+
+        # Load PPO RGB expert from checkpoint
+        >>> wrapper = ExpertResidualWrapper(
+        ...     "PickCube-v1",
+        ...     expert_type="ppo_rgb",
+        ...     model_path="runs/rgb_model/final_ckpt.pt",
+        ...     num_envs=100,
+        ... )
 
         # 100 parallel environments - ManiSkill handles vectorization
         >>> wrapper = ExpertResidualWrapper("PickBox-v1", expert_policy, num_envs=100)
@@ -70,15 +483,19 @@ class ExpertResidualWrapper(gym.Wrapper):
     def __init__(
         self,
         env_id: str,
-        expert_policy_fn: Callable[[torch.Tensor], torch.Tensor],
+        expert_policy_fn: Callable[[torch.Tensor], torch.Tensor] = None,
         num_envs: int = 1,
-        residual_scale: float = 0.05,
+        residual_scale: float = 1.0,
         clip_final_action: bool = True,
         expert_action_noise: float = 0.0,
         log_actions: bool = False,
         track_action_stats: bool = False,
         device: str = "cuda",
         control_mode: str = "pd_joint_delta_pos",
+        # PPO expert parameters
+        expert_type: str = "none",
+        model_path: str = None,
+        deterministic_expert: bool = True,
         **env_kwargs,
     ):
         """
@@ -88,6 +505,7 @@ class ExpertResidualWrapper(gym.Wrapper):
             env_id: ManiSkill environment ID (e.g., "PickBox-v1")
             expert_policy_fn: Function that takes observation tensor and returns expert action tensor.
                 MUST return torch.Tensor. Input and output should be on the same device.
+                If None and expert_type is "ppo" or "ppo_rgb", will load from model_path.
             num_envs: Number of parallel environments
             residual_scale: Scale factor for residual actions
             clip_final_action: Whether to clip final action to action space bounds
@@ -97,6 +515,9 @@ class ExpertResidualWrapper(gym.Wrapper):
             device: Device to place environments on
             control_mode: Control mode for the environment.
                 IMPORTANT: Use "pd_ee_delta_pos" for IK expert policies.
+            expert_type: Type of expert policy ("none", "ppo", "ppo_rgb")
+            model_path: Path to saved PPO model checkpoint (required for "ppo" and "ppo_rgb" types)
+            deterministic_expert: Whether to use deterministic actions from expert policy
             **env_kwargs: Additional environment creation arguments
         """
         # Initialize logger first
@@ -104,6 +525,31 @@ class ExpertResidualWrapper(gym.Wrapper):
 
         # Set control mode in env_kwargs
         env_kwargs["control_mode"] = control_mode
+
+        # Handle expert policy creation
+        if expert_policy_fn is None:
+            if expert_type in ["ppo", "ppo_rgb"]:
+                if model_path is None:
+                    raise ValueError(
+                        f"model_path is required for expert_type='{expert_type}'"
+                    )
+
+                # Create expert policy from trained PPO model
+                expert_policy_fn = create_ppo_expert_policy(
+                    expert_type=expert_type,
+                    model_path=model_path,
+                    env_id=env_id,
+                    device=device,
+                    deterministic=deterministic_expert,
+                    **env_kwargs,
+                )
+                self.logger.info(
+                    f"Created {expert_type} expert policy from {model_path}"
+                )
+            else:
+                raise ValueError(
+                    f"expert_policy_fn is required for expert_type='{expert_type}'"
+                )
 
         # Let ManiSkill handle vectorization efficiently
         env = gym.make(env_id, num_envs=num_envs, **env_kwargs)
@@ -135,6 +581,9 @@ class ExpertResidualWrapper(gym.Wrapper):
         self.log_actions = log_actions
         self.track_action_stats = track_action_stats
         self.control_mode = control_mode
+        self.expert_type = expert_type
+        self.model_path = model_path
+        self.deterministic_expert = deterministic_expert
 
         # Set up wrapper
         self._setup_wrapper()
@@ -532,7 +981,7 @@ class ExpertResidualWrapper(gym.Wrapper):
         scaled_residual = residual_action * self.residual_scale
 
         # Combine expert and residual actions
-        final_action = expert_action + scaled_residual
+        final_action = 0.2 * expert_action + scaled_residual
 
         # Clip final action if requested
         if self.clip_final_action:
@@ -583,23 +1032,45 @@ class ExpertResidualWrapper(gym.Wrapper):
         """Get expert action for given observation."""
         # Handle different observation types
         if isinstance(obs, dict):
-            # Check if this is an ACT expert policy by looking at the function name
-            expert_func_name = getattr(self.expert_policy_fn, "__name__", "unknown")
-            is_act_expert = (
-                isinstance(expert_func_name, str) and "act_expert" in expert_func_name
-            )
-
-            if is_act_expert:
-                # For ACT expert policies, pass dict observations directly
-                # ACT expert policies can handle both flattened and raw observations
+            # Check expert type for proper observation handling
+            if self.expert_type == "ppo":
+                # PPO state expert expects flattened observations
+                if self._expects_flattened_obs:
+                    obs_input = self._flatten_dict_obs(obs)
+                else:
+                    obs_input = obs
+            elif self.expert_type == "ppo_rgb":
+                # PPO RGB expert expects dict observations with RGB and state
                 obs_input = obs
-            elif self._expects_flattened_obs:
-                # For other expert policies with flattened observations, flatten the dict
-                obs_input = self._flatten_dict_obs(obs)
+            elif self.expert_type == "model":
+                # Model expert type - check if it's RGB-based by looking at observation structure
+                if "rgb" in obs:
+                    # This is likely an RGB model, pass dict observations
+                    obs_input = obs
+                # This is likely a state model, flatten the observations
+                elif self._expects_flattened_obs:
+                    obs_input = self._flatten_dict_obs(obs)
+                else:
+                    obs_input = obs
             else:
-                # For other expert policies with raw dict observations
-                # This shouldn't happen with current setup, but handle it
-                obs_input = self._flatten_dict_obs(obs)
+                # Check if this is an ACT expert policy by looking at the function name
+                expert_func_name = getattr(self.expert_policy_fn, "__name__", "unknown")
+                is_act_expert = (
+                    isinstance(expert_func_name, str)
+                    and "act_expert" in expert_func_name
+                )
+
+                if is_act_expert:
+                    # For ACT expert policies, pass dict observations directly
+                    # ACT expert policies can handle both flattened and raw observations
+                    obs_input = obs
+                elif self._expects_flattened_obs:
+                    # For other expert policies with flattened observations, flatten the dict
+                    obs_input = self._flatten_dict_obs(obs)
+                else:
+                    # For other expert policies with raw dict observations
+                    # This shouldn't happen with current setup, but handle it
+                    obs_input = self._flatten_dict_obs(obs)
         else:
             # Box observations (state-only environments)
             obs_input = common.to_tensor(obs, device=self.device)
@@ -619,7 +1090,6 @@ class ExpertResidualWrapper(gym.Wrapper):
         # Add noise if specified
         if self.expert_action_noise > 0:
             noise = torch.randn_like(expert_action) * self.expert_action_noise
-            expert_action = expert_action + noise
 
         # Ensure expert action is within bounds
         # Handle dimension mismatch between expert action and action bounds
@@ -646,6 +1116,8 @@ class ExpertResidualWrapper(gym.Wrapper):
             rgb_value = obs_dict["rgb"]
             if isinstance(rgb_value, torch.Tensor):
                 batch_size = rgb_value.shape[0] if rgb_value.dim() > 0 else 1
+                # Ensure tensor is on correct device
+                rgb_value = rgb_value.to(self.device).float()
                 if rgb_value.dim() == 1:
                     obs_parts.append(rgb_value)
                 else:
@@ -664,6 +1136,8 @@ class ExpertResidualWrapper(gym.Wrapper):
             state_value = obs_dict["state"]
             if isinstance(state_value, torch.Tensor):
                 batch_size = state_value.shape[0] if state_value.dim() > 0 else 1
+                # Ensure tensor is on correct device
+                state_value = state_value.to(self.device).float()
                 if state_value.dim() == 1:
                     obs_parts.append(state_value)
                 else:
@@ -761,16 +1235,22 @@ class ExpertResidualWrapper(gym.Wrapper):
         # Handle RGB observations for PPO RGB mode
         if "rgb" in base_obs:
             extended_obs["rgb"] = base_obs["rgb"]
-        else:
-            # For ACT expert policy, RGB data is required
-            if self.expert_type == "act":
-                raise ValueError(
-                    "ACT expert policy requires RGB data but none found in environment observation. "
-                    "Make sure the environment is configured with RGB cameras and FlattenRGBDObservationWrapper is applied."
-                )
+        # For PPO RGB expert policy, RGB data is required
+        elif self.expert_type == "ppo_rgb":
+            raise ValueError(
+                "PPO RGB expert policy requires RGB data but none found in environment observation. "
+                "Make sure the environment is configured with RGB cameras and FlattenRGBDObservationWrapper is applied."
+            )
+        # For ACT expert policy, RGB data is required
+        elif self.expert_type == "act":
+            raise ValueError(
+                "ACT expert policy requires RGB data but none found in environment observation. "
+                "Make sure the environment is configured with RGB cameras and FlattenRGBDObservationWrapper is applied."
+            )
 
-            # For other expert types in PPO RGB mode, create dummy RGB observation
-            # This ensures consistency with PPO RGB mode expectations
+        # For other expert types in PPO RGB mode, create dummy RGB observation
+        # This ensures consistency with PPO RGB mode expectations
+        else:
             batch_size = 1
             if "state" in base_obs:
                 state_tensor = base_obs["state"]
@@ -885,19 +1365,86 @@ class ExpertResidualWrapper(gym.Wrapper):
 
     def get_wrapper_info(self) -> Dict[str, Any]:
         """Get wrapper configuration information."""
-        return {
+        info = {
             "env_id": self.env_id,
+            "expert_type": self.expert_type,
+            "model_path": self.model_path,
+            "deterministic_expert": self.deterministic_expert,
             "residual_scale": self.residual_scale,
             "clip_final_action": self.clip_final_action,
             "expert_action_noise": self.expert_action_noise,
             "track_action_stats": self.track_action_stats,
-            "base_obs_dim": self.base_observation_space.shape[0],
-            "action_dim": self.base_action_space.shape[0],
-            "extended_obs_dim": self.observation_space.shape[0],
             "device": str(self.device),
             "num_envs": self.num_envs,
+            "control_mode": self.control_mode,
         }
+
+        # Add observation and action space information
+        if hasattr(self, "base_observation_space"):
+            if hasattr(self.base_observation_space, "shape"):
+                info["base_obs_dim"] = self.base_observation_space.shape[0]
+            else:
+                info["base_obs_space_type"] = type(self.base_observation_space).__name__
+
+        if hasattr(self, "base_action_space"):
+            if hasattr(self.base_action_space, "shape"):
+                info["action_dim"] = self.base_action_space.shape[0]
+            else:
+                info["action_space_type"] = type(self.base_action_space).__name__
+
+        if hasattr(self, "observation_space"):
+            if hasattr(self.observation_space, "shape"):
+                info["extended_obs_dim"] = self.observation_space.shape[0]
+            else:
+                info["extended_obs_space_type"] = type(self.observation_space).__name__
+
+        return info
 
     def close(self):
         """Close environment."""
         self.env.close()
+
+
+# Example usage:
+"""
+# Example 1: Load PPO state expert for PickCube-v1
+from mani_skill.envs.wrappers.expert_residual import ExpertResidualWrapper
+
+# Create wrapper with PPO state expert
+wrapper = ExpertResidualWrapper(
+    env_id="PickCube-v1",
+    expert_type="ppo",
+    model_path="runs/ppo_state_model/final_ckpt.pt",
+    num_envs=256,
+    residual_scale=0.1,
+    control_mode="pd_joint_delta_pos",
+    robot_uids="panda"
+)
+
+# Use with standard training loop
+obs, info = wrapper.reset()
+for step in range(50):
+    # Agent provides residual actions
+    residual_actions = agent.predict(obs)
+    obs, reward, terminated, truncated, info = wrapper.step(residual_actions)
+    
+    # Expert action info is in info["expert_action"]
+    # Final action is in info["final_action"]
+
+# Example 2: Load PPO RGB expert for PickCube-v1 with wrist camera
+wrapper = ExpertResidualWrapper(
+    env_id="PickCube-v1",
+    expert_type="ppo_rgb",
+    model_path="runs/ppo_rgb_model/final_ckpt.pt",
+    num_envs=64,
+    residual_scale=0.05,
+    control_mode="pd_joint_delta_pos",
+    robot_uids="panda_wristcam"
+)
+
+# Training loop is the same
+obs, info = wrapper.reset()
+for step in range(50):
+    residual_actions = agent.predict(obs)
+    obs, reward, terminated, truncated, info = wrapper.step(residual_actions)
+"""

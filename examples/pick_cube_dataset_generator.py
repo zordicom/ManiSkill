@@ -17,6 +17,7 @@ import numpy as np
 import sapien
 import torch
 from mani_skill.envs.tasks.tabletop.pick_cube import PickCubeEnv
+from mani_skill.utils.visualization.misc import images_to_video
 
 # depth/segmentation removed; Actor/Link no longer needed
 from torch import nn
@@ -24,6 +25,16 @@ from torch.distributions import Normal
 
 sys.path.append(str(Path(__file__).parent / "baselines" / "ppo"))
 from ppo import Agent
+
+# Add import for ppo_rgb_fast
+sys.path.append(str(Path(__file__).parent / "baselines" / "ppo"))
+try:
+    from ppo_rgb_fast import Agent as RGBFastAgent
+    from ppo_rgb_fast import NatureCNN, layer_init
+except ImportError:
+    RGBFastAgent = None
+    NatureCNN = None
+    layer_init = None
 
 
 class PandaDatasetGenerator:
@@ -35,6 +46,12 @@ class PandaDatasetGenerator:
         output_root_dir="training_data/panda_cube_pick_sim/",
         save_video=True,
         video_fps=30,
+        use_wrist_cam=False,
+        debug=False,
+        vis=False,
+        base_pose=None,
+        visualize_target_grasp_pose=False,
+        print_env_info=False,
         **kwargs,
     ):
         # No motion-planner superclass; store env/robot explicitly
@@ -47,6 +64,12 @@ class PandaDatasetGenerator:
         self.frame_counter = 0
         self.start_time = None
         self.last_timestamp = None
+        self.use_wrist_cam = use_wrist_cam
+        self.debug = debug
+        self.vis = vis
+        self.base_pose = base_pose
+        self.visualize_target_grasp_pose = visualize_target_grasp_pose
+        self.print_env_info = print_env_info
 
         # Video recording settings
         self.save_video = save_video
@@ -84,6 +107,12 @@ class PandaDatasetGenerator:
 
         # Create camera directories
         (self.episode_dir / "base_camera_rgb").mkdir(parents=True, exist_ok=True)
+        if self.use_wrist_cam:
+            (self.episode_dir / "hand_camera_rgb").mkdir(parents=True, exist_ok=True)
+        if self.save_video:
+            (self.episode_dir / "default_camera_video").mkdir(
+                parents=True, exist_ok=True
+            )
 
         print(f"Started episode: {episode_name}")
         print(f"Episode directory: {self.episode_dir}")
@@ -91,7 +120,7 @@ class PandaDatasetGenerator:
             print("Video recording enabled - frames will be saved from default camera")
 
     def save_frame_data(self, action: np.ndarray = None, phase: str = ""):
-        """Save frame data including images and observations."""
+        """Save frame data including images, robot state, and action observations."""
         if self.episode_dir is None:
             raise ValueError("Episode not started. Call start_episode() first.")
 
@@ -109,8 +138,107 @@ class PandaDatasetGenerator:
             delta_ms = (current_time - self.last_timestamp).total_seconds() * 1000
         self.last_timestamp = current_time
 
-        # Get task-specific extra observations (obj_pose, tcp_to_obj_pos, obj_to_goal_pos)
-        extra_obs = obs.get("extra", {})
+        # Handle different observation formats
+        if isinstance(obs, dict):
+            # Dictionary observations (RGB mode)
+            extra_obs = obs.get("extra", {})
+            obs_dict = obs
+        else:
+            # Tensor observations (state mode)
+            extra_obs = {}
+            obs_dict = {"state_tensor": obs}
+
+        # Get state observation (unified for both PPO and PPO_rgb_fast)
+        state_obs = {}
+
+        # Handle different observation modes
+        if "agent" in obs_dict:
+            # Extract agent state (qpos, qvel, etc.) - this is the main state data
+            agent_obs = obs_dict["agent"]
+            if isinstance(agent_obs, dict):
+                for key, value in agent_obs.items():
+                    if isinstance(value, torch.Tensor):
+                        value = value.cpu().numpy()
+                    if hasattr(value, "ndim") and value.ndim > 1:
+                        value = value[0]  # Take first batch element
+                    state_obs[key] = (
+                        value.tolist() if hasattr(value, "tolist") else value
+                    )
+
+        # For RGB environments, we might have a flattened state observation
+        if "state" in obs_dict:
+            state_value = obs_dict["state"]
+            if isinstance(state_value, torch.Tensor):
+                state_value = state_value.cpu().numpy()
+            if hasattr(state_value, "ndim") and state_value.ndim > 1:
+                state_value = state_value[0]  # Take first batch element
+            state_obs["flattened_state"] = (
+                state_value.tolist() if hasattr(state_value, "tolist") else state_value
+            )
+
+        # For state-only environments, save the raw state tensor
+        if "state_tensor" in obs_dict:
+            state_tensor = obs_dict["state_tensor"]
+            if isinstance(state_tensor, torch.Tensor):
+                state_tensor = state_tensor.cpu().numpy()
+            if hasattr(state_tensor, "ndim") and state_tensor.ndim > 1:
+                state_tensor = state_tensor[0]  # Take first batch element
+            state_obs["raw_state"] = (
+                state_tensor.tolist()
+                if hasattr(state_tensor, "tolist")
+                else state_tensor
+            )
+
+        # Extract other relevant observation components (excluding sensor_param)
+        for key, value in obs_dict.items():
+            if key not in [
+                "sensor_data",
+                "extra",
+                "agent",
+                "state",
+                "state_tensor",
+                "sensor_param",
+            ]:
+                if isinstance(value, torch.Tensor):
+                    value = value.cpu().numpy()
+                if hasattr(value, "ndim") and value.ndim > 1:
+                    value = value[0]  # Take first batch element
+                state_obs[key] = value.tolist() if hasattr(value, "tolist") else value
+
+        # Process action data - this is the actual action performed by the agent
+        action_data = {}
+        if action is not None:
+            # Convert action to numpy array
+            if isinstance(action, torch.Tensor):
+                action_np = action.cpu().numpy()
+            else:
+                action_np = np.array(action)
+
+            # Handle batch dimension
+            if hasattr(action_np, "ndim") and action_np.ndim > 1:
+                action_np = action_np[0]  # Take first batch element
+
+            # Ensure it's a 1D array
+            if action_np.ndim == 0:
+                action_np = np.array([action_np])
+
+            action_data["action"] = action_np.tolist()
+
+        # Helper function to ensure JSON serialization
+        def convert_to_json_serializable(obj):
+            """Recursively convert all torch tensors and numpy arrays to JSON-serializable formats."""
+            if isinstance(obj, torch.Tensor):
+                return obj.cpu().numpy().tolist()
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {k: convert_to_json_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_to_json_serializable(item) for item in obj]
+            elif isinstance(obj, (np.integer, np.floating, np.bool_)):
+                return obj.item()
+            else:
+                return obj
 
         # Frame numbering (6-digit format)
         frame_str = f"{self.frame_counter:06d}"
@@ -118,18 +246,19 @@ class PandaDatasetGenerator:
         # Save camera images
         image_paths = {}
 
-        # Create observation entry
+        # Create streamlined observation entry
         observation = {
             "frame_index": len(self.observations),
             "delta_ms": delta_ms,
             "elapsed_ms": elapsed_ms,
-            "extra": {
-                k: (v.tolist() if hasattr(v, "tolist") else v)
-                for k, v in extra_obs.items()
-            },
+            "phase": phase,
+            "state": convert_to_json_serializable(state_obs),
+            "action": convert_to_json_serializable(action_data),
+            "extra": convert_to_json_serializable(extra_obs),
         }
 
-        if "sensor_data" in obs:
+        # Handle sensor data if available (RGB mode)
+        if isinstance(obs, dict) and "sensor_data" in obs:
             sensor_data = obs["sensor_data"]
 
             # Debug: Print available cameras (only for first few frames)
@@ -164,7 +293,31 @@ class PandaDatasetGenerator:
                 if self.save_video:
                     self.base_camera_video_frames.append(bgr_image)
 
-            # depth and segmentation skipped for base camera
+            # Save hand camera RGB if enabled (wrist camera)
+            if (
+                self.use_wrist_cam
+                and "hand_camera" in sensor_data
+                and "rgb" in sensor_data["hand_camera"]
+            ):
+                rgb_image = sensor_data["hand_camera"]["rgb"].cpu().numpy()
+                if rgb_image.ndim == 4:
+                    rgb_image = rgb_image[0]
+
+                if rgb_image.dtype != np.uint8:
+                    rgb_image = (rgb_image * 255).astype(np.uint8)
+
+                bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+
+                # Resize to target resolution
+                bgr_image = cv2.resize(
+                    bgr_image, self._img_size, interpolation=cv2.INTER_LINEAR
+                )
+
+                hand_rgb_path = (
+                    self.episode_dir / "hand_camera_rgb" / f"{frame_str}.jpg"
+                )
+                cv2.imwrite(str(hand_rgb_path), bgr_image)
+                image_paths["hand_camera_rgb"] = f"hand_camera_rgb/{frame_str}.jpg"
 
         # Capture video frame from default human render camera
         if self.save_video:
@@ -185,27 +338,29 @@ class PandaDatasetGenerator:
                     if video_frame.dtype != np.uint8:
                         video_frame = (video_frame * 255).astype(np.uint8)
 
-                    # Convert RGB to BGR for OpenCV
+                    # Convert RGB to BGR for OpenCV image saving
                     if video_frame.shape[-1] == 3:
-                        video_frame = cv2.cvtColor(video_frame, cv2.COLOR_RGB2BGR)
+                        bgr_frame = cv2.cvtColor(video_frame, cv2.COLOR_RGB2BGR)
+                    else:
+                        bgr_frame = video_frame
 
-                    # Save individual video frame
+                    # Save individual video frame (BGR format for cv2.imwrite)
                     video_frame_path = (
                         self.episode_dir / "default_camera_video" / f"{frame_str}.jpg"
                     )
-                    cv2.imwrite(str(video_frame_path), video_frame)
+                    cv2.imwrite(str(video_frame_path), bgr_frame)
                     image_paths["default_camera_video"] = (
                         f"default_camera_video/{frame_str}.jpg"
                     )
 
-                    # Store frame for video compilation
-                    self.video_frames.append(video_frame)
+                    # Store frame for video compilation (keep as BGR for consistency)
+                    self.video_frames.append(bgr_frame)
 
             except Exception as e:
                 print(f"Warning: Could not capture video frame: {e}")
 
         # Add image paths to observation
-        observation.update(image_paths)
+        observation.update(convert_to_json_serializable(image_paths))
 
         # Add the observation to the list
         self.observations.append(observation)
@@ -213,59 +368,14 @@ class PandaDatasetGenerator:
 
         if len(self.observations) % 10 == 0:
             print(f"Saved frame {len(self.observations)}: {phase}")
-
-    def _colorize_segmentation(self, seg_image: np.ndarray) -> np.ndarray:
-        """Convert segmentation mask to colorized visualization using predetermined colors.
-
-        Args:
-            seg_image: Segmentation mask with integer labels
-
-        Returns:
-            Colorized BGR image for visualization
-        """
-        # Get unique segment IDs
-        unique_ids = np.unique(seg_image)
-
-        # Create a colorized version
-        height, width = seg_image.shape
-        colorized = np.zeros((height, width, 3), dtype=np.uint8)
-
-        # Apply predetermined colors to each segment
-        for seg_id in unique_ids:
-            mask = seg_image == seg_id
-            if seg_id in self.color_mapping:
-                # Use predetermined color
-                colorized[mask] = self.color_mapping[seg_id]
+            print(f"  State obs keys: {list(state_obs.keys())}")
+            if action_data:
+                print(f"  Action shape: {len(action_data.get('action', []))}")
             else:
-                # Fallback: use hash-based color for unknown segments
-                np.random.seed(int(seg_id))
-                color = np.random.randint(50, 255, 3)
-                colorized[mask] = color
-
-        return colorized
-
-    def _convert_to_simple_ids(self, seg_image: np.ndarray) -> np.ndarray:
-        """Convert segmentation image to simplified IDs (1-5) as UINT8 PNG.
-
-        Args:
-            seg_image: Original segmentation mask with arbitrary integer labels
-
-        Returns:
-            Simplified segmentation mask with IDs 0-5 as UINT8
-        """
-        # Create output image
-        height, width = seg_image.shape
-        simple_seg = np.zeros((height, width), dtype=np.uint8)
-
-        # Map each pixel to simplified ID
-        for orig_id, simple_id in self.id_remapping.items():
-            mask = seg_image == orig_id
-            simple_seg[mask] = simple_id
-
-        return simple_seg
+                print("  No action data")
 
     def _compile_video(self):
-        """Compile video frames into MP4 video files for all cameras."""
+        """Compile video frames into MP4 video files for all cameras using ManiSkill's approach."""
         videos_to_compile = [
             ("default_camera", self.video_frames),
             ("base_camera", self.base_camera_video_frames),
@@ -276,113 +386,30 @@ class PandaDatasetGenerator:
                 print(f"No {video_name} frames to compile")
                 continue
 
-            video_path = self.episode_dir / f"{self.episode_name}_{video_name}.mp4"
-
             try:
-                # Get video dimensions from first frame
-                height, width = frames[0].shape[:2]
+                # Convert BGR frames back to RGB for imageio (since imageio expects RGB)
+                rgb_frames = []
+                for frame in frames:
+                    # Convert BGR to RGB for imageio
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    rgb_frames.append(rgb_frame)
 
-                # Define codec and create VideoWriter
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                video_writer = cv2.VideoWriter(
-                    str(video_path), fourcc, self.video_fps, (width, height)
+                # Use ManiSkill's images_to_video function
+                images_to_video(
+                    rgb_frames,
+                    output_dir=str(self.episode_dir),
+                    video_name=f"{self.episode_name}_{video_name}",
+                    fps=self.video_fps,
+                    quality=5,  # Same quality as ManiSkill default
+                    verbose=True,
                 )
 
-                # Write frames to video
-                for frame in frames:
-                    video_writer.write(frame)
-
-                # Release video writer
-                video_writer.release()
-
-                print(f"{video_name.title()} video compiled successfully: {video_path}")
-                print(f"Video contains {len(frames)} frames at {self.video_fps} FPS")
+                print(
+                    f"{video_name.title()} video compiled successfully with {len(frames)} frames at {self.video_fps} FPS"
+                )
 
             except Exception as e:
                 print(f"Error compiling {video_name} video: {e}")
-
-    def follow_path(self, result, refine_steps: int = 0):
-        """Override follow_path to save dataset at every control frame."""
-        n_step = result["position"].shape[0]
-        print(f"Following path with {n_step} steps")
-
-        for i in range(n_step + refine_steps):
-            qpos = result["position"][min(i, n_step - 1)]
-            if self.control_mode == "pd_joint_pos_vel":
-                qvel = result["velocity"][min(i, n_step - 1)]
-                action = np.hstack([qpos, qvel, self.gripper_state])
-            else:
-                action = np.hstack([qpos, self.gripper_state])
-
-            obs, reward, terminated, truncated, info = self.env.step(action)
-
-            # Save frame data
-            self.save_frame_data(action, f"trajectory_step_{i}")
-
-            self.elapsed_steps += 1
-            if self.print_env_info:
-                print(
-                    f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}"
-                )
-            if self.vis:
-                self.base_env.render_human()
-
-        return obs, reward, terminated, truncated, info
-
-    def open_gripper(self):
-        """Override open_gripper to save dataset at every control frame."""
-        print(f"Opening gripper from {self.gripper_state} to {self.OPEN}")
-        self.gripper_state = self.OPEN
-        qpos = self.robot.get_qpos()[0, :-2].cpu().numpy()
-
-        for step in range(6):
-            if self.control_mode == "pd_joint_pos":
-                action = np.hstack([qpos, self.gripper_state])
-            else:
-                action = np.hstack([qpos, np.zeros_like(qpos), self.gripper_state])
-
-            obs, reward, terminated, truncated, info = self.env.step(action)
-
-            # Save frame data
-            self.save_frame_data(action, f"open_gripper_step_{step}")
-
-            self.elapsed_steps += 1
-            if self.print_env_info:
-                print(
-                    f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}"
-                )
-            if self.vis:
-                self.base_env.render_human()
-
-        return obs, reward, terminated, truncated, info
-
-    def close_gripper(self, t: int = 6, gripper_state: float = None):
-        """Override close_gripper to save dataset at every control frame."""
-        old_gripper_state = self.gripper_state
-        self.gripper_state = self.CLOSED if gripper_state is None else gripper_state
-        print(f"Closing gripper from {old_gripper_state} to {self.gripper_state}")
-        qpos = self.robot.get_qpos()[0, :-2].cpu().numpy()
-
-        for step in range(t):
-            if self.control_mode == "pd_joint_pos":
-                action = np.hstack([qpos, self.gripper_state])
-            else:
-                action = np.hstack([qpos, np.zeros_like(qpos), self.gripper_state])
-
-            obs, reward, terminated, truncated, info = self.env.step(action)
-
-            # Save frame data
-            self.save_frame_data(action, f"close_gripper_step_{step}")
-
-            self.elapsed_steps += 1
-            if self.print_env_info:
-                print(
-                    f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}"
-                )
-            if self.vis:
-                self.base_env.render_human()
-
-        return obs, reward, terminated, truncated, info
 
     def _get_camera_metadata(self) -> Dict:
         """Extract real camera intrinsic matrices and parameters from the environment."""
@@ -454,7 +481,40 @@ class PandaDatasetGenerator:
         # Create the format with metadata and observations
         metadata = {
             "episode_name": self.episode_name,
-            "robot_id": "panda",
+            "robot_id": "panda_wristcam" if self.use_wrist_cam else "panda",
+            "data_structure": {
+                "description": "Streamlined robot state, action, and observation data",
+                "observation_format": {
+                    "frame_index": "Sequential frame number",
+                    "delta_ms": "Time since last frame in milliseconds",
+                    "elapsed_ms": "Total elapsed time since episode start in milliseconds",
+                    "phase": "Description of current phase (e.g., 'initial', 'step_N')",
+                    "state": {
+                        "description": "Robot state observations from environment",
+                        "qpos": "Joint positions (if in agent observations)",
+                        "qvel": "Joint velocities (if in agent observations)",
+                        "flattened_state": "Flattened state for RGB environments",
+                        "raw_state": "Raw state tensor for state-only environments",
+                        "other_keys": "Additional state components from environment",
+                    },
+                    "action": {
+                        "description": "Action data executed by the agent",
+                        "action": "Full action vector executed",
+                    },
+                    "extra": {
+                        "description": "Task-specific observations",
+                        "obj_pose": "Object pose in world coordinates",
+                        "tcp_to_obj_pos": "Vector from TCP to object",
+                        "obj_to_goal_pos": "Vector from object to goal",
+                        "other_task_info": "Additional task-specific information",
+                    },
+                    "image_paths": {
+                        "base_camera_rgb": "Path to base camera RGB image",
+                        "hand_camera_rgb": "Path to hand camera RGB image (if wrist cam enabled)",
+                        "default_camera_video": "Path to default camera video frame",
+                    },
+                },
+            },
             **camera_metadata,
         }
 
@@ -469,13 +529,32 @@ class PandaDatasetGenerator:
         }
 
         # Save episode data JSON file
-        json_path = self.episode_dir / f"{self.episode_name}.json"
+        json_path = self.episode_dir / "observations.json"
         with open(json_path, "w") as f:
             json.dump(episode_data, f, indent=2)
 
         print(f"Episode finished: {self.episode_name}")
         print(f"Total frames: {len(self.observations)}")
         print(f"Episode data saved to: {json_path}")
+
+        # Print summary of data structure
+        if len(self.observations) > 0:
+            sample_obs = self.observations[0]
+            print("\nData structure summary:")
+            print(f"  State keys: {list(sample_obs.get('state', {}).keys())}")
+            print(f"  Action keys: {list(sample_obs.get('action', {}).keys())}")
+            print(f"  Extra keys: {list(sample_obs.get('extra', {}).keys())}")
+
+            # Print dimensions
+            state_data = sample_obs.get("state", {})
+            if "qpos" in state_data:
+                print(f"  qpos dimension: {len(state_data['qpos'])}")
+            if "qvel" in state_data:
+                print(f"  qvel dimension: {len(state_data['qvel'])}")
+
+            action_data = sample_obs.get("action", {})
+            if "action" in action_data:
+                print(f"  action dimension: {len(action_data['action'])}")
 
         # Compile video if video recording is enabled
         if self.save_video and len(self.base_camera_video_frames) > 0:
@@ -486,7 +565,6 @@ class PandaDatasetGenerator:
         self.episode_dir = None
         self.frame_counter = 0
         self.last_timestamp = None
-        self.segmentation_mapping = {}
         self.color_mapping = {}
         self.id_remapping = {}
         self.video_frames = []
@@ -537,6 +615,54 @@ def load_ppo_agent(env, ckpt_path: str, device: str | torch.device = "cpu") -> A
     return agent
 
 
+def load_ppo_rgb_fast_agent(
+    env, ckpt_path: str, device: str | torch.device = "cpu"
+) -> RGBFastAgent:
+    """Load the exact Agent from ppo_rgb_fast.py checkpoint."""
+    if RGBFastAgent is None:
+        raise ImportError(
+            "ppo_rgb_fast.py Agent not available. Please ensure it's importable."
+        )
+
+    # Import the flattening wrapper
+    # Get action dimensions
+    import math
+
+    from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
+
+    # Check if environment is already wrapped - if so, use it directly
+    if (
+        hasattr(env, "_is_wrapped")
+        or not hasattr(env.unwrapped, "_init_raw_obs")
+        or "sensor_data" not in env.unwrapped._init_raw_obs
+    ):
+        # Environment is already wrapped, use it directly
+        temp_env = env
+    else:
+        # Create a temporary wrapped environment to get the right observation structure
+        temp_env = FlattenRGBDObservationWrapper(env, rgb=True, state=True)
+
+        # Apply action space wrapper if needed (same as in ppo_rgb_fast.py)
+        if isinstance(temp_env.action_space, gym.spaces.Dict):
+            from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
+
+            temp_env = FlattenActionSpaceWrapper(temp_env)
+
+    # Get action dimensions from properly wrapped environment
+    n_act = math.prod(temp_env.action_space.shape)
+    sample_obs = temp_env.reset()[0]
+
+    # Create agent with exact same architecture
+    agent = RGBFastAgent(n_act, sample_obs, device=device)
+
+    # Load checkpoint
+    state_dict = torch.load(ckpt_path, map_location=device)
+    agent.load_state_dict(state_dict, strict=True)
+    agent.eval()
+
+    return agent
+
+
 def generate_pick_cube_dataset(
     env_config: dict,
     num_episodes: int = 1,
@@ -549,6 +675,7 @@ def generate_pick_cube_dataset(
     use_table_origin: bool = True,
     ppo_checkpoint_path: str | None = None,
     max_steps_per_episode: int | None = None,
+    use_wrist_cam: bool = False,
 ):
     """Generate multiple episodes of pick cube dataset.
 
@@ -562,18 +689,32 @@ def generate_pick_cube_dataset(
         save_video: Enable video recording from default camera (default: True)
         video_fps: Frame rate for compiled video (default: 30)
         use_table_origin: Use table origin coordinate system (default: True)
+        use_wrist_cam: Use panda_wristcam robot configuration with ppo_rgb_fast agent (saves both base and hand camera images) (default: False)
     """
     # Track success statistics
     success_count = 0
     total_episodes = 0
 
-    for episode_idx in range(num_episodes):
+    for episode_idx in range(num_episodes):  # noqa: PLR1702
         print(f"\n{'=' * 60}")
         print(f"GENERATING EPISODE {episode_idx + 1}/{num_episodes}")
         print(f"{'=' * 60}")
 
         # Create fresh environment for each episode to ensure proper randomization
         env = gym.make(**env_config)
+
+        # Apply wrappers if using wrist cam BEFORE creating PandaDatasetGenerator
+        if use_wrist_cam:
+            from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
+
+            # Apply wrappers to the raw environment
+            env = FlattenRGBDObservationWrapper(env, rgb=True, state=True)
+
+            # Apply action space wrapper if needed (same as in ppo_rgb_fast.py)
+            if isinstance(env.action_space, gym.spaces.Dict):
+                from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
+
+                env = FlattenActionSpaceWrapper(env)
 
         # Reset environment with unique seed and capture initial observation
         initial_obs, _ = env.reset(seed=seed_start + episode_idx)
@@ -609,6 +750,7 @@ def generate_pick_cube_dataset(
             base_pose=env.unwrapped.agent.robot.pose,
             visualize_target_grasp_pose=vis,
             print_env_info=debug,
+            use_wrist_cam=use_wrist_cam,
         )
 
         if ppo_checkpoint_path is None:
@@ -622,15 +764,25 @@ def generate_pick_cube_dataset(
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Create a temporary state-only env just for agent initialization
-        temp_state_env_config = env_config.copy()
-        temp_state_env_config["obs_mode"] = "state"
-        temp_state_env = gym.make(**temp_state_env_config)
-        agent = load_ppo_agent(temp_state_env, ppo_checkpoint_path, device)
+        # Create agent based on whether wrist cam is enabled
+        if use_wrist_cam:
+            # For wrist cam, use RGB fast agent with RGB environment
+            # The agent expects the dual camera setup (base_camera + hand_camera)
+            agent = load_ppo_rgb_fast_agent(env, ppo_checkpoint_path, device)
+            # No need for separate state environment since main env provides flattened obs
+            temp_state_env = None
+        else:
+            # Create a temporary state-only env just for agent initialization
+            temp_state_env_config = env_config.copy()
+            temp_state_env_config["obs_mode"] = "state"
+            temp_state_env = gym.make(**temp_state_env_config)
+            agent = load_ppo_agent(temp_state_env, ppo_checkpoint_path, device)
+            wrapped_env = None
 
         # Keep the state environment open for getting state observations
         # Reset it with the same seed to keep it synchronized
-        temp_state_env.reset(seed=seed_start + episode_idx)
+        if temp_state_env is not None:
+            temp_state_env.reset(seed=seed_start + episode_idx)
 
         # Start episode and capture the initial frame
         generator.start_episode()
@@ -642,28 +794,55 @@ def generate_pick_cube_dataset(
         _max_steps = max_steps_per_episode or getattr(env, "_max_episode_steps", 100)
         episode_success = False
 
+        # Initialize wrapped_obs for wrist cam case
+        if use_wrist_cam:
+            wrapped_obs = obs  # Use the observation from the main environment
+
         while not done and step < _max_steps:
-            # Get state observation from the synchronized state environment
-            state_obs = temp_state_env.get_obs()
-
-            # Convert to numpy if it's a tensor
-            if isinstance(state_obs, torch.Tensor):
-                state_obs = state_obs.cpu().numpy().flatten()
-            else:
-                state_obs = np.array(state_obs).flatten()
-
-            # Convert to tensor
-            state_obs_tensor = (
-                torch.from_numpy(state_obs).float().to(device).unsqueeze(0)
-            )
-
             with torch.no_grad():
-                action = agent.get_action(state_obs_tensor, deterministic=True)
-                action = action.squeeze(0).cpu().numpy()
+                if use_wrist_cam:
+                    # For RGB fast agent, use flattened observations from wrapped environment
+                    # Move observation to device and ensure proper format
+                    obs_device = {}
+                    for key, value in wrapped_obs.items():
+                        if isinstance(value, torch.Tensor):
+                            obs_device[key] = value.to(device)
+                        else:
+                            obs_device[key] = torch.from_numpy(value).to(device)
+
+                        # Convert RGB from uint8 to float as expected by the model
+                        # (The model will handle the /255.0 normalization)
+                        if "rgb" in key:
+                            obs_device[key] = obs_device[key].float()
+
+                    # Get action using the actor_mean for deterministic action
+                    features = agent.get_features(obs_device)
+                    action = agent.actor_mean(features)
+                    action = action.squeeze(0).cpu().numpy()
+                else:
+                    # For basic PPO agent, use state observations
+                    state_obs = temp_state_env.get_obs()
+
+                    # Convert to numpy if it's a tensor
+                    if isinstance(state_obs, torch.Tensor):
+                        state_obs = state_obs.cpu().numpy().flatten()
+                    else:
+                        state_obs = np.array(state_obs).flatten()
+
+                    # Convert to tensor
+                    state_obs_tensor = (
+                        torch.from_numpy(state_obs).float().to(device).unsqueeze(0)
+                    )
+
+                    action = agent.get_action(state_obs_tensor, deterministic=True)
+                    action = action.squeeze(0).cpu().numpy()
 
             # Step both environments with the same action to keep them synchronized
             obs, reward, terminated, truncated, info = env.step(action)
-            temp_state_env.step(action)  # Keep state env synchronized
+            if not use_wrist_cam:
+                temp_state_env.step(action)  # Keep state env synchronized
+            if use_wrist_cam:
+                wrapped_obs = obs  # Use the observation from the main environment
 
             # Check for success
             if info.get("success"):
@@ -691,9 +870,10 @@ def generate_pick_cube_dataset(
         )
         print("Episode completed successfully!")
 
-        # Close both environments to free resources
+        # Close environments to free resources
         env.close()
-        temp_state_env.close()
+        if temp_state_env is not None:
+            temp_state_env.close()
 
     # Final success rate summary
     final_success_rate = (
@@ -767,7 +947,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--robot-uids",
         type=str,
-        default="panda",
+        default="panda_wristcam",
         help="Robot UIDs to use (default: panda)",
     )
     parser.add_argument(
@@ -778,8 +958,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--control-mode",
         type=str,
-        default="pd_joint_delta_pos",
-        help="Control mode (default: pd_joint_pos)",
+        default="auto",
+        help="Control mode (default: auto - pd_joint_delta_pos for PPO, pd_ee_delta_pos for PPO RGB fast)",
     )
     parser.add_argument(
         "--ppo-checkpoint",
@@ -787,8 +967,26 @@ if __name__ == "__main__":
         default="/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo__1__1752538773/final_ckpt.pt",
         help="Path to the trained PPO checkpoint (*.pt) used to drive the policy",
     )
+    parser.add_argument(
+        "--use-wrist-cam",
+        action="store_true",
+        help="Use panda_wristcam robot configuration with ppo_rgb_fast agent (saves both base and hand camera images)",
+    )
 
     args = parser.parse_args()
+
+    # Update checkpoint path for wrist cam if not explicitly provided
+    if (
+        args.use_wrist_cam
+        and args.ppo_checkpoint
+        == "/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo__1__1752538773/final_ckpt.pt"
+    ):
+        args.ppo_checkpoint = "/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo_rgb_fast__1__1752546740/ckpt_176.pt"
+        print(f"Using RGB fast checkpoint for wrist cam: {args.ppo_checkpoint}")
+    elif args.use_wrist_cam:
+        print(f"Using custom checkpoint for wrist cam: {args.ppo_checkpoint}")
+    else:
+        print(f"Using state-based PPO checkpoint: {args.ppo_checkpoint}")
 
     # Create environment configuration dictionary
     env_config = {
@@ -798,6 +996,19 @@ if __name__ == "__main__":
         "render_mode": "rgb_array",
         "control_mode": args.control_mode,
     }
+
+    # Update robot configuration and control mode for wrist cam
+    if args.use_wrist_cam:
+        env_config["robot_uids"] = "panda_wristcam"
+        # PPO RGB fast agent uses ee_delta_pos control mode
+        env_config["control_mode"] = (
+            "pd_ee_delta_pos" if args.control_mode == "auto" else args.control_mode
+        )
+    else:
+        # PPO state agent uses joint_delta_pos control mode
+        env_config["control_mode"] = (
+            "pd_joint_delta_pos" if args.control_mode == "auto" else args.control_mode
+        )
 
     # Generate dataset
     generate_pick_cube_dataset(
@@ -809,4 +1020,5 @@ if __name__ == "__main__":
         save_video=not args.no_video,
         video_fps=args.video_fps,
         ppo_checkpoint_path=os.path.expanduser(args.ppo_checkpoint),
+        use_wrist_cam=args.use_wrist_cam,
     )

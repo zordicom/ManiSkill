@@ -116,7 +116,7 @@ class Args:
     """type of expert policy: 'none' (regular PPO), 'zero', 'ik', 'model', 'act', 'dummy_act'"""
     residual_scale: float = 1.0
     """scale factor for residual actions"""
-    expert_action_noise: float = 0.0
+    expert_action_noise: float = 1.0
     """Gaussian noise std to add to expert actions"""
     track_action_stats: bool = False
     """whether to track expert/residual action statistics"""
