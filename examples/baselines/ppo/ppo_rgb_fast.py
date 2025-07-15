@@ -114,7 +114,7 @@ class Args:
     """evaluation frequency in terms of iterations"""
     save_train_video_freq: Optional[int] = None
     """frequency to save training videos in terms of iterations"""
-    control_mode: Optional[str] = "pd_joint_delta_pos"
+    control_mode: Optional[str] = "pd_ee_delta_pos"
     """the control mode to use for the environment"""
 
     # Algorithm specific arguments
@@ -175,7 +175,9 @@ class Args:
     """whether to track expert/residual action statistics"""
     ik_gain: float = 2.0
     """proportional gain for IK expert policy"""
-    model_path: Optional[str] = None
+    model_path: Optional[str] = (
+        "/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo_rgb_fast__1__1752546740/ckpt_326.pt"
+    )
     """path to pre-trained model for model expert policy"""
 
 

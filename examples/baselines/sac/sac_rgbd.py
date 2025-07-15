@@ -14,10 +14,59 @@ import tyro
 from torch import nn, optim
 from torch.utils.tensorboard import SummaryWriter
 
+import mani_skill.envs
 from mani_skill.utils import gym_utils
-from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper, FlattenRGBDObservationWrapper
+from mani_skill.utils.wrappers.flatten import (
+    FlattenActionSpaceWrapper,
+    FlattenRGBDObservationWrapper,
+)
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+
+# Expert+Residual wrapper utility
+try:
+    from util import create_expert_residual_envs
+except ImportError:
+    create_expert_residual_envs = None
+
+# PPO RGB Fast expert utility
+try:
+    import sys
+
+    sys.path.append("examples/baselines/ppo")
+    from ppo_rgb_fast import Agent as PPORGBFastAgent
+    from ppo_rgb_fast import NatureCNN
+except ImportError:
+    PPORGBFastAgent = None
+    NatureCNN = None
+
+
+def create_ppo_rgb_fast_expert(checkpoint_path: str, sample_obs, n_act: int, device: str = "cuda"):
+    """Create PPO RGB Fast expert policy from checkpoint."""
+    if PPORGBFastAgent is None:
+        raise ImportError("PPO RGB Fast agent not available. Please ensure ppo_rgb_fast.py is accessible.")
+
+    print(f"Loading PPO RGB Fast expert from: {checkpoint_path}")
+
+    # Create agent
+    agent = PPORGBFastAgent(n_act, sample_obs, device=device)
+
+    # Load checkpoint
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    agent.load_state_dict(state_dict, strict=True)
+    agent.eval()
+
+    print(f"PPO RGB Fast expert loaded successfully with {n_act} action dimensions")
+
+    def ppo_rgb_fast_expert(obs):
+        """Expert policy function that uses PPO RGB Fast model."""
+        with torch.no_grad():
+            # Get features and then mean action (deterministic)
+            features = agent.get_features(obs)
+            action = agent.actor_mean(features)
+            return action
+
+    return ppo_rgb_fast_expert
 
 
 @dataclass
@@ -125,6 +174,26 @@ class Args:
     camera_height: Optional[int] = None
     """the height of the camera image. If none it will use the default the environment specifies."""
 
+    # Expert+Residual parameters (optional)
+    expert_type: str = "none"
+    """type of expert policy: 'none' (regular SAC), 'zero', 'ik', 'model', 'ppo_rgb_fast'"""
+    residual_scale: float = 1.0
+    """scale factor for residual actions"""
+    expert_action_noise: float = 0.0
+    """Gaussian noise std to add to expert actions"""
+    track_action_stats: bool = False
+    """whether to track expert/residual action statistics"""
+    ik_gain: float = 2.0
+    """proportional gain for IK expert policy"""
+    model_path: Optional[str] = None
+    """path to pre-trained model for model expert policy"""
+
+    # PPO RGB Fast expert parameters
+    ppo_rgb_fast_path: Optional[str] = (
+        "/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo_rgb_fast__1__1752546740/ckpt_326.pt"
+    )
+    """path to pre-trained PPO RGB Fast model checkpoint"""
+
     # to be filled in runtime
     grad_steps_per_iteration: int = 0
     """the number of gradient updates per iteration"""
@@ -197,7 +266,14 @@ class ReplayBufferSample:
 
 
 class ReplayBuffer:
-    def __init__(self, env, num_envs: int, buffer_size: int, storage_device: torch.device, sample_device: torch.device):
+    def __init__(
+        self,
+        env,
+        num_envs: int,
+        buffer_size: int,
+        storage_device: torch.device,
+        sample_device: torch.device,
+    ):
         self.buffer_size = buffer_size
         self.pos = 0
         self.full = False
@@ -207,13 +283,20 @@ class ReplayBuffer:
         self.per_env_buffer_size = buffer_size // num_envs
         # note 128x128x3 RGB data with replay buffer size 100_000 takes up around 4.7GB of GPU memory
         # 32 parallel envs with rendering uses up around 2.2GB of GPU memory.
-        self.obs = DictArray((self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device)
+        self.obs = DictArray(
+            (self.per_env_buffer_size, num_envs),
+            env.single_observation_space,
+            device=storage_device,
+        )
         # TODO (stao): optimize final observation storage
         self.next_obs = DictArray(
-            (self.per_env_buffer_size, num_envs), env.single_observation_space, device=storage_device
+            (self.per_env_buffer_size, num_envs),
+            env.single_observation_space,
+            device=storage_device,
         )
         self.actions = torch.zeros(
-            (self.per_env_buffer_size, num_envs) + env.single_action_space.shape, device=storage_device
+            (self.per_env_buffer_size, num_envs) + env.single_action_space.shape,
+            device=storage_device,
         )
         self.logprobs = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
         self.rewards = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
@@ -221,7 +304,12 @@ class ReplayBuffer:
         self.values = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
 
     def add(
-        self, obs: torch.Tensor, next_obs: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, done: torch.Tensor
+        self,
+        obs: torch.Tensor,
+        next_obs: torch.Tensor,
+        action: torch.Tensor,
+        reward: torch.Tensor,
+        done: torch.Tensor,
     ):
         if self.storage_device == torch.device("cpu"):
             obs = {k: v.cpu() for k, v in obs.items()}
@@ -407,7 +495,11 @@ class SoftQNetwork(nn.Module):
         self.encoder = encoder
         action_dim = np.prod(envs.single_action_space.shape)
         state_dim = envs.single_observation_space["state"].shape[0]
-        self.mlp = make_mlp(encoder.encoder.out_dim + action_dim + state_dim, [512, 256, 1], last_act=False)
+        self.mlp = make_mlp(
+            encoder.encoder.out_dim + action_dim + state_dim,
+            [512, 256, 1],
+            last_act=False,
+        )
 
     def forward(self, obs, action, visual_feature=None, detach_encoder=False):
         if visual_feature is None:
@@ -520,7 +612,12 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # Environment setup #######
-    env_kwargs = dict(obs_mode=args.obs_mode, render_mode=args.render_mode, sim_backend="gpu", sensor_configs=dict())
+    env_kwargs = dict(
+        obs_mode=args.obs_mode,
+        render_mode=args.render_mode,
+        sim_backend="gpu",
+        sensor_configs=dict(),
+    )
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
     if args.camera_width is not None:
@@ -528,27 +625,64 @@ if __name__ == "__main__":
         env_kwargs["sensor_configs"]["width"] = args.camera_width
     if args.camera_height is not None:
         env_kwargs["sensor_configs"]["height"] = args.camera_height
-    envs = gym.make(
-        args.env_id,
-        num_envs=args.num_envs if not args.evaluate else 1,
-        reconfiguration_freq=args.reconfiguration_freq,
-        **env_kwargs,
-    )
-    eval_envs = gym.make(
-        args.env_id,
-        num_envs=args.num_eval_envs,
-        reconfiguration_freq=args.eval_reconfiguration_freq,
-        human_render_camera_configs=dict(shader_pack="default"),
-        **env_kwargs,
-    )
 
-    # rgbd obs mode returns a dict of data, we flatten it so there is just a rgbd key and state key
-    envs = FlattenRGBDObservationWrapper(envs, rgb=True, depth=False, state=args.include_state)
-    eval_envs = FlattenRGBDObservationWrapper(eval_envs, rgb=True, depth=False, state=args.include_state)
+    # Create environments conditionally based on expert mode
+    if args.expert_type != "none":
+        print(f"Creating Expert+Residual environments with expert type: {args.expert_type}")
 
-    if isinstance(envs.action_space, gym.spaces.Dict):
-        envs = FlattenActionSpaceWrapper(envs)
-        eval_envs = FlattenActionSpaceWrapper(eval_envs)
+        # Handle PPO RGB Fast expert specially
+        if args.expert_type == "ppo_rgb_fast":
+            if args.ppo_rgb_fast_path is None:
+                args.ppo_rgb_fast_path = args.model_path  # Fallback to model_path
+            if args.ppo_rgb_fast_path is None:
+                raise ValueError("PPO RGB Fast expert requires --ppo-rgb-fast-path or --model-path")
+
+            # Create temporary environment to get sample obs and action dims
+            temp_env = gym.make(args.env_id, num_envs=1, **env_kwargs)
+            temp_env = FlattenRGBDObservationWrapper(temp_env, rgb=True, depth=False, state=args.include_state)
+            if isinstance(temp_env.action_space, gym.spaces.Dict):
+                temp_env = FlattenActionSpaceWrapper(temp_env)
+
+            sample_obs = temp_env.reset()[0]
+            action_dim = temp_env.action_space.shape[0]
+            temp_env.close()
+
+            # Create PPO RGB Fast expert
+            from mani_skill.envs.wrappers.experts import register_expert_policy
+
+            expert_policy = create_ppo_rgb_fast_expert(args.ppo_rgb_fast_path, sample_obs, action_dim, str(device))
+
+            # Register as 'ppo_rgb_fast' expert type
+            register_expert_policy("ppo_rgb_fast", lambda action_dim, **kwargs: expert_policy)
+
+            # Update args for wrapper creation
+            args.model_path = args.ppo_rgb_fast_path
+
+        if create_expert_residual_envs is None:
+            raise ImportError("Expert+Residual wrapper not available. Please ensure util.py is importable.")
+        envs, eval_envs = create_expert_residual_envs(args, env_kwargs, device)
+    else:
+        envs = gym.make(
+            args.env_id,
+            num_envs=args.num_envs if not args.evaluate else 1,
+            reconfiguration_freq=args.reconfiguration_freq,
+            **env_kwargs,
+        )
+        eval_envs = gym.make(
+            args.env_id,
+            num_envs=args.num_eval_envs,
+            reconfiguration_freq=args.eval_reconfiguration_freq,
+            human_render_camera_configs=dict(shader_pack="default"),
+            **env_kwargs,
+        )
+
+        # rgbd obs mode returns a dict of data, we flatten it so there is just a rgbd key and state key
+        envs = FlattenRGBDObservationWrapper(envs, rgb=True, depth=False, state=args.include_state)
+        eval_envs = FlattenRGBDObservationWrapper(eval_envs, rgb=True, depth=False, state=args.include_state)
+
+        if isinstance(envs.action_space, gym.spaces.Dict):
+            envs = FlattenActionSpaceWrapper(envs)
+            eval_envs = FlattenActionSpaceWrapper(eval_envs)
     if args.capture_video or args.save_trajectory:
         eval_output_dir = f"runs/{run_name}/videos"
         if args.evaluate:
@@ -573,9 +707,17 @@ if __name__ == "__main__":
             max_steps_per_video=args.num_eval_steps,
             video_fps=30,
         )
-    envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=not args.partial_reset, record_metrics=True)
+    envs = ManiSkillVectorEnv(
+        envs,
+        args.num_envs,
+        ignore_terminations=not args.partial_reset,
+        record_metrics=True,
+    )
     eval_envs = ManiSkillVectorEnv(
-        eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True
+        eval_envs,
+        args.num_eval_envs,
+        ignore_terminations=not args.eval_partial_reset,
+        record_metrics=True,
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -649,7 +791,8 @@ if __name__ == "__main__":
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.Adam(
-        list(qf1.mlp.parameters()) + list(qf2.mlp.parameters()) + list(qf1.encoder.parameters()), lr=args.q_lr
+        list(qf1.mlp.parameters()) + list(qf2.mlp.parameters()) + list(qf1.encoder.parameters()),
+        lr=args.q_lr,
     )
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
@@ -680,9 +823,13 @@ if __name__ == "__main__":
             num_episodes = 0
             for _ in range(args.num_eval_steps):
                 with torch.no_grad():
-                    eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(
-                        actor.get_eval_action(eval_obs)
-                    )
+                    (
+                        eval_obs,
+                        eval_rew,
+                        eval_terminations,
+                        eval_truncations,
+                        eval_infos,
+                    ) = eval_envs.step(actor.get_eval_action(eval_obs))
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
                         num_episodes += mask.sum()
@@ -835,7 +982,11 @@ if __name__ == "__main__":
             logger.add_scalar("losses/alpha", alpha, global_step)
             logger.add_scalar("time/update_time", update_time, global_step)
             logger.add_scalar("time/rollout_time", rollout_time, global_step)
-            logger.add_scalar("time/rollout_fps", global_steps_per_iteration / rollout_time, global_step)
+            logger.add_scalar(
+                "time/rollout_fps",
+                global_steps_per_iteration / rollout_time,
+                global_step,
+            )
             for k, v in cumulative_times.items():
                 logger.add_scalar(f"time/total_{k}", v, global_step)
             logger.add_scalar(

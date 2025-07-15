@@ -45,7 +45,7 @@ RIGHT_ARM_OFFSET = torch.tensor([-0.025, -0.365, 0.005])
 LEFT_ARM_OFFSET = torch.tensor([-0.025, 0.365, 0.005])
 
 
-@register_env("PickBox-v1", max_episode_steps=200)
+@register_env("PickBox-v1", max_episode_steps=150)
 class PickBoxEnv(BaseEnv):
     """Single-arm or bimanual pick-and-place task using b5box and basket assets."""
 

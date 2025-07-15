@@ -20,7 +20,7 @@ from typing import Dict, List
 # Path to the reference PPO training script. We deduce it relative to this file
 PPO_SCRIPT = Path(__file__).resolve().parent / "ppo.py"
 # Experiment parameters requested by the user
-TOTAL_TIMESTEPS = 100_000  # shorter runs for quick sanity checks
+TOTAL_TIMESTEPS = 500_000  # shorter runs for quick sanity checks
 
 # Default parallel environment counts (can be overridden per experiment)
 DEFAULT_NUM_ENVS_STATE = 256
@@ -198,13 +198,24 @@ def main() -> None:  # noqa: D103
         help="Target ManiSkill environment ID (default: PickCube-v1)",
     )
     parser.add_argument(
+        "--control-mode",
+        default="pd_ee_delta_pos",
+        help="Control mode for the environment (default: pd_ee_delta_pos)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands without executing the experiments.",
     )
+    parser.add_argument(
+        "--expert-type",
+        default="ik",
+        help="Expert type for the environment (default: ik)",
+    )
     args = parser.parse_args()
 
     env_id = args.env_id
+    control_mode = args.control_mode
 
     configs: List[ExperimentConfig] = []
 
@@ -212,6 +223,13 @@ def main() -> None:  # noqa: D103
     def add_cfg(
         script: str, expert: str, num_envs: int, extra: List[str] | None = None
     ):
+        # Always include control_mode in extra_args
+        control_mode_arg = [f"--control-mode={control_mode}"]
+        if extra is None:
+            extra = control_mode_arg
+        else:
+            extra = control_mode_arg + extra
+
         configs.append(
             ExperimentConfig(
                 script=script,
