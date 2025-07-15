@@ -113,7 +113,7 @@ class Args:
 
     # Expert+Residual parameters (optional)
     expert_type: str = "none"
-    """type of expert policy: 'none' (regular PPO), 'zero', 'ik', 'model'"""
+    """type of expert policy: 'none' (regular PPO), 'zero', 'ik', 'model', 'act', 'dummy_act'"""
     residual_scale: float = 1.0
     """scale factor for residual actions"""
     expert_action_noise: float = 0.0
@@ -124,6 +124,20 @@ class Args:
     """proportional gain for IK expert policy"""
     model_path: Optional[str] = None
     """path to pre-trained model for model expert policy"""
+
+    # ACT expert parameters
+    config_path: Optional[str] = None
+    """path to ACT model configuration file"""
+    checkpoint_path: Optional[str] = None
+    """path to ACT model checkpoint file"""
+    output_format: str = "absolute_joints"
+    """ACT output format: 'absolute_joints', 'absolute_ee_pos', 'absolute_ee_pose', 'joint_deltas', 'ee_pos_deltas', 'ee_pose_deltas'"""
+    action_offset: int = 0
+    """offset for selecting action from ACT action chunk"""
+    action_clamp: float = 0.5
+    """clamp range for ACT actions"""
+    act_output_dim: int = 14
+    """dimension of ACT model output (for dummy_act)"""
 
     # to be filled in runtime
     batch_size: int = 0

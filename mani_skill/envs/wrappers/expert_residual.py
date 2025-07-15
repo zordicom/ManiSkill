@@ -17,152 +17,6 @@ from gymnasium import spaces
 from mani_skill.utils import common
 
 
-def create_zero_expert_policy(action_dim: int) -> callable:
-    """
-    Create zero expert policy (no expert knowledge).
-
-    Args:
-        action_dim: Action space dimension
-
-    Returns:
-        Expert policy function that returns torch.Tensor
-    """
-
-    def zero_expert_policy(obs: torch.Tensor) -> torch.Tensor:
-        """Zero expert policy that returns zero actions and is never trainable."""
-        with torch.no_grad():
-            if obs.dim() == 1:
-                return torch.zeros(action_dim, device=obs.device, dtype=torch.float32)
-            else:
-                batch_size = obs.shape[0]
-                return torch.zeros(
-                    batch_size, action_dim, device=obs.device, dtype=torch.float32
-                )
-
-    return zero_expert_policy
-
-
-def create_ik_expert_policy(action_dim: int, gain: float = 2.0) -> callable:
-    """
-    Create IK-style expert policy for manipulation environments.
-
-    This expert policy extracts target position from observation and uses
-    proportional control to move the end-effector towards the target.
-
-    Args:
-        action_dim: Action space dimension
-        gain: Proportional control gain
-
-    Returns:
-        Expert policy function that returns torch.Tensor
-    """
-
-    def ik_expert_policy(obs: torch.Tensor) -> torch.Tensor:
-        """IK-style expert policy for manipulation environments."""
-        # Handle both single and batched observations
-        if obs.dim() == 1:
-            batch_size = 1
-            obs_batch = obs.unsqueeze(0)
-        else:
-            batch_size = obs.shape[0]
-            obs_batch = obs
-
-        # Extract relevant information from observation
-        # This is a simplified IK policy - in practice you'd want to extract
-        # actual TCP and target positions from the observation
-
-        # For demonstration, we'll use a simple proportional controller
-        # that moves towards the first 3 elements of the observation
-        if obs_batch.shape[1] >= 6:
-            # Assume first 3 elements are current position, next 3 are target
-            current_pos = obs_batch[:, :3]
-            target_pos = obs_batch[:, 3:6]
-
-            # Compute proportional control action
-            position_error = target_pos - current_pos
-            action = torch.clamp(position_error * gain, -1.0, 1.0)
-
-            # Pad to full action space
-            if action.shape[1] < action_dim:
-                padding = torch.zeros(
-                    batch_size, action_dim - action.shape[1], device=obs.device
-                )
-                action = torch.cat([action, padding], dim=1)
-        else:
-            # Fallback to zero action if observation is too small
-            action = torch.zeros(batch_size, action_dim, device=obs.device)
-
-        # Handle single environment case
-        if obs.dim() == 1:
-            action = action.squeeze(0)
-
-        return action.float()
-
-    return ik_expert_policy
-
-
-def create_model_expert_policy(
-    model_path: str, action_dim: int, device: str = "cuda"
-) -> callable:
-    """
-    Create expert policy from pre-trained model.
-
-    Args:
-        model_path: Path to pre-trained model
-        action_dim: Action space dimension
-        device: Device to run model on
-
-    Returns:
-        Expert policy function that returns torch.Tensor
-    """
-    # This would load a pre-trained model
-    # Implementation depends on your model format
-
-    def model_expert_policy(obs: torch.Tensor) -> torch.Tensor:
-        """Expert policy from pre-trained model."""
-        # Ensure we return tensor on same device as input
-        device = obs.device
-
-        # Load model and get action
-        # This is a placeholder implementation
-        if obs.dim() == 1:
-            return torch.zeros(action_dim, device=device, dtype=torch.float32)
-        else:
-            batch_size = obs.shape[0]
-            return torch.zeros(
-                batch_size, action_dim, device=device, dtype=torch.float32
-            )
-
-    return model_expert_policy
-
-
-def create_expert_policy(expert_type: str, action_dim: int, **kwargs) -> callable:
-    """
-    Create expert policy based on type.
-
-    Args:
-        expert_type: Type of expert policy ('zero', 'ik', 'model')
-        action_dim: Action space dimension
-        **kwargs: Additional arguments for specific expert types
-
-    Returns:
-        Expert policy function
-    """
-    if expert_type == "zero":
-        return create_zero_expert_policy(action_dim)
-    elif expert_type == "ik":
-        gain = kwargs.get("gain", 2.0)
-        return create_ik_expert_policy(action_dim, gain=gain)
-    elif expert_type == "model":
-        model_path = kwargs.get("model_path", "dummy_path")
-        device = kwargs.get("device", "cuda")
-        return create_model_expert_policy(model_path, action_dim, device=device)
-    else:
-        raise ValueError(
-            f"Unknown expert type: {expert_type}. Available: 'zero', 'ik', 'model'"
-        )
-
-
 class ExpertResidualWrapper(gym.Wrapper):
     """
     ManiSkill wrapper for expert+residual action decomposition.
@@ -218,12 +72,13 @@ class ExpertResidualWrapper(gym.Wrapper):
         env_id: str,
         expert_policy_fn: Callable[[torch.Tensor], torch.Tensor],
         num_envs: int = 1,
-        residual_scale: float = 1.0,
+        residual_scale: float = 0.05,
         clip_final_action: bool = True,
         expert_action_noise: float = 0.0,
         log_actions: bool = False,
         track_action_stats: bool = False,
         device: str = "cuda",
+        control_mode: str = "pd_joint_delta_pos",
         **env_kwargs,
     ):
         """
@@ -240,10 +95,29 @@ class ExpertResidualWrapper(gym.Wrapper):
             log_actions: Whether to log action decomposition for debugging
             track_action_stats: Whether to track expert/residual action statistics for monitoring
             device: Device to place environments on
+            control_mode: Control mode for the environment.
+                IMPORTANT: Use "pd_ee_delta_pos" for IK expert policies.
             **env_kwargs: Additional environment creation arguments
         """
+        # Initialize logger first
+        self.logger = logging.getLogger(__name__)
+
+        # Set control mode in env_kwargs
+        env_kwargs["control_mode"] = control_mode
+
         # Let ManiSkill handle vectorization efficiently
         env = gym.make(env_id, num_envs=num_envs, **env_kwargs)
+
+        # Apply FlattenRGBDObservationWrapper only if environment has RGB observations
+        if self._has_rgb_observations(env):
+            from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
+
+            # Apply flattening wrapper to get consistent observation format
+            env = FlattenRGBDObservationWrapper(env, rgb=True, depth=False, state=True)
+            self._expects_flattened_obs = True
+        else:
+            self._expects_flattened_obs = False
+
         super().__init__(env)
 
         # Use environment's device if available, otherwise use specified device
@@ -260,18 +134,62 @@ class ExpertResidualWrapper(gym.Wrapper):
         self.expert_action_noise = expert_action_noise
         self.log_actions = log_actions
         self.track_action_stats = track_action_stats
-
-        self.logger = logging.getLogger(__name__)
+        self.control_mode = control_mode
 
         # Set up wrapper
         self._setup_wrapper()
 
-        self.logger.info("✅ Expert+Residual wrapper initialized:")
-        self.logger.info(f"   Environment: {env_id}")
-        self.logger.info(f"   Parallel environments: {self.num_envs}")
-        self.logger.info(f"   Residual scale: {self.residual_scale}")
-        self.logger.info(f"   Track action stats: {self.track_action_stats}")
-        self.logger.info(f"   Device: {self.device}")
+    def _has_rgb_observations(self, env) -> bool:
+        """Check if environment has RGB observations that need flattening."""
+        if not hasattr(env, "observation_space"):
+            return False
+
+        obs_space = env.observation_space
+
+        # Check if it's a Dict observation space (potential RGB environment)
+        if not isinstance(obs_space, spaces.Dict):
+            return False
+
+        # Check if it has sensor_data with RGB cameras
+        if "sensor_data" in obs_space.spaces:
+            sensor_data_space = obs_space.spaces["sensor_data"]
+            if isinstance(sensor_data_space, spaces.Dict):
+                # Look for RGB cameras in sensor_data
+                for camera_name, camera_space in sensor_data_space.spaces.items():
+                    if (
+                        isinstance(camera_space, spaces.Dict)
+                        and "rgb" in camera_space.spaces
+                    ):
+                        return True
+        return False
+
+    def _calculate_rgb_channels(self) -> int:
+        """Calculate the number of RGB channels that will be provided by FlattenRGBDObservationWrapper."""
+        total_channels = 0
+        if hasattr(self, "env") and hasattr(self.env, "observation_space"):  # noqa: PLR1702
+            obs_space = self.env.observation_space
+            if isinstance(obs_space, spaces.Dict) and "sensor_data" in obs_space.spaces:
+                sensor_data_space = obs_space.spaces["sensor_data"]
+                if isinstance(sensor_data_space, spaces.Dict):
+                    for camera_name, camera_space in sensor_data_space.spaces.items():
+                        if (
+                            isinstance(camera_space, spaces.Dict)
+                            and "rgb" in camera_space.spaces
+                        ):
+                            rgb_space = camera_space.spaces["rgb"]
+                            if len(rgb_space.shape) >= 3:
+                                _, _, c = rgb_space.shape[-3:]
+                                total_channels += c
+
+            # Also check if env has 'rgb' key directly (from FlattenRGBDObservationWrapper)
+            if isinstance(obs_space, spaces.Dict) and "rgb" in obs_space.spaces:
+                rgb_space = obs_space.spaces["rgb"]
+                if len(rgb_space.shape) >= 3:
+                    _, _, c = rgb_space.shape[-3:]
+                    total_channels = c  # Use the flattened RGB channels
+
+        result = total_channels if total_channels > 0 else 3
+        return result
 
     def _setup_wrapper(self):
         """Set up wrapper for any number of environments."""
@@ -409,10 +327,27 @@ class ExpertResidualWrapper(gym.Wrapper):
         new_spaces = {}
 
         # Keep RGB space in image format (concatenate cameras along channel dimension)
-        if "sensor_data" in self.base_observation_space.spaces:
-            total_channels = 0
-            image_height = None
-            image_width = None
+        total_channels = 0
+        image_height = None
+        image_width = None
+
+        # Check if RGB is already in the base observation space (from FlattenRGBDObservationWrapper)
+        if "rgb" in self.base_observation_space.spaces:  # noqa: PLR1702
+            rgb_space = self.base_observation_space.spaces["rgb"]
+            if len(rgb_space.shape) >= 3:
+                # RGB space should be (H, W, C) or (batch, H, W, C)
+                if len(rgb_space.shape) == 4:
+                    # Batched: (batch, H, W, C)
+                    _, h, w, c = rgb_space.shape
+                else:
+                    # Single: (H, W, C)
+                    h, w, c = rgb_space.shape
+                total_channels = c
+                image_height = h
+                image_width = w
+
+        # If not found in base observation space, check sensor_data (original environment)
+        elif "sensor_data" in self.base_observation_space.spaces:
             sensor_data_space = self.base_observation_space.spaces["sensor_data"]
 
             if isinstance(sensor_data_space, spaces.Dict):
@@ -430,53 +365,89 @@ class ExpertResidualWrapper(gym.Wrapper):
                                 image_height = h
                                 image_width = w
 
-            if total_channels > 0 and image_height is not None:
-                new_spaces["rgb"] = spaces.Box(
-                    low=0,
-                    high=255,
-                    shape=(image_height, image_width, total_channels),
-                    dtype=np.uint8,
-                )
+        # For expert residual wrapper, always include RGB space to maintain consistency
+        # with PPO RGB mode expectations (even if creating dummy RGB observations)
+
+        if total_channels > 0 and image_height is not None:
+            new_spaces["rgb"] = spaces.Box(
+                low=0,
+                high=255,
+                shape=(image_height, image_width, total_channels),
+                dtype=np.uint8,
+            )
+        else:
+            # Create a default RGB space for dummy observations
+            # Check if the environment has RGB observations that we need to account for
+            rgb_channels = 3  # Default to 3 channels
+            if hasattr(self, "env") and self._has_rgb_observations(self.env):
+                # If environment has RGB observations, calculate the actual number of channels
+                # that will be provided by FlattenRGBDObservationWrapper
+                rgb_channels = self._calculate_rgb_channels()
+
+            new_spaces["rgb"] = spaces.Box(
+                low=0,
+                high=255,
+                shape=(224, 224, rgb_channels),
+                dtype=np.uint8,
+            )
 
         # Calculate flattened state space (including expert_action)
-        total_state_dim = action_dim  # Start with expert_action dimension
+        # If the environment is already wrapped with FlattenRGBDObservationWrapper,
+        # use the existing state dimensions + expert_action dimensions
+        if "state" in self.base_observation_space.spaces:  # noqa: PLR1702
+            base_state_space = self.base_observation_space.spaces["state"]
 
-        # Add agent components (qpos, qvel, etc.)
-        if "agent" in self.base_observation_space.spaces:
-            agent_space = self.base_observation_space.spaces["agent"]
-            if isinstance(agent_space, spaces.Dict):
-                for key, space in agent_space.spaces.items():
-                    if isinstance(space, spaces.Box):
-                        if len(space.shape) > 1:
-                            # Remove batch dimension: (num_envs, ...) -> (...)
-                            per_env_shape = space.shape[1:]
-                            total_state_dim += int(np.prod(per_env_shape))
-                        else:
-                            # Single dimension per environment
-                            total_state_dim += 1
+            # Get the per-environment state dimensions
+            if len(base_state_space.shape) > 1:
+                # Remove batch dimension: (num_envs, ...) -> (...)
+                per_env_state_dims = int(np.prod(base_state_space.shape[1:]))
+            else:
+                # Single environment: (state_dim,)
+                per_env_state_dims = int(np.prod(base_state_space.shape))
 
-        if "extra" in self.base_observation_space.spaces:
-            extra_space = self.base_observation_space.spaces["extra"]
-            if isinstance(extra_space, spaces.Box):
-                # Add flattened state dimensions (per-environment)
-                if len(extra_space.shape) > 1:
-                    # Remove batch dimension: (num_envs, ...) -> (...)
-                    per_env_shape = extra_space.shape[1:]
-                    total_state_dim += int(np.prod(per_env_shape))
-                else:
-                    # Single dimension per environment
-                    total_state_dim += 1
-            elif isinstance(extra_space, spaces.Dict):
-                # Add all state components (per-environment)
-                for key, space in extra_space.spaces.items():
-                    if isinstance(space, spaces.Box):
-                        if len(space.shape) > 1:
-                            # Remove batch dimension: (num_envs, ...) -> (...)
-                            per_env_shape = space.shape[1:]
-                            total_state_dim += int(np.prod(per_env_shape))
-                        else:
-                            # Single dimension per environment
-                            total_state_dim += 1
+            # Add expert action dimensions
+            total_state_dim = per_env_state_dims + action_dim
+
+        else:
+            # If no state space exists, calculate from agent/extra components
+            total_state_dim = action_dim  # Start with expert_action dimension
+
+            # Add agent components (qpos, qvel, etc.)
+            if "agent" in self.base_observation_space.spaces:
+                agent_space = self.base_observation_space.spaces["agent"]
+                if isinstance(agent_space, spaces.Dict):
+                    for key, space in agent_space.spaces.items():
+                        if isinstance(space, spaces.Box):
+                            if len(space.shape) > 1:
+                                # Remove batch dimension: (num_envs, ...) -> (...)
+                                per_env_shape = space.shape[1:]
+                                total_state_dim += int(np.prod(per_env_shape))
+                            else:
+                                # Single dimension per environment
+                                total_state_dim += 1
+
+            if "extra" in self.base_observation_space.spaces:
+                extra_space = self.base_observation_space.spaces["extra"]
+                if isinstance(extra_space, spaces.Box):
+                    # Add flattened state dimensions (per-environment)
+                    if len(extra_space.shape) > 1:
+                        # Remove batch dimension: (num_envs, ...) -> (...)
+                        per_env_shape = extra_space.shape[1:]
+                        total_state_dim += int(np.prod(per_env_shape))
+                    else:
+                        # Single dimension per environment
+                        total_state_dim += 1
+                elif isinstance(extra_space, spaces.Dict):
+                    # Add all state components (per-environment)
+                    for key, space in extra_space.spaces.items():
+                        if isinstance(space, spaces.Box):
+                            if len(space.shape) > 1:
+                                # Remove batch dimension: (num_envs, ...) -> (...)
+                                per_env_shape = space.shape[1:]
+                                total_state_dim += int(np.prod(per_env_shape))
+                            else:
+                                # Single dimension per environment
+                                total_state_dim += 1
 
         if total_state_dim > 0:
             new_spaces["state"] = spaces.Box(
@@ -565,20 +536,27 @@ class ExpertResidualWrapper(gym.Wrapper):
 
         # Clip final action if requested
         if self.clip_final_action:
-            final_action = torch.clamp(
-                final_action, self._action_low, self._action_high
-            )
+            # Handle dimension mismatch between final action and action bounds
+            if final_action.dim() == 1:
+                # Single environment case
+                action_low = self._action_low[: final_action.shape[0]]
+                action_high = self._action_high[: final_action.shape[0]]
+                final_action = torch.clamp(final_action, action_low, action_high)
+            else:
+                # Batch case - apply bounds to each environment
+                action_low = self._action_low[: final_action.shape[1]]
+                action_high = self._action_high[: final_action.shape[1]]
+                final_action = torch.clamp(final_action, action_low, action_high)
 
         # Update statistics if tracking is enabled
         if self.track_action_stats:
             self._update_action_stats(expert_action, scaled_residual)
 
         # Log action decomposition if requested
-        if self.log_actions and self.step_count % 100 == 0:
-            self.logger.debug(f"Action decomposition (step {self.step_count}):")
-            self.logger.debug(f"  Expert:   {expert_action}")
-            self.logger.debug(f"  Residual: {scaled_residual}")
-            self.logger.debug(f"  Final:    {final_action}")
+        self.logger.info(f"Action decomposition (step {self.step_count}):")
+        self.logger.info(f"  Expert:   {expert_action}")
+        self.logger.info(f"  Residual: {scaled_residual}")
+        self.logger.info(f"  Final:    {final_action}")
 
         # Take environment step
         next_base_obs, reward, terminated, truncated, info = self.env.step(final_action)
@@ -603,61 +581,60 @@ class ExpertResidualWrapper(gym.Wrapper):
 
     def _get_expert_action(self, obs: torch.Tensor) -> torch.Tensor:
         """Get expert action for given observation."""
-        try:
-            # Handle different observation types
-            if isinstance(obs, dict):
-                # For Dict observations, try to flatten first
-                # Expert policies typically expect flattened state
-                obs_input = self._flatten_dict_obs(obs)
-            else:
-                obs_input = common.to_tensor(obs, device=self.device)
-
-            expert_action = self.expert_policy_fn(obs_input)
-
-            # Expert policy should return torch.Tensor - validate this expectation
-            if not isinstance(expert_action, torch.Tensor):
-                raise TypeError(
-                    f"Expert policy must return torch.Tensor, got {type(expert_action)}. "
-                    f"Expert policies should be designed to work with torch tensors directly."
-                )
-
-            # Ensure expert action is on the correct device
-            expert_action = expert_action.to(self.device)
-
-            # Add noise if specified
-            if self.expert_action_noise > 0:
-                noise = torch.randn_like(expert_action) * self.expert_action_noise
-                expert_action = expert_action + noise
-
-            # Ensure expert action is within bounds
-            expert_action = torch.clamp(
-                expert_action, self._action_low, self._action_high
+        # Handle different observation types
+        if isinstance(obs, dict):
+            # Check if this is an ACT expert policy by looking at the function name
+            expert_func_name = getattr(self.expert_policy_fn, "__name__", "unknown")
+            is_act_expert = (
+                isinstance(expert_func_name, str) and "act_expert" in expert_func_name
             )
 
-            return expert_action.float()
-
-        except Exception as e:
-            self.logger.error(f"Expert policy failed: {e}")
-            if isinstance(obs, dict):
-                self.logger.error(f"Dict observation keys: {list(obs.keys())}")
-                for key, value in obs.items():
-                    if hasattr(value, "shape"):
-                        self.logger.error(f"  {key} shape: {value.shape}")
+            if is_act_expert:
+                # For ACT expert policies, pass dict observations directly
+                # ACT expert policies can handle both flattened and raw observations
+                obs_input = obs
+            elif self._expects_flattened_obs:
+                # For other expert policies with flattened observations, flatten the dict
+                obs_input = self._flatten_dict_obs(obs)
             else:
-                self.logger.error(f"Observation shape: {obs.shape}")
-                self.logger.error(f"Observation device: {obs.device}")
-                if hasattr(obs, "min") and hasattr(obs, "max"):
-                    self.logger.error(
-                        f"Observation range: [{obs.min():.3f}, {obs.max():.3f}]"
-                    )
+                # For other expert policies with raw dict observations
+                # This shouldn't happen with current setup, but handle it
+                obs_input = self._flatten_dict_obs(obs)
+        else:
+            # Box observations (state-only environments)
+            obs_input = common.to_tensor(obs, device=self.device)
 
-            # Raise error instead of falling back to zero action
-            raise RuntimeError(
-                f"Expert policy failed and no fallback is available. "
-                f"Original error: {e}. "
-                f"Please check that your expert policy function is correctly implemented "
-                f"and can handle observations of the given type and shape."
-            ) from e
+        expert_action = self.expert_policy_fn(obs_input)
+
+        # Expert policy should return torch.Tensor - validate this expectation
+        if not isinstance(expert_action, torch.Tensor):
+            raise TypeError(
+                f"Expert policy must return torch.Tensor, got {type(expert_action)}. "
+                f"Expert policies should be designed to work with torch tensors directly."
+            )
+
+        # Ensure expert action is on the correct device
+        expert_action = expert_action.to(self.device)
+
+        # Add noise if specified
+        if self.expert_action_noise > 0:
+            noise = torch.randn_like(expert_action) * self.expert_action_noise
+            expert_action = expert_action + noise
+
+        # Ensure expert action is within bounds
+        # Handle dimension mismatch between expert action and action bounds
+        if expert_action.dim() == 1:
+            # Single environment case
+            action_low = self._action_low[: expert_action.shape[0]]
+            action_high = self._action_high[: expert_action.shape[0]]
+            expert_action = torch.clamp(expert_action, action_low, action_high)
+        else:
+            # Batch case - apply bounds to each environment
+            action_low = self._action_low[: expert_action.shape[1]]
+            action_high = self._action_high[: expert_action.shape[1]]
+            expert_action = torch.clamp(expert_action, action_low, action_high)
+
+        return expert_action.float()
 
     def _flatten_dict_obs(self, obs_dict: dict) -> torch.Tensor:
         """Flatten dictionary observations into a single tensor (for expert policy input)."""
@@ -718,8 +695,16 @@ class ExpertResidualWrapper(gym.Wrapper):
             # Handle Box observation space (state observations)
             return self._create_extended_box_obs(base_obs, expert_action)
         elif isinstance(self.base_observation_space, spaces.Dict):
-            # Handle Dict observation space (RGB/visual observations)
-            return self._create_extended_dict_obs(base_obs, expert_action)
+            # Handle Dict observation space
+            if self._expects_flattened_obs:
+                # RGB observations that have been flattened
+                return self._create_extended_dict_obs(base_obs, expert_action)
+            else:
+                # Raw dict observations - shouldn't happen with current setup
+                raise ValueError(
+                    "Raw dict observations not supported. "
+                    "ExpertResidualWrapper expected flattened observations."
+                )
         else:
             raise ValueError(
                 f"Unsupported observation space type: {type(self.base_observation_space)}"
@@ -757,120 +742,78 @@ class ExpertResidualWrapper(gym.Wrapper):
     def _create_extended_dict_obs(
         self, base_obs: dict, expert_action: torch.Tensor
     ) -> dict:
-        """Create extended observation for Dict observation spaces with flattened structure."""
-        # Create flattened observation structure compatible with FlattenRGBDObservationWrapper
-        # Keep RGB in image format, flatten only state+expert_action
-        flattened_obs = {}
+        """Create extended observation for Dict observation spaces with flattened structure.
 
-        # Find the correct batch size by looking at actual observation tensors
-        batch_size = 1
-        if "sensor_data" in base_obs:
-            for camera_name, camera_data in base_obs["sensor_data"].items():
-                if "rgb" in camera_data:
-                    rgb_data = camera_data["rgb"]
-                    if rgb_data.dim() >= 1:
-                        batch_size = rgb_data.shape[0]
-                        break
-        elif "extra" in base_obs:
-            extra_obs = base_obs["extra"]
-            if isinstance(extra_obs, dict):
-                for key, value in extra_obs.items():
-                    if isinstance(value, torch.Tensor) and value.dim() >= 1:
-                        batch_size = value.shape[0]
-                        break
-            elif isinstance(extra_obs, torch.Tensor) and extra_obs.dim() >= 1:
-                batch_size = extra_obs.shape[0]
+        Expects base_obs to be in FlattenRGBDObservationWrapper format:
+        - base_obs["state"]: Flattened state tensor
+        - base_obs["rgb"]: RGB image tensor
+        """
+        # Expect FlattenRGBDObservationWrapper format
+        if "state" not in base_obs:
+            raise ValueError(
+                "ExpertResidualWrapper expects FlattenRGBDObservationWrapper to be applied first. "
+                "Expected 'state' key in base_obs, but got keys: "
+                + str(list(base_obs.keys()))
+            )
 
-        # Ensure expert action matches the batch size
-        if expert_action.dim() == 1:
-            # Single action for all envs, expand to [batch_size, action_dim]
-            if batch_size > 1:
-                expert_action = expert_action.unsqueeze(0).expand(batch_size, -1)
-            else:
-                expert_action = expert_action.unsqueeze(0)
-        elif expert_action.shape[0] != batch_size:
-            # Batch size mismatch, this shouldn't happen but let's handle it
-            if expert_action.shape[0] == 1 and batch_size > 1:
-                # Expand single action to match batch size
-                expert_action = expert_action.expand(batch_size, -1)
+        extended_obs = {}
 
-        # Keep RGB observations in image format (concatenate cameras if multiple)
-        if "sensor_data" in base_obs:
-            rgb_tensors = []
-            for camera_name, camera_data in base_obs["sensor_data"].items():
-                if "rgb" in camera_data:
-                    rgb_data = camera_data["rgb"]
-                    rgb_tensors.append(rgb_data)
-
-            if len(rgb_tensors) == 1:
-                # Single camera - keep original format
-                flattened_obs["rgb"] = rgb_tensors[0]
-            elif len(rgb_tensors) > 1:
-                # Multiple cameras - concatenate along channel dimension
-                # Assuming RGB data is (B, H, W, C), concatenate along C
-                flattened_obs["rgb"] = torch.cat(rgb_tensors, dim=-1)
-
-        # Flatten state observations from "agent" and "extra" and concatenate with expert_action
-        state_tensors = []
-
-        # Add agent components (qpos, qvel, etc.)
-        if "agent" in base_obs:
-            agent_obs = base_obs["agent"]
-            if isinstance(agent_obs, dict):
-                # Process agent components in sorted order for consistency
-                for key in sorted(agent_obs.keys()):
-                    value = agent_obs[key]
-                    if isinstance(value, torch.Tensor):
-                        # Convert to float32 to handle any dtype issues
-                        value = value.float()
-                        if value.dim() > 1:
-                            state_tensors.append(value.flatten(start_dim=1))
-                        else:
-                            state_tensors.append(
-                                value.unsqueeze(1) if value.dim() == 1 else value
-                            )
-            elif isinstance(agent_obs, torch.Tensor):
-                # Direct tensor - convert to float32 first
-                agent_obs = agent_obs.float()
-                if agent_obs.dim() > 1:
-                    state_tensors.append(agent_obs.flatten(start_dim=1))
-                else:
-                    state_tensors.append(agent_obs.unsqueeze(1))
-
-        if "extra" in base_obs:
-            extra_obs = base_obs["extra"]
-            if isinstance(extra_obs, dict):
-                # Flatten all state data from extra
-                for key in sorted(extra_obs.keys()):
-                    value = extra_obs[key]
-                    if isinstance(value, torch.Tensor):
-                        # Convert to float32 to handle boolean and other dtypes
-                        value = value.float()
-                        if value.dim() > 1:
-                            state_tensors.append(value.flatten(start_dim=1))
-                        else:
-                            state_tensors.append(
-                                value.unsqueeze(1) if value.dim() == 1 else value
-                            )
-            elif isinstance(extra_obs, torch.Tensor):
-                # Direct tensor - convert to float32 first
-                extra_obs = extra_obs.float()
-                if extra_obs.dim() > 1:
-                    state_tensors.append(extra_obs.flatten(start_dim=1))
-                else:
-                    state_tensors.append(extra_obs.unsqueeze(1))
-
-        # Add expert_action to state (should now have correct batch size)
-        if expert_action.dim() == 1:
-            state_tensors.append(expert_action.unsqueeze(1))
+        # Handle RGB observations for PPO RGB mode
+        if "rgb" in base_obs:
+            extended_obs["rgb"] = base_obs["rgb"]
         else:
-            state_tensors.append(expert_action)
+            # For ACT expert policy, RGB data is required
+            if self.expert_type == "act":
+                raise ValueError(
+                    "ACT expert policy requires RGB data but none found in environment observation. "
+                    "Make sure the environment is configured with RGB cameras and FlattenRGBDObservationWrapper is applied."
+                )
 
-        # Concatenate all state data including expert_action
-        if state_tensors:
-            flattened_obs["state"] = torch.cat(state_tensors, dim=-1)
+            # For other expert types in PPO RGB mode, create dummy RGB observation
+            # This ensures consistency with PPO RGB mode expectations
+            batch_size = 1
+            if "state" in base_obs:
+                state_tensor = base_obs["state"]
+                if isinstance(state_tensor, torch.Tensor) and state_tensor.dim() > 1:
+                    batch_size = state_tensor.shape[0]
 
-        return flattened_obs
+            # Create a dummy RGB tensor (batch_size, H, W, C)
+            dummy_rgb = torch.full(
+                (batch_size, 224, 224, 3), 128, dtype=torch.uint8, device=self.device
+            )
+            extended_obs["rgb"] = dummy_rgb
+
+        # Extend state with expert action
+        base_state = base_obs["state"]
+        if isinstance(base_state, torch.Tensor):
+            base_state = base_state.float()
+        else:
+            base_state = torch.tensor(
+                base_state, dtype=torch.float32, device=self.device
+            )
+
+        # Ensure expert action matches batch size
+        if base_state.dim() == 1:
+            # Single environment
+            if expert_action.dim() == 1:
+                extended_state = torch.cat([base_state, expert_action], dim=-1)
+            else:
+                extended_state = torch.cat(
+                    [base_state, expert_action.squeeze(0)], dim=-1
+                )
+        else:
+            # Batch environment
+            batch_size = base_state.shape[0]
+            if expert_action.dim() == 1:
+                expert_action = expert_action.unsqueeze(0).expand(batch_size, -1)
+            elif expert_action.shape[0] != batch_size:
+                if expert_action.shape[0] == 1:
+                    expert_action = expert_action.expand(batch_size, -1)
+            extended_state = torch.cat([base_state, expert_action], dim=-1)
+
+        extended_obs["state"] = extended_state
+
+        return extended_obs
 
     def _update_action_stats(
         self, expert_action: torch.Tensor, residual_action: torch.Tensor
