@@ -1,7 +1,7 @@
 """
 Copyright 2025 Zordi, Inc. All rights reserved.
 
-Simplified multimodal encoders for SAC with DINOv2 vision backbone.
+Simplified multimodal encoders for SAC with MobileNet v3 small vision backbone.
 """
 
 from typing import Optional
@@ -9,7 +9,7 @@ from typing import Optional
 import torch
 from torch import nn
 from torchvision import models
-from transformers.models.dinov2.modeling_dinov2 import Dinov2Model
+from torchvision.models import MobileNet_V3_Small_Weights
 
 
 def _init_weights(module: nn.Module) -> None:
@@ -23,59 +23,82 @@ def _init_weights(module: nn.Module) -> None:
             nn.init.constant_(module.bias, 0.0)
 
 
-class DINOv2Encoder(nn.Module):
-    """Simplified DINOv2 encoder that outputs spatial features."""
+class MobileNetV3SmallEncoder(nn.Module):
+    """MobileNet v3 small encoder with pre-trained weights."""
 
     def __init__(self, in_channels: int = 3, output_dim: int = 256):
         super().__init__()
+        self.out_dim = output_dim  # Store output dimension for compatibility
 
-        # Load frozen DINOv2-small model
-        self.model = Dinov2Model.from_pretrained("facebook/dinov2-small")
+        # Load pre-trained MobileNet v3 small
+        self.mobilenet = models.mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
 
-        # Adjust input channels if needed
-        orig_patch_proj = self.model.embeddings.patch_embeddings.projection
-        if in_channels != orig_patch_proj.in_channels:
-            new_patch_proj = nn.Conv2d(
-                in_channels,
-                orig_patch_proj.out_channels,
-                kernel_size=orig_patch_proj.kernel_size,
-                stride=orig_patch_proj.stride,
-                padding=orig_patch_proj.padding,
-                bias=(orig_patch_proj.bias is not None),
-            )
-            with torch.no_grad():
-                new_patch_proj.weight[:, : orig_patch_proj.in_channels] = orig_patch_proj.weight
-                if new_patch_proj.bias is not None and orig_patch_proj.bias is not None:
-                    new_patch_proj.bias.data = orig_patch_proj.bias.data.clone()
-                if in_channels > orig_patch_proj.in_channels:
-                    mean_rgb_weights = orig_patch_proj.weight.mean(dim=1, keepdim=True)
-                    num_new_channels = in_channels - orig_patch_proj.in_channels
-                    new_channel_weights = mean_rgb_weights.repeat(1, num_new_channels, 1, 1)
-                    new_patch_proj.weight[:, orig_patch_proj.in_channels :] = new_channel_weights
-            self.model.embeddings.patch_embeddings.projection = new_patch_proj
+        # Adjust first layer if needed for different input channels
+        if in_channels != 3:
+            # The first layer is Conv2dNormActivation which contains [Conv2d, BatchNorm, Activation]
+            first_block = self.mobilenet.features[0]  # Conv2dNormActivation
+            orig_conv = first_block[0]  # First Conv2d in the block
 
-        # Freeze the model
-        self.model.eval()
-        for param in self.model.parameters():
-            param.requires_grad = False
+            # Type check to ensure we have a Conv2d layer
+            if isinstance(orig_conv, nn.Conv2d):
+                k_tuple = orig_conv.kernel_size
+                k_h, k_w = int(k_tuple[0]), int(k_tuple[1])
+                if isinstance(orig_conv.stride, tuple):
+                    s_tuple = orig_conv.stride
+                    stride = (int(s_tuple[0]), int(s_tuple[1]))
+                else:
+                    stride = int(orig_conv.stride)
+                if isinstance(orig_conv.padding, str):
+                    padding = orig_conv.padding
+                else:
+                    p_tuple = orig_conv.padding
+                    padding = (int(p_tuple[0]), int(p_tuple[1]))
 
-        # Projection layer to output_dim
-        self.projection = nn.Linear(384, output_dim)  # DINOv2-small has 384 hidden size
+                new_conv = nn.Conv2d(
+                    in_channels,
+                    orig_conv.out_channels,
+                    kernel_size=(k_h, k_w),
+                    stride=stride,
+                    padding=padding,
+                    bias=(orig_conv.bias is not None),
+                )
+
+                # Initialize with pre-trained weights for first 3 channels
+                with torch.no_grad():
+                    if in_channels >= 3:
+                        new_conv.weight[:, :3] = orig_conv.weight
+                        if new_conv.bias is not None and orig_conv.bias is not None:
+                            new_conv.bias.data = orig_conv.bias.data.clone()
+                        if in_channels > 3:
+                            # Initialize extra channels with mean of RGB weights
+                            extra = orig_conv.weight.mean(dim=1, keepdim=True)
+                            new_conv.weight[:, 3:] = extra.repeat(1, in_channels - 3, 1, 1)
+                    else:
+                        # If fewer than 3 channels, use subset of weights
+                        new_conv.weight = orig_conv.weight[:, :in_channels]
+                        if new_conv.bias is not None and orig_conv.bias is not None:
+                            new_conv.bias.data = orig_conv.bias.data.clone()
+
+                first_block[0] = new_conv
+
+        # We'll extract features from the backbone without using the classifier
+        # MobileNet v3 small outputs 576 features from the feature extractor
+
+        # Add custom projection layer
+        # MobileNet v3 small outputs 576 features
+        self.projection = nn.Sequential(nn.Linear(576, 512), nn.ReLU(), nn.Linear(512, output_dim))
+
+        # Apply weight initialization to projection layer
+        self.projection.apply(_init_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass returning spatial features [B, output_dim]."""
-        with torch.no_grad():
-            model_output = self.model(x)
-            feats = model_output.last_hidden_state  # [B, num_tokens, hidden_size]
-
-            # Extract patch tokens (skip CLS token)
-            patch_tokens = feats[:, 1:]  # [B, num_patches, hidden_size]
-
-            # Global average pooling over spatial patches
-            pooled_features = patch_tokens.mean(dim=1)  # [B, hidden_size]
-
-        # Project to desired output dimension
-        return self.projection(pooled_features)
+        """Forward pass returning features [B, output_dim]."""
+        x = x.float() / 255.0  # Normalize to [0, 1]
+        # Extract features without using classifier
+        features = self.mobilenet.features(x)  # [B, 576, H, W]
+        features = self.mobilenet.avgpool(features)  # [B, 576, 1, 1]
+        features = torch.flatten(features, 1)  # [B, 576]
+        return self.projection(features)
 
 
 class EfficientNetB0Encoder(nn.Module):
@@ -83,6 +106,7 @@ class EfficientNetB0Encoder(nn.Module):
 
     def __init__(self, in_channels: int = 3, output_dim: int = 256):
         super().__init__()
+        self.out_dim = output_dim  # Store output dimension for compatibility
 
         # Load pre-trained EfficientNet-B0
         self.efficientnet = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
@@ -91,35 +115,51 @@ class EfficientNetB0Encoder(nn.Module):
         if in_channels != 3:
             # Replace first conv layer
             orig_conv = self.efficientnet.features[0][0]
-            new_conv = nn.Conv2d(
-                in_channels,
-                orig_conv.out_channels,
-                kernel_size=orig_conv.kernel_size,
-                stride=orig_conv.stride,
-                padding=orig_conv.padding,
-                bias=orig_conv.bias is not None,
-            )
 
-            # Initialize with pre-trained weights for first 3 channels
-            with torch.no_grad():
-                if in_channels >= 3:
-                    new_conv.weight[:, :3] = orig_conv.weight
-                    if in_channels > 3:
-                        # Initialize extra channels with mean of RGB weights
-                        mean_weight = orig_conv.weight.mean(dim=1, keepdim=True)
-                        for i in range(3, in_channels):
-                            new_conv.weight[:, i : i + 1] = mean_weight
+            # Type check to ensure we have a Conv2d layer
+            if isinstance(orig_conv, nn.Conv2d):
+                k_tuple = orig_conv.kernel_size
+                k_h, k_w = int(k_tuple[0]), int(k_tuple[1])
+                if isinstance(orig_conv.stride, tuple):
+                    s_tuple = orig_conv.stride
+                    stride = (int(s_tuple[0]), int(s_tuple[1]))
                 else:
-                    # If fewer than 3 channels, use subset of weights
-                    new_conv.weight = orig_conv.weight[:, :in_channels]
+                    stride = int(orig_conv.stride)
+                if isinstance(orig_conv.padding, str):
+                    padding = orig_conv.padding
+                else:
+                    p_tuple = orig_conv.padding
+                    padding = (int(p_tuple[0]), int(p_tuple[1]))
 
-                if new_conv.bias is not None and orig_conv.bias is not None:
-                    new_conv.bias.data = orig_conv.bias.data.clone()
+                new_conv = nn.Conv2d(
+                    in_channels,
+                    orig_conv.out_channels,
+                    kernel_size=(k_h, k_w),
+                    stride=stride,
+                    padding=padding,
+                    bias=orig_conv.bias is not None,
+                )
 
-            self.efficientnet.features[0][0] = new_conv
+                # Initialize with pre-trained weights for first 3 channels
+                with torch.no_grad():
+                    if in_channels >= 3:
+                        new_conv.weight[:, :3] = orig_conv.weight
+                        if in_channels > 3:
+                            # Initialize extra channels with mean of RGB weights
+                            mean_weight = orig_conv.weight.mean(dim=1, keepdim=True)
+                            for i in range(3, in_channels):
+                                new_conv.weight[:, i : i + 1] = mean_weight
+                    else:
+                        # If fewer than 3 channels, use subset of weights
+                        new_conv.weight = orig_conv.weight[:, :in_channels]
 
-        # Remove the classifier head (we'll add our own)
-        self.efficientnet.classifier = nn.Identity()
+                    if new_conv.bias is not None and orig_conv.bias is not None:
+                        new_conv.bias.data = orig_conv.bias.data.clone()
+
+                self.efficientnet.features[0][0] = new_conv
+
+        # We'll extract features from the backbone without using the classifier
+        # EfficientNet-B0 outputs 1280 features from the feature extractor
 
         # Add custom projection layer
         # EfficientNet-B0 outputs 1280 features
@@ -131,7 +171,10 @@ class EfficientNetB0Encoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass returning features [B, output_dim]."""
         x = x.float() / 255.0  # Normalize to [0, 1]
-        features = self.efficientnet(x)  # [B, 1280]
+        # Extract features without using classifier
+        features = self.efficientnet.features(x)  # [B, 1280, H, W]
+        features = self.efficientnet.avgpool(features)  # [B, 1280, 1, 1]
+        features = torch.flatten(features, 1)  # [B, 1280]
         return self.projection(features)
 
 
@@ -140,6 +183,7 @@ class SimpleConvEncoder(nn.Module):
 
     def __init__(self, in_channels: int = 3, output_dim: int = 256, image_size: tuple = (64, 64)):
         super().__init__()
+        self.out_dim = output_dim  # Store output dimension for compatibility
 
         self.cnn = nn.Sequential(
             nn.Conv2d(in_channels, 32, 3, stride=2, padding=1),
@@ -177,7 +221,7 @@ class MultimodalEncoder(nn.Module):
         image_channels: int = 3,
         image_size: tuple = (64, 64),
         output_dim: int = 512,
-        use_dinov2: bool = True,
+        use_mobilenet: bool = True,
         use_efficientnet: bool = False,
         image_encoder: Optional[nn.Module] = None,
         state_encoder_dims: list = [256, 256],
@@ -201,36 +245,51 @@ class MultimodalEncoder(nn.Module):
         self.state_encoder = nn.Sequential(*state_layers)
 
         # Image encoder (optionally shared across networks)
-        image_output_dim = 256  # Both DINOv2Encoder and SimpleConvEncoder output 256-D features
-
-        # Determine number of cameras based on image channels
-        if (use_dinov2 or use_efficientnet) and image_channels % 3 == 0:
-            self.num_cameras = image_channels // 3
-        else:
-            self.num_cameras = 1
+        image_output_dim = 256  # All encoders output 256-D features
 
         if image_encoder is not None:
-            # Reuse the provided encoder to avoid redundant initialisation (e.g. heavy DINOv2 model)
+            # Reuse the provided encoder to avoid redundant initialisation
             self.image_encoder = image_encoder
+
+            # Determine number of cameras based on encoder type and image channels
+            if isinstance(image_encoder, (MobileNetV3SmallEncoder, EfficientNetB0Encoder)):
+                # For pre-trained encoders, check if they expect 3 channels and we have multi-camera
+                if hasattr(image_encoder, "mobilenet") or hasattr(image_encoder, "efficientnet"):
+                    # These encoders process 3 channels at a time
+                    if image_channels % 3 == 0 and image_channels > 3:
+                        self.num_cameras = image_channels // 3
+                    else:
+                        self.num_cameras = 1
+                else:
+                    self.num_cameras = 1
+            else:
+                # For other encoder types, assume single camera
+                self.num_cameras = 1
+
+        elif use_mobilenet:
+            if image_channels % 3 == 0:
+                # Multi-camera setup: split channels and process each camera separately
+                self.num_cameras = image_channels // 3
+                self.image_encoder = MobileNetV3SmallEncoder(3, image_output_dim)  # Process 3 channels at a time
+                print(f"📷 Multi-camera setup detected: {self.num_cameras} cameras, using MobileNet v3 small for each")
+            else:
+                self.num_cameras = 1
+                print(
+                    f"⚠️ Warning: MobileNet v3 small works best with 3 channels, but got {image_channels}. Using anyway."
+                )
+                self.image_encoder = MobileNetV3SmallEncoder(image_channels, image_output_dim)
         elif use_efficientnet:
             if image_channels % 3 == 0:
                 # Multi-camera setup: split channels and process each camera separately
+                self.num_cameras = image_channels // 3
                 self.image_encoder = EfficientNetB0Encoder(3, image_output_dim)  # Process 3 channels at a time
                 print(f"📷 Multi-camera setup detected: {self.num_cameras} cameras, using EfficientNet-B0 for each")
             else:
+                self.num_cameras = 1
                 print(f"⚠️ Warning: EfficientNet-B0 works best with 3 channels, but got {image_channels}. Using anyway.")
                 self.image_encoder = EfficientNetB0Encoder(image_channels, image_output_dim)
-        elif use_dinov2:
-            if image_channels % 3 == 0:
-                # Multi-camera setup: split channels and process each camera separately
-                self.image_encoder = DINOv2Encoder(3, image_output_dim)  # Process 3 channels at a time
-                print(f"📷 Multi-camera setup detected: {self.num_cameras} cameras, using DINOv2 for each")
-            else:
-                print(
-                    f"⚠️ Warning: DINOv2 requires channels divisible by 3, but got {image_channels}. Falling back to SimpleConvEncoder"
-                )
-                self.image_encoder = SimpleConvEncoder(image_channels, image_output_dim, image_size)
         else:
+            self.num_cameras = 1
             self.image_encoder = SimpleConvEncoder(image_channels, image_output_dim, image_size)
 
         # Fusion layer

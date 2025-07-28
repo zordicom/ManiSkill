@@ -21,8 +21,9 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 import tqdm
 import tyro
+from multimodal_encoders import MobileNetV3SmallEncoder
 from torch import nn, optim
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 
 from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper, FlattenRGBDObservationWrapper
@@ -62,8 +63,10 @@ class Args:
     """logging frequency in terms of environment steps"""
 
     # Environment specific arguments
-    env_id: str = "PickBox-v1"
+    env_id: str = "PickCube-v1"
     """the id of the environment"""
+    robot_uids: Optional[str] = None
+    """the robot type to use for the environment"""
     obs_mode: str = "rgb"
     """the observation mode to use"""
     include_state: bool = True
@@ -124,16 +127,18 @@ class Args:
     """automatic tuning of the entropy coefficient"""
     training_freq: int = 64
     """training frequency (in steps)"""
-    utd: float = 2.0
+    utd: float = 0.25
     """update to data ratio"""
-    partial_reset: bool = False
-    """whether to let parallel environments reset upon termination instead of truncation"""
     bootstrap_at_done: str = "always"
     """the bootstrap method to use when a done signal is received. Can be 'always' or 'never'"""
     camera_width: Optional[int] = 112
     """the width of the camera image. If none it will use the default the environment specifies"""
     camera_height: Optional[int] = 112
     """the height of the camera image. If none it will use the default the environment specifies."""
+
+    # Encoder specific arguments
+    use_mobilenet: bool = True
+    """whether to use MobileNet v3 small encoder for images (instead of PlainConv)"""
 
     # to be filled in runtime
     grad_steps_per_iteration: int = 0
@@ -199,8 +204,8 @@ class DictArray(object):
 
 @dataclass
 class ReplayBufferSample:
-    obs: torch.Tensor
-    next_obs: torch.Tensor
+    obs: dict
+    next_obs: dict
     actions: torch.Tensor
     rewards: torch.Tensor
     dones: torch.Tensor
@@ -230,9 +235,7 @@ class ReplayBuffer:
         self.dones = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
         self.values = torch.zeros((self.per_env_buffer_size, num_envs), device=storage_device)
 
-    def add(
-        self, obs: torch.Tensor, next_obs: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, done: torch.Tensor
-    ):
+    def add(self, obs: dict, next_obs: dict, action: torch.Tensor, reward: torch.Tensor, done: torch.Tensor):
         if self.storage_device == torch.device("cpu"):
             obs = {k: v.cpu() for k, v in obs.items()}
             next_obs = {k: v.cpu() for k, v in next_obs.items()}
@@ -347,15 +350,17 @@ class EncoderObsWrapper(nn.Module):
         self.encoder = encoder
 
     def forward(self, obs):
+        rgb, depth = None, None
         if "rgb" in obs:
             rgb = obs["rgb"].float() / 255.0  # (B, H, W, 3*k)
         if "depth" in obs:
             depth = obs["depth"].float()  # (B, H, W, 1*k)
-        if "rgb" and "depth" in obs:
+
+        if rgb is not None and depth is not None:
             img = torch.cat([rgb, depth], dim=3)  # (B, H, W, C)
-        elif "rgb" in obs:
+        elif rgb is not None:
             img = rgb
-        elif "depth" in obs:
+        elif depth is not None:
             img = depth
         else:
             raise ValueError("Observation dict must contain 'rgb' or 'depth'")
@@ -396,12 +401,13 @@ LOG_STD_MIN = -5
 
 
 class Actor(nn.Module):
-    def __init__(self, envs, sample_obs):
+    def __init__(self, envs, sample_obs, use_mobilenet=False):
         super().__init__()
         action_dim = np.prod(envs.single_action_space.shape)
         state_dim = envs.single_observation_space["state"].shape[0]
         # count number of channels and image size
         in_channels = 0
+        image_size = (112, 112)  # default size
         if "rgb" in sample_obs:
             in_channels += sample_obs["rgb"].shape[-1]
             image_size = sample_obs["rgb"].shape[1:3]
@@ -409,9 +415,19 @@ class Actor(nn.Module):
             in_channels += sample_obs["depth"].shape[-1]
             image_size = sample_obs["depth"].shape[1:3]
 
-        self.encoder = EncoderObsWrapper(
-            PlainConv(in_channels=in_channels, out_dim=256, image_size=image_size)  # assume image is 64x64
-        )
+        # Choose encoder based on use_mobilenet flag
+        if use_mobilenet:
+            if in_channels % 3 == 0:
+                # Multi-camera setup: process 3 channels at a time
+                print(f"📷 Multi-camera setup detected: {in_channels // 3} cameras, using MobileNet v3 small")
+                base_encoder = MobileNetV3SmallEncoder(3, 256)
+            else:
+                print(f"⚠️ Warning: MobileNet v3 small works best with 3 channels, but got {in_channels}. Using anyway.")
+                base_encoder = MobileNetV3SmallEncoder(in_channels, 256)
+        else:
+            base_encoder = PlainConv(in_channels=in_channels, out_dim=256, image_size=image_size)
+
+        self.encoder = EncoderObsWrapper(base_encoder)
         self.mlp = make_mlp(self.encoder.encoder.out_dim + state_dim, [512, 256], last_act=True)
         self.fc_mean = nn.Linear(256, action_dim)
         self.fc_logstd = nn.Linear(256, action_dim)
@@ -454,24 +470,28 @@ class Actor(nn.Module):
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean, visual_feature
 
-    def to(self, device):
+    def to(self, device, *args, **kwargs):
         self.action_scale = self.action_scale.to(device)
         self.action_bias = self.action_bias.to(device)
-        return super().to(device)
+        return super().to(device, *args, **kwargs)
 
 
 class Logger:
-    def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
+    def __init__(self, log_wandb=False, tensorboard: Optional[SummaryWriter] = None) -> None:
         self.writer = tensorboard
         self.log_wandb = log_wandb
 
     def add_scalar(self, tag, scalar_value, step):
         if self.log_wandb:
+            import wandb
+
             wandb.log({tag: scalar_value}, step=step)
-        self.writer.add_scalar(tag, scalar_value, step)
+        if self.writer is not None:
+            self.writer.add_scalar(tag, scalar_value, step)
 
     def close(self):
-        self.writer.close()
+        if self.writer is not None:
+            self.writer.close()
 
 
 if __name__ == "__main__":
@@ -493,14 +513,24 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # Environment setup #######
-    env_kwargs = dict(obs_mode=args.obs_mode, render_mode=args.render_mode, sim_backend="gpu", sensor_configs=dict())
+    env_kwargs = dict(
+        obs_mode=args.obs_mode,
+        render_mode=args.render_mode,
+        sim_backend="gpu",
+        sensor_configs=dict(),
+    )
+    if args.robot_uids is not None:
+        env_kwargs["robot_uids"] = args.robot_uids
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
+
+    sensor_configs = {}
     if args.camera_width is not None:
         # this overrides every sensor used for observation generation
-        env_kwargs["sensor_configs"]["width"] = args.camera_width
+        sensor_configs["width"] = args.camera_width
     if args.camera_height is not None:
-        env_kwargs["sensor_configs"]["height"] = args.camera_height
+        sensor_configs["height"] = args.camera_height
+    env_kwargs["sensor_configs"] = sensor_configs
     envs = gym.make(
         args.env_id,
         num_envs=args.num_envs if not args.evaluate else 1,
@@ -609,7 +639,7 @@ if __name__ == "__main__":
     eval_obs, _ = eval_envs.reset(seed=args.seed)
 
     # architecture is all actor, q-networks share the same vision encoder. Output of encoder is concatenates with any state data followed by separate MLPs.
-    actor = Actor(envs, sample_obs=obs).to(device)
+    actor = Actor(envs, sample_obs=obs, use_mobilenet=args.use_mobilenet).to(device)
     qf1 = SoftQNetwork(envs, actor.encoder).to(device)
     qf2 = SoftQNetwork(envs, actor.encoder).to(device)
     qf1_target = SoftQNetwork(envs, actor.encoder).to(device)

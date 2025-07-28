@@ -6,18 +6,18 @@ from dataclasses import dataclass
 from typing import Optional
 
 import gymnasium as gym
-import mani_skill.envs
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 import tqdm
 import tyro
+from torch import nn, optim
+from torch.utils.tensorboard import SummaryWriter
+
 from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
-from torch import nn, optim
-from torch.utils.tensorboard import SummaryWriter
 
 # Expert+Residual wrapper utility
 try:
@@ -109,7 +109,7 @@ class Args:
     policy_frequency: int = 1
     """the frequency of training policy (delayed)"""
     target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
-    """the frequency of updates for the target nerworks"""
+    """the frequency of updates for the target networks"""
     alpha: float = 0.2
     """Entropy regularization coefficient."""
     autotune: bool = True
@@ -134,9 +134,7 @@ class Args:
     """whether to track expert/residual action statistics"""
     ik_gain: float = 2.0
     """proportional gain for IK expert policy"""
-    model_path: Optional[str] = (
-        "/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo__1__1752538773/final_ckpt.pt"
-    )
+    model_path: Optional[str] = "/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo__1__1752538773/final_ckpt.pt"
     """path to pre-trained model for model expert policy"""
 
     # ACT expert parameters
@@ -185,29 +183,19 @@ class ReplayBuffer:
         self.storage_device = storage_device
         self.sample_device = sample_device
         self.per_env_buffer_size = buffer_size // num_envs
-        self.obs = torch.zeros(
-            (self.per_env_buffer_size, self.num_envs)
-            + env.single_observation_space.shape
-        ).to(storage_device)
-        self.next_obs = torch.zeros(
-            (self.per_env_buffer_size, self.num_envs)
-            + env.single_observation_space.shape
-        ).to(storage_device)
-        self.actions = torch.zeros(
-            (self.per_env_buffer_size, self.num_envs) + env.single_action_space.shape
-        ).to(storage_device)
-        self.logprobs = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(
+        self.obs = torch.zeros((self.per_env_buffer_size, self.num_envs) + env.single_observation_space.shape).to(
             storage_device
         )
-        self.rewards = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(
+        self.next_obs = torch.zeros((self.per_env_buffer_size, self.num_envs) + env.single_observation_space.shape).to(
             storage_device
         )
-        self.dones = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(
+        self.actions = torch.zeros((self.per_env_buffer_size, self.num_envs) + env.single_action_space.shape).to(
             storage_device
         )
-        self.values = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(
-            storage_device
-        )
+        self.logprobs = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(storage_device)
+        self.rewards = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(storage_device)
+        self.dones = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(storage_device)
+        self.values = torch.zeros((self.per_env_buffer_size, self.num_envs)).to(storage_device)
 
     def add(
         self,
@@ -257,8 +245,7 @@ class SoftQNetwork(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(
-                np.array(env.single_observation_space.shape).prod()
-                + np.prod(env.single_action_space.shape),
+                np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
                 256,
             ),
             nn.ReLU(),
@@ -293,12 +280,8 @@ class Actor(nn.Module):
         self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
         # action rescaling
         h, l = env.single_action_space.high, env.single_action_space.low
-        self.register_buffer(
-            "action_scale", torch.tensor((h - l) / 2.0, dtype=torch.float32)
-        )
-        self.register_buffer(
-            "action_bias", torch.tensor((h + l) / 2.0, dtype=torch.float32)
-        )
+        self.register_buffer("action_scale", torch.tensor((h - l) / 2.0, dtype=torch.float32))
+        self.register_buffer("action_bias", torch.tensor((h + l) / 2.0, dtype=torch.float32))
         # will be saved in the state_dict
 
     def forward(self, x):
@@ -306,9 +289,7 @@ class Actor(nn.Module):
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
-        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
-            log_std + 1
-        )  # From SpinUp / Denis Yarats
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
 
         return mean, log_std
 
@@ -379,13 +360,9 @@ if __name__ == "__main__":
 
     # Create environments conditionally based on expert mode
     if args.expert_type != "none":
-        print(
-            f"Creating Expert+Residual environments with expert type: {args.expert_type}"
-        )
+        print(f"Creating Expert+Residual environments with expert type: {args.expert_type}")
         if create_expert_residual_envs is None:
-            raise ImportError(
-                "Expert+Residual wrapper not available. Please ensure util.py is importable."
-            )
+            raise ImportError("Expert+Residual wrapper not available. Please ensure util.py is importable.")
         envs, eval_envs = create_expert_residual_envs(args, env_kwargs, device)
     else:
         envs = gym.make(
@@ -412,9 +389,7 @@ if __name__ == "__main__":
             eval_output_dir = f"{os.path.dirname(args.checkpoint)}/test_videos"
         print(f"Saving eval trajectories/videos to {eval_output_dir}")
         if args.save_train_video_freq is not None:
-            save_video_trigger = (
-                lambda x: (x // args.num_steps) % args.save_train_video_freq == 0
-            )
+            save_video_trigger = lambda x: (x // args.num_steps) % args.save_train_video_freq == 0
             envs = RecordEpisode(
                 envs,
                 output_dir=f"runs/{run_name}/train_videos",
@@ -444,9 +419,7 @@ if __name__ == "__main__":
         ignore_terminations=not args.eval_partial_reset,
         record_metrics=True,
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Box), (
-        "only continuous action space is supported"
-    )
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
     logger = None
@@ -485,8 +458,7 @@ if __name__ == "__main__":
         writer = SummaryWriter(f"runs/{run_name}")
         writer.add_text(
             "hyperparameters",
-            "|param|value|\n|-|-|\n%s"
-            % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
         )
         logger = Logger(log_wandb=args.track, tensorboard=writer)
     else:
@@ -506,16 +478,12 @@ if __name__ == "__main__":
         qf2.load_state_dict(ckpt["qf2"])
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(
-        list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr
-    )
+    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
     # Automatic entropy tuning
     if args.autotune:
-        target_entropy = -torch.prod(
-            torch.Tensor(envs.single_action_space.shape).to(device)
-        ).item()
+        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
@@ -532,9 +500,7 @@ if __name__ == "__main__":
     )
 
     # TRY NOT TO MODIFY: start the game
-    obs, info = envs.reset(
-        seed=args.seed
-    )  # in Gymnasium, seed is given to reset() instead of seed()
+    obs, info = envs.reset(seed=args.seed)  # in Gymnasium, seed is given to reset() instead of seed()
     eval_obs, _ = eval_envs.reset(seed=args.seed)
     global_step = 0
     global_update = 0
@@ -545,11 +511,7 @@ if __name__ == "__main__":
     cumulative_times = defaultdict(float)
 
     while global_step < args.total_timesteps:
-        if (
-            args.eval_freq > 0
-            and (global_step - args.training_freq) // args.eval_freq
-            < global_step // args.eval_freq
-        ):
+        if args.eval_freq > 0 and (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
             # evaluate
             actor.eval()
             stime = time.perf_counter()
@@ -577,8 +539,7 @@ if __name__ == "__main__":
                 if logger is not None:
                     logger.add_scalar(f"eval/{k}", mean, global_step)
             pbar.set_description(
-                f"success_once: {eval_metrics_mean['success_once']:.2f}, "
-                f"return: {eval_metrics_mean['return']:.2f}"
+                f"success_once: {eval_metrics_mean['success_once']:.2f}, return: {eval_metrics_mean['return']:.2f}"
             )
             if logger is not None:
                 eval_time = time.perf_counter() - stime
@@ -608,9 +569,7 @@ if __name__ == "__main__":
 
             # ALGO LOGIC: put action logic here
             if not learning_has_started:
-                actions = torch.tensor(
-                    envs.action_space.sample(), dtype=torch.float32, device=device
-                )
+                actions = torch.tensor(envs.action_space.sample(), dtype=torch.float32, device=device)
             else:
                 actions, _, _ = actor.get_action(obs)
                 actions = actions.detach()
@@ -620,31 +579,19 @@ if __name__ == "__main__":
             real_next_obs = next_obs.clone()
             if args.bootstrap_at_done == "never":
                 need_final_obs = torch.ones_like(terminations, dtype=torch.bool)
-                stop_bootstrap = (
-                    truncations | terminations
-                )  # always stop bootstrap when episode ends
+                stop_bootstrap = truncations | terminations  # always stop bootstrap when episode ends
             elif args.bootstrap_at_done == "always":
-                need_final_obs = (
-                    truncations | terminations
-                )  # always need final obs when episode ends
-                stop_bootstrap = torch.zeros_like(
-                    terminations, dtype=torch.bool
-                )  # never stop bootstrap
+                need_final_obs = truncations | terminations  # always need final obs when episode ends
+                stop_bootstrap = torch.zeros_like(terminations, dtype=torch.bool)  # never stop bootstrap
             else:  # bootstrap at truncated
-                need_final_obs = truncations & (
-                    ~terminations
-                )  # only need final obs when truncated and not terminated
+                need_final_obs = truncations & (~terminations)  # only need final obs when truncated and not terminated
                 stop_bootstrap = terminations  # only stop bootstrap when terminated, don't stop when truncated
             if "final_info" in infos:
                 final_info = infos["final_info"]
                 done_mask = infos["_final_info"]
-                real_next_obs[need_final_obs] = infos["final_observation"][
-                    need_final_obs
-                ]
+                real_next_obs[need_final_obs] = infos["final_observation"][need_final_obs]
                 for k, v in final_info["episode"].items():
-                    logger.add_scalar(
-                        f"train/{k}", v[done_mask].float().mean(), global_step
-                    )
+                    logger.add_scalar(f"train/{k}", v[done_mask].float().mean(), global_step)
 
             rb.add(obs, real_next_obs, actions, rewards, stop_bootstrap)
 
@@ -666,18 +613,13 @@ if __name__ == "__main__":
 
             # update the value networks
             with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(
-                    data.next_obs
-                )
+                next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_obs)
                 qf1_next_target = qf1_target(data.next_obs, next_state_actions)
                 qf2_next_target = qf2_target(data.next_obs, next_state_actions)
-                min_qf_next_target = (
-                    torch.min(qf1_next_target, qf2_next_target)
-                    - alpha * next_state_log_pi
-                )
-                next_q_value = data.rewards.flatten() + (
-                    1 - data.dones.flatten()
-                ) * args.gamma * (min_qf_next_target).view(-1)
+                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (
+                    min_qf_next_target
+                ).view(-1)
                 # data.dones is "stop_bootstrap", which is computed earlier according to args.bootstrap_at_done
 
             qf1_a_values = qf1(data.obs, data.actions).view(-1)
@@ -691,9 +633,7 @@ if __name__ == "__main__":
             q_optimizer.step()
 
             # update the policy network
-            if (
-                global_update % args.policy_frequency == 0
-            ):  # TD 3 Delayed update support
+            if global_update % args.policy_frequency == 0:  # TD 3 Delayed update support
                 pi, log_pi, _ = actor.get_action(data.obs)
                 qf1_pi = qf1(data.obs, pi)
                 qf2_pi = qf2(data.obs, pi)
@@ -720,31 +660,17 @@ if __name__ == "__main__":
 
             # update the target networks
             if global_update % args.target_network_frequency == 0:
-                for param, target_param in zip(
-                    qf1.parameters(), qf1_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
-                for param, target_param in zip(
-                    qf2.parameters(), qf2_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
+                for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
         update_time = time.perf_counter() - update_time
         cumulative_times["update_time"] += update_time
 
         # Log training-related data
-        if (
-            global_step - args.training_freq
-        ) // args.log_freq < global_step // args.log_freq:
-            logger.add_scalar(
-                "losses/qf1_values", qf1_a_values.mean().item(), global_step
-            )
-            logger.add_scalar(
-                "losses/qf2_values", qf2_a_values.mean().item(), global_step
-            )
+        if (global_step - args.training_freq) // args.log_freq < global_step // args.log_freq:
+            logger.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
+            logger.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
             logger.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
             logger.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
             logger.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)

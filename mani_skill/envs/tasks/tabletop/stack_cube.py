@@ -67,9 +67,7 @@ class StackCubeEnv(BaseEnv):
         },
     }
 
-    def __init__(
-        self, *args, robot_uids="panda_wristcam", robot_init_qpos_noise=0.02, **kwargs
-    ):
+    def __init__(self, *args, robot_uids="panda_wristcam", robot_init_qpos_noise=0.02, **kwargs):
         self.robot_init_qpos_noise = robot_init_qpos_noise
 
         # Set robot-specific configurations
@@ -97,12 +95,8 @@ class StackCubeEnv(BaseEnv):
         super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
 
     def _load_scene(self, options: dict):
-        self.cube_half_size_tensor = common.to_tensor(
-            [self.cube_half_size] * 3, device=self.device
-        )
-        self.table_scene = TableSceneBuilder(
-            env=self, robot_init_qpos_noise=self.robot_init_qpos_noise
-        )
+        self.cube_half_size_tensor = common.to_tensor([self.cube_half_size] * 3, device=self.device)
+        self.table_scene = TableSceneBuilder(env=self, robot_init_qpos_noise=self.robot_init_qpos_noise)
         self.table_scene.build()
         self.cubeA = actors.build_cube(
             self.scene,
@@ -132,15 +126,8 @@ class StackCubeEnv(BaseEnv):
                 [-spawn_half_range, -self.cube_spawn_range],
                 [spawn_half_range, self.cube_spawn_range],
             ]
-            sampler = randomization.UniformPlacementSampler(
-                bounds=region, batch_size=b, device=self.device
-            )
-            radius = (
-                torch.linalg.norm(
-                    torch.tensor([self.cube_half_size, self.cube_half_size])
-                )
-                + 0.001
-            )
+            sampler = randomization.UniformPlacementSampler(bounds=region, batch_size=b, device=self.device)
+            radius = torch.linalg.norm(torch.tensor([self.cube_half_size, self.cube_half_size])) + 0.001
             cubeA_xy = xy + sampler.sample(radius, 100)
             cubeB_xy = xy + sampler.sample(radius, 100, verbose=False)
 
@@ -167,12 +154,9 @@ class StackCubeEnv(BaseEnv):
         pos_B = self.cubeB.pose.p
         offset = pos_A - pos_B
         xy_flag = (
-            torch.linalg.norm(offset[..., :2], axis=1)
-            <= torch.linalg.norm(self.cube_half_size_tensor[:2]) + 0.005
+            torch.linalg.norm(offset[..., :2], axis=1) <= torch.linalg.norm(self.cube_half_size_tensor[:2]) + 0.005
         )
-        z_flag = (
-            torch.abs(offset[..., 2] - self.cube_half_size_tensor[..., 2] * 2) <= 0.005
-        )
+        z_flag = torch.abs(offset[..., 2] - self.cube_half_size_tensor[..., 2] * 2) <= 0.005
         is_cubeA_on_cubeB = torch.logical_and(xy_flag, z_flag)
         # NOTE (stao): GPU sim can be fast but unstable. Angular velocity is rather high despite it not really rotating
         is_cubeA_static = self.cubeA.is_static(lin_thresh=1e-2, ang_thresh=0.5)
@@ -217,26 +201,18 @@ class StackCubeEnv(BaseEnv):
         reward[info["is_cubeA_grasped"]] = (4 + place_reward)[info["is_cubeA_grasped"]]
 
         # ungrasp and static reward
-        gripper_width = (self.agent.robot.get_qlimits()[0, -1, 1] * 2).to(
-            self.device
-        )  # NOTE: hard-coded with panda
+        gripper_width = (self.agent.robot.get_qlimits()[0, -1, 1] * 2).to(self.device)  # NOTE: hard-coded with panda
         is_cubeA_grasped = info["is_cubeA_grasped"]
-        ungrasp_reward = (
-            torch.sum(self.agent.robot.get_qpos()[:, -2:], axis=1) / gripper_width
-        )
+        ungrasp_reward = torch.sum(self.agent.robot.get_qpos()[:, -2:], axis=1) / gripper_width
         ungrasp_reward[~is_cubeA_grasped] = 1.0
         v = torch.linalg.norm(self.cubeA.linear_velocity, axis=1)
         av = torch.linalg.norm(self.cubeA.angular_velocity, axis=1)
         static_reward = 1 - torch.tanh(v * 10 + av)
-        reward[info["is_cubeA_on_cubeB"]] = (
-            6 + (ungrasp_reward + static_reward) / 2.0
-        )[info["is_cubeA_on_cubeB"]]
+        reward[info["is_cubeA_on_cubeB"]] = (6 + (ungrasp_reward + static_reward) / 2.0)[info["is_cubeA_on_cubeB"]]
 
         reward[info["success"]] = 8
 
         return reward
 
-    def compute_normalized_dense_reward(
-        self, obs: Any, action: torch.Tensor, info: Dict
-    ):
+    def compute_normalized_dense_reward(self, obs: Any, action: torch.Tensor, info: Dict):
         return self.compute_dense_reward(obs=obs, action=action, info=info) / 8

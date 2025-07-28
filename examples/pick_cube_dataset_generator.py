@@ -16,12 +16,13 @@ import gymnasium as gym
 import numpy as np
 import sapien
 import torch
-from mani_skill.envs.tasks.tabletop.pick_cube import PickCubeEnv
-from mani_skill.utils.visualization.misc import images_to_video
 
 # depth/segmentation removed; Actor/Link no longer needed
 from torch import nn
 from torch.distributions import Normal
+
+from mani_skill.envs.tasks.tabletop.pick_cube import PickCubeEnv
+from mani_skill.utils.visualization.misc import images_to_video
 
 sys.path.append(str(Path(__file__).parent / "baselines" / "ppo"))
 from ppo import Agent
@@ -96,23 +97,14 @@ class PandaDatasetGenerator:
 
         # Create episode directory structure
         date_str = self.start_time.strftime("%Y/%m/%d")
-        self.episode_dir = (
-            self.output_root_dir
-            / "panda_cube_pick"
-            / "cube_pick"
-            / "data"
-            / date_str
-            / episode_name
-        )
+        self.episode_dir = self.output_root_dir / "panda_cube_pick" / "cube_pick" / "data" / date_str / episode_name
 
         # Create camera directories
         (self.episode_dir / "base_camera_rgb").mkdir(parents=True, exist_ok=True)
         if self.use_wrist_cam:
             (self.episode_dir / "hand_camera_rgb").mkdir(parents=True, exist_ok=True)
         if self.save_video:
-            (self.episode_dir / "default_camera_video").mkdir(
-                parents=True, exist_ok=True
-            )
+            (self.episode_dir / "default_camera_video").mkdir(parents=True, exist_ok=True)
 
         print(f"Started episode: {episode_name}")
         print(f"Episode directory: {self.episode_dir}")
@@ -161,9 +153,7 @@ class PandaDatasetGenerator:
                         value = value.cpu().numpy()
                     if hasattr(value, "ndim") and value.ndim > 1:
                         value = value[0]  # Take first batch element
-                    state_obs[key] = (
-                        value.tolist() if hasattr(value, "tolist") else value
-                    )
+                    state_obs[key] = value.tolist() if hasattr(value, "tolist") else value
 
         # For RGB environments, we might have a flattened state observation
         if "state" in obs_dict:
@@ -172,9 +162,7 @@ class PandaDatasetGenerator:
                 state_value = state_value.cpu().numpy()
             if hasattr(state_value, "ndim") and state_value.ndim > 1:
                 state_value = state_value[0]  # Take first batch element
-            state_obs["flattened_state"] = (
-                state_value.tolist() if hasattr(state_value, "tolist") else state_value
-            )
+            state_obs["flattened_state"] = state_value.tolist() if hasattr(state_value, "tolist") else state_value
 
         # For state-only environments, save the raw state tensor
         if "state_tensor" in obs_dict:
@@ -183,11 +171,7 @@ class PandaDatasetGenerator:
                 state_tensor = state_tensor.cpu().numpy()
             if hasattr(state_tensor, "ndim") and state_tensor.ndim > 1:
                 state_tensor = state_tensor[0]  # Take first batch element
-            state_obs["raw_state"] = (
-                state_tensor.tolist()
-                if hasattr(state_tensor, "tolist")
-                else state_tensor
-            )
+            state_obs["raw_state"] = state_tensor.tolist() if hasattr(state_tensor, "tolist") else state_tensor
 
         # Extract other relevant observation components (excluding sensor_param)
         for key, value in obs_dict.items():
@@ -279,13 +263,9 @@ class PandaDatasetGenerator:
                 bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
 
                 # Resize to target resolution
-                bgr_image = cv2.resize(
-                    bgr_image, self._img_size, interpolation=cv2.INTER_LINEAR
-                )
+                bgr_image = cv2.resize(bgr_image, self._img_size, interpolation=cv2.INTER_LINEAR)
 
-                base_rgb_path = (
-                    self.episode_dir / "base_camera_rgb" / f"{frame_str}.jpg"
-                )
+                base_rgb_path = self.episode_dir / "base_camera_rgb" / f"{frame_str}.jpg"
                 cv2.imwrite(str(base_rgb_path), bgr_image)
                 image_paths["base_camera_rgb"] = f"base_camera_rgb/{frame_str}.jpg"
 
@@ -294,11 +274,7 @@ class PandaDatasetGenerator:
                     self.base_camera_video_frames.append(bgr_image)
 
             # Save hand camera RGB if enabled (wrist camera)
-            if (
-                self.use_wrist_cam
-                and "hand_camera" in sensor_data
-                and "rgb" in sensor_data["hand_camera"]
-            ):
+            if self.use_wrist_cam and "hand_camera" in sensor_data and "rgb" in sensor_data["hand_camera"]:
                 rgb_image = sensor_data["hand_camera"]["rgb"].cpu().numpy()
                 if rgb_image.ndim == 4:
                     rgb_image = rgb_image[0]
@@ -309,13 +285,9 @@ class PandaDatasetGenerator:
                 bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
 
                 # Resize to target resolution
-                bgr_image = cv2.resize(
-                    bgr_image, self._img_size, interpolation=cv2.INTER_LINEAR
-                )
+                bgr_image = cv2.resize(bgr_image, self._img_size, interpolation=cv2.INTER_LINEAR)
 
-                hand_rgb_path = (
-                    self.episode_dir / "hand_camera_rgb" / f"{frame_str}.jpg"
-                )
+                hand_rgb_path = self.episode_dir / "hand_camera_rgb" / f"{frame_str}.jpg"
                 cv2.imwrite(str(hand_rgb_path), bgr_image)
                 image_paths["hand_camera_rgb"] = f"hand_camera_rgb/{frame_str}.jpg"
 
@@ -345,13 +317,9 @@ class PandaDatasetGenerator:
                         bgr_frame = video_frame
 
                     # Save individual video frame (BGR format for cv2.imwrite)
-                    video_frame_path = (
-                        self.episode_dir / "default_camera_video" / f"{frame_str}.jpg"
-                    )
+                    video_frame_path = self.episode_dir / "default_camera_video" / f"{frame_str}.jpg"
                     cv2.imwrite(str(video_frame_path), bgr_frame)
-                    image_paths["default_camera_video"] = (
-                        f"default_camera_video/{frame_str}.jpg"
-                    )
+                    image_paths["default_camera_video"] = f"default_camera_video/{frame_str}.jpg"
 
                     # Store frame for video compilation (keep as BGR for consistency)
                     self.video_frames.append(bgr_frame)
@@ -436,9 +404,7 @@ class PandaDatasetGenerator:
                     # Convert from tensor to list (flatten 3x3 matrix row-wise)
                     if hasattr(intrinsic_cv, "cpu"):
                         intrinsic_cv = intrinsic_cv.cpu().numpy()
-                    k_matrix = (
-                        intrinsic_cv[0].flatten().tolist()
-                    )  # Take first batch element
+                    k_matrix = intrinsic_cv[0].flatten().tolist()  # Take first batch element
 
                     camera_metadata["k_mats"][sensor_name] = k_matrix
 
@@ -464,9 +430,7 @@ class PandaDatasetGenerator:
                     "id_remapping": "Maps original segmentation IDs to simplified IDs (0=background, 1-5=key objects)",
                 },
             }
-            print(
-                f"✅ Added segmentation legend with {len(self.segmentation_mapping)} entities"
-            )
+            print(f"✅ Added segmentation legend with {len(self.segmentation_mapping)} entities")
 
         return camera_metadata
 
@@ -582,10 +546,7 @@ class DummyVectorEnv:
     def __init__(self, env):
         # PPO was trained with state observations, so we need to create a proper Box space
         # The state observation is typically a flat vector
-        if (
-            hasattr(env.observation_space, "shape")
-            and env.observation_space.shape is not None
-        ):
+        if hasattr(env.observation_space, "shape") and env.observation_space.shape is not None:
             self.single_observation_space = env.observation_space
         else:
             # For complex observation spaces, we need to flatten them
@@ -615,14 +576,10 @@ def load_ppo_agent(env, ckpt_path: str, device: str | torch.device = "cpu") -> A
     return agent
 
 
-def load_ppo_rgb_fast_agent(
-    env, ckpt_path: str, device: str | torch.device = "cpu"
-) -> RGBFastAgent:
+def load_ppo_rgb_fast_agent(env, ckpt_path: str, device: str | torch.device = "cpu") -> RGBFastAgent:
     """Load the exact Agent from ppo_rgb_fast.py checkpoint."""
     if RGBFastAgent is None:
-        raise ImportError(
-            "ppo_rgb_fast.py Agent not available. Please ensure it's importable."
-        )
+        raise ImportError("ppo_rgb_fast.py Agent not available. Please ensure it's importable.")
 
     # Import the flattening wrapper
     # Get action dimensions
@@ -695,7 +652,7 @@ def generate_pick_cube_dataset(
     success_count = 0
     total_episodes = 0
 
-    for episode_idx in range(num_episodes):  # noqa: PLR1702
+    for episode_idx in range(num_episodes):
         print(f"\n{'=' * 60}")
         print(f"GENERATING EPISODE {episode_idx + 1}/{num_episodes}")
         print(f"{'=' * 60}")
@@ -735,9 +692,7 @@ def generate_pick_cube_dataset(
                 try:
                     u.goal_site.set_visibility(True)
                 except Exception as e:
-                    print(
-                        f"[WARN] Failed to unhide goal sphere via set_visibility: {e}"
-                    )
+                    print(f"[WARN] Failed to unhide goal sphere via set_visibility: {e}")
 
         # Create dataset generator
         generator = PandaDatasetGenerator(
@@ -754,9 +709,7 @@ def generate_pick_cube_dataset(
         )
 
         if ppo_checkpoint_path is None:
-            raise ValueError(
-                "ppo_checkpoint_path must be provided when using PPO rollout."
-            )
+            raise ValueError("ppo_checkpoint_path must be provided when using PPO rollout.")
 
         # -------------------------------------------------
         # PPO-based rollout (replaces motion-planning logic)
@@ -830,9 +783,7 @@ def generate_pick_cube_dataset(
                         state_obs = np.array(state_obs).flatten()
 
                     # Convert to tensor
-                    state_obs_tensor = (
-                        torch.from_numpy(state_obs).float().to(device).unsqueeze(0)
-                    )
+                    state_obs_tensor = torch.from_numpy(state_obs).float().to(device).unsqueeze(0)
 
                     action = agent.get_action(state_obs_tensor, deterministic=True)
                     action = action.squeeze(0).cpu().numpy()
@@ -862,12 +813,8 @@ def generate_pick_cube_dataset(
         if episode_success:
             success_count += 1
 
-        print(
-            f"Episode {episode_idx + 1} completed: {'SUCCESS' if episode_success else 'FAILED'}"
-        )
-        print(
-            f"Current success rate: {success_count}/{total_episodes} ({100 * success_count / total_episodes:.1f}%)"
-        )
+        print(f"Episode {episode_idx + 1} completed: {'SUCCESS' if episode_success else 'FAILED'}")
+        print(f"Current success rate: {success_count}/{total_episodes} ({100 * success_count / total_episodes:.1f}%)")
         print("Episode completed successfully!")
 
         # Close environments to free resources
@@ -876,9 +823,7 @@ def generate_pick_cube_dataset(
             temp_state_env.close()
 
     # Final success rate summary
-    final_success_rate = (
-        100 * success_count / total_episodes if total_episodes > 0 else 0
-    )
+    final_success_rate = 100 * success_count / total_episodes if total_episodes > 0 else 0
     print(f"\n{'=' * 60}")
     print("DATASET GENERATION COMPLETE")
     print(f"{'=' * 60}")
@@ -895,6 +840,7 @@ if __name__ == "__main__":
     import os
 
     import gymnasium as gym
+
     import mani_skill
 
     # Parse command line arguments
@@ -978,10 +924,11 @@ if __name__ == "__main__":
     # Update checkpoint path for wrist cam if not explicitly provided
     if (
         args.use_wrist_cam
-        and args.ppo_checkpoint
-        == "/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo__1__1752538773/final_ckpt.pt"
+        and args.ppo_checkpoint == "/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo__1__1752538773/final_ckpt.pt"
     ):
-        args.ppo_checkpoint = "/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo_rgb_fast__1__1752546740/ckpt_176.pt"
+        args.ppo_checkpoint = (
+            "/home/gilwoo/workspace/ManiSkill/runs/PickCube-v1__ppo_rgb_fast__1__1752546740/ckpt_176.pt"
+        )
         print(f"Using RGB fast checkpoint for wrist cam: {args.ppo_checkpoint}")
     elif args.use_wrist_cam:
         print(f"Using custom checkpoint for wrist cam: {args.ppo_checkpoint}")
@@ -1001,14 +948,10 @@ if __name__ == "__main__":
     if args.use_wrist_cam:
         env_config["robot_uids"] = "panda_wristcam"
         # PPO RGB fast agent uses ee_delta_pos control mode
-        env_config["control_mode"] = (
-            "pd_ee_delta_pos" if args.control_mode == "auto" else args.control_mode
-        )
+        env_config["control_mode"] = "pd_ee_delta_pos" if args.control_mode == "auto" else args.control_mode
     else:
         # PPO state agent uses joint_delta_pos control mode
-        env_config["control_mode"] = (
-            "pd_joint_delta_pos" if args.control_mode == "auto" else args.control_mode
-        )
+        env_config["control_mode"] = "pd_joint_delta_pos" if args.control_mode == "auto" else args.control_mode
 
     # Generate dataset
     generate_pick_cube_dataset(

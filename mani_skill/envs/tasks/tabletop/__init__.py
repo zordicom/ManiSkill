@@ -12,6 +12,7 @@ from .peg_insertion_top import PegInsertionTopEnv
 from .pick_box import PickBoxEnv
 from .pick_clutter_ycb import PickClutterYCBEnv
 from .pick_cube import PickCubeEnv
+from .pick_cube_orient import PickCubeOrientEnv
 from .pick_single_ycb import PickSingleYCBEnv
 from .place_sphere import PlaceSphereEnv
 from .plug_charger import PlugChargerEnv
