@@ -183,8 +183,11 @@ class PickClutterEnv(BaseEnv):
         }
 
     def _get_obs_extra(self, info: Dict):
-
-        return dict()
+        obs = dict(
+            tcp_pose=self.agent.tcp.pose.raw_pose,
+            goal_pos=self.goal_site.pose.p,
+        )
+        return obs
 
 
 @register_env(
