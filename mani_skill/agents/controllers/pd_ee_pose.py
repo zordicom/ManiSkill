@@ -136,7 +136,7 @@ class PDEEPosController(PDJointPosController):
 
             def format_array(arr):
                 """Format array with at most 4 decimal places, suppress scientific notation."""
-                np.set_printoptions(precision=4, suppress=True, floatmode='fixed')
+                np.set_printoptions(precision=4, suppress=True, floatmode="fixed")
                 return np.array2string(arr, precision=4, suppress_small=True)
 
             if ik_via_target_pose:
