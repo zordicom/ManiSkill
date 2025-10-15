@@ -134,14 +134,20 @@ class PDEEPosController(PDJointPosController):
                     return x.detach().cpu().numpy()
                 return np.asarray(x)
 
+            def format_array(arr):
+                """Format array with at most 4 decimal places, suppress scientific notation."""
+                np.set_printoptions(precision=4, suppress=True, floatmode='fixed')
+                return np.array2string(arr, precision=4, suppress_small=True)
+
             if ik_via_target_pose:
                 target_pos = to_numpy(self._target_pose.p)
                 target_quat = to_numpy(self._target_pose.q)
                 target_info = (
-                    f"Target pose (base frame): pos={target_pos}, quat={target_quat}"
+                    f"Target pose (base frame): pos={format_array(target_pos)}, "
+                    f"quat={format_array(target_quat)}"
                 )
             else:
-                target_info = f"Delta action: {to_numpy(action)}"
+                target_info = f"Delta action: {format_array(to_numpy(action))}"
 
             current_ee_pose = self.ee_pose_at_base
             current_pos = to_numpy(current_ee_pose.p)
@@ -151,8 +157,9 @@ class PDEEPosController(PDJointPosController):
             logger.error(
                 f"IK FAILED for {self.articulation.name} ({self.__class__.__name__})\n"
                 f"  {target_info}\n"
-                f"  Current EE pose (base frame): pos={current_pos}, quat={current_quat}\n"
-                f"  Current qpos: {current_qpos}\n"
+                f"  Current EE pose (base frame): pos={format_array(current_pos)}, "
+                f"quat={format_array(current_quat)}\n"
+                f"  Current qpos: {format_array(current_qpos)}\n"
                 f"  Falling back to current joint positions (robot will not move)"
             )
             self._target_qpos = self._start_qpos
