@@ -2,7 +2,6 @@ from copy import deepcopy
 
 import numpy as np
 import sapien
-import sapien.physx as physx
 import torch
 
 from mani_skill import PACKAGE_ASSET_DIR
@@ -124,8 +123,12 @@ class Panda(BaseAgent):
         )
         arm_pd_ee_pose = PDEEPoseControllerConfig(
             joint_names=self.arm_joint_names,
-            pos_lower=None,
-            pos_upper=None,
+            # Large workspace bounds for absolute pose control
+            # No action normalization, so bounds are just for safety
+            pos_lower=[-10.0, -10.0, -10.0],
+            pos_upper=[10.0, 10.0, 10.0],
+            rot_lower=-10.0 * np.pi,
+            rot_upper=10.0 * np.pi,
             stiffness=self.arm_stiffness,
             damping=self.arm_damping,
             force_limit=self.arm_force_limit,

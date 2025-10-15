@@ -4,8 +4,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
-import sapien
-import sapien.physx as physx
 import torch
 from gymnasium import spaces
 from gymnasium.vector.utils import batch_space
@@ -306,7 +304,6 @@ class DictController(BaseController):
 
 
 class CombinedController(DictController):
-
     """A flat/combined view of multiple controllers."""
 
     def _initialize_action_space(self):
@@ -325,7 +322,9 @@ class CombinedController(DictController):
         assert action.shape == (
             self.scene.num_envs,
             action_dim,
-        ), f"Received action of shape {action.shape} but expected shape ({self.scene.num_envs}, {action_dim})"
+        ), (
+            f"Received action of shape {action.shape} but expected shape ({self.scene.num_envs}, {action_dim})"
+        )
         for uid, controller in self.controllers.items():
             start, end = self.action_mapping[uid]
             controller.set_action(action[:, start:end])
