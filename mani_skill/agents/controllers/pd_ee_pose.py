@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional, Sequence, Union
 
 import numpy as np
@@ -7,6 +7,7 @@ from gymnasium import spaces
 
 from mani_skill.agents.controllers.utils.kinematics import Kinematics
 from mani_skill.utils import gym_utils, sapien_utils
+from mani_skill.utils.logging_utils import logger
 from mani_skill.utils.geometry.rotation_conversions import (
     euler_angles_to_matrix,
     matrix_to_quaternion,
@@ -27,9 +28,9 @@ class PDEEPosController(PDJointPosController):
     _target_pose = None
 
     def _check_gpu_sim_works(self):
-        assert (
-            self.config.frame == "root_translation"
-        ), "currently only translation in the root frame for EE control is supported in GPU sim"
+        assert self.config.frame == "root_translation", (
+            "currently only translation in the root frame for EE control is supported in GPU sim"
+        )
 
     def _initialize_joints(self):
         self.initial_qpos = None
@@ -72,13 +73,14 @@ class PDEEPosController(PDJointPosController):
 
     def reset(self):
         super().reset()
-        if self._target_pose is None:
-            self._target_pose = self.ee_pose_at_base
-        else:
-            # TODO (stao): this is a strange way to mask setting individual batched pose parts
-            self._target_pose.raw_pose[self.scene._reset_mask] = (
-                self.ee_pose_at_base.raw_pose[self.scene._reset_mask]
-            )
+        if self.config.use_target:
+            if self._target_pose is None:
+                self._target_pose = self.ee_pose_at_base
+            else:
+                # TODO (stao): this is a strange way to mask setting individual batched pose parts
+                self._target_pose.raw_pose[self.scene._reset_mask] = (
+                    self.ee_pose_at_base.raw_pose[self.scene._reset_mask]
+                )
 
     def compute_target_pose(self, prev_ee_pose_at_base, action):
         # Keep the current rotation and change the position
@@ -105,16 +107,61 @@ class PDEEPosController(PDJointPosController):
         else:
             prev_ee_pose_at_base = self.ee_pose_at_base
 
-        self._target_pose = self.compute_target_pose(prev_ee_pose_at_base, action)
+        # we only need to use the target pose for CPU sim or if a virtual target is enabled
+        # if we have no virtual target and using the gpu sim we can directly use the given action without
+        # having to recompute the new target pose based on the action delta.
+        ik_via_target_pose = self.config.use_target or not self.scene.gpu_sim_enabled
+        if ik_via_target_pose:
+            self._target_pose = self.compute_target_pose(prev_ee_pose_at_base, action)
         pos_only = type(self.config) == PDEEPosControllerConfig
+        if pos_only:
+            action = torch.hstack(
+                [action, torch.zeros(action.shape[0], 3, device=self.device)]
+            )
+
         self._target_qpos = self.kinematics.compute_ik(
-            self._target_pose,
-            self.articulation.get_qpos(),
-            pos_only=pos_only,
-            action=action,
-            use_delta_ik_solver=self.config.use_delta and not self.config.use_target,
+            pose=self._target_pose if ik_via_target_pose else action,
+            q0=self.articulation.get_qpos(),
+            is_delta_pose=not ik_via_target_pose and self.config.use_delta,
+            current_pose=self.ee_pose_at_base,
+            solver_config=self.config.delta_solver_config,
         )
         if self._target_qpos is None:
+            # IK failed - log detailed error information
+            def to_numpy(x):
+                """Convert tensor to numpy array, handling both CPU and GPU tensors."""
+                if isinstance(x, torch.Tensor):
+                    return x.detach().cpu().numpy()
+                return np.asarray(x)
+
+            def format_array(arr):
+                """Format array with at most 4 decimal places, suppress scientific notation."""
+                np.set_printoptions(precision=4, suppress=True, floatmode="fixed")
+                return np.array2string(arr, precision=4, suppress_small=True)
+
+            if ik_via_target_pose:
+                target_pos = to_numpy(self._target_pose.p)
+                target_quat = to_numpy(self._target_pose.q)
+                target_info = (
+                    f"Target pose (base frame): pos={format_array(target_pos)}, "
+                    f"quat={format_array(target_quat)}"
+                )
+            else:
+                target_info = f"Delta action: {format_array(to_numpy(action))}"
+
+            current_ee_pose = self.ee_pose_at_base
+            current_pos = to_numpy(current_ee_pose.p)
+            current_quat = to_numpy(current_ee_pose.q)
+            current_qpos = to_numpy(self._start_qpos)
+
+            logger.error(
+                f"IK FAILED for {self.articulation.name} ({self.__class__.__name__})\n"
+                f"  {target_info}\n"
+                f"  Current EE pose (base frame): pos={format_array(current_pos)}, "
+                f"quat={format_array(current_quat)}\n"
+                f"  Current qpos: {format_array(current_qpos)}\n"
+                f"  Falling back to current joint positions (robot will not move)"
+            )
             self._target_qpos = self._start_qpos
         if self.config.interpolate:
             self._step_size = (self._target_qpos - self._start_qpos) / self._sim_steps
@@ -175,6 +222,10 @@ class PDEEPosControllerConfig(ControllerConfig):
     interpolate: bool = False
     normalize_action: bool = True
     """Whether to normalize each action dimension into a range of [-1, 1]. Normally for most machine learning workflows this is recommended to be kept true."""
+    delta_solver_config: dict = field(
+        default_factory=lambda: dict(type="levenberg_marquardt", alpha=1.0)
+    )
+    """Configuration for the delta IK solver. Default is `dict(type="levenberg_marquardt", alpha=1.0)`. type can be one of "levenberg_marquardt" or "pseudo_inverse". alpha is a scaling term applied to the delta joint positions generated by the solver. Generally levenberg_marquardt is faster and more accurate than pseudo_inverse and is the recommended option, see https://github.com/haosulab/ManiSkill/issues/955#issuecomment-2742253342 for some analysis on performance."""
     drive_mode: Union[Sequence[DriveMode], DriveMode] = "force"
     controller_cls = PDEEPosController
 
@@ -183,9 +234,9 @@ class PDEEPoseController(PDEEPosController):
     config: "PDEEPoseControllerConfig"
 
     def _check_gpu_sim_works(self):
-        assert (
-            self.config.frame == "root_translation:root_aligned_body_rotation"
-        ), "currently only translation in the root frame for EE control is supported in GPU sim"
+        assert self.config.frame == "root_translation:root_aligned_body_rotation", (
+            "currently only translation in the root frame for EE control is supported in GPU sim"
+        )
 
     def _initialize_action_space(self):
         low = np.float32(
@@ -238,9 +289,9 @@ class PDEEPoseController(PDEEPosController):
                 )
             target_pose = Pose.create_from_pq(p, q)
         else:
-            assert (
-                self.config.frame == "root_translation:root_aligned_body_rotation"
-            ), self.config.frame
+            assert self.config.frame == "root_translation:root_aligned_body_rotation", (
+                self.config.frame
+            )
             target_pos, target_rot = action[:, 0:3], action[:, 3:6]
             target_quat = matrix_to_quaternion(
                 euler_angles_to_matrix(target_rot, "XYZ")
@@ -252,7 +303,6 @@ class PDEEPoseController(PDEEPosController):
 
 @dataclass
 class PDEEPoseControllerConfig(PDEEPosControllerConfig):
-
     rot_lower: Union[float, Sequence[float]] = None
     """Lower bound for rotation control. If a single float then X, Y, and Z rotations are bounded by this value. Otherwise can be three floats to specify each dimensions bounds"""
     rot_upper: Union[float, Sequence[float]] = None

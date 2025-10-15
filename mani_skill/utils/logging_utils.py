@@ -41,15 +41,24 @@ class CustomFormatter(logging.Formatter):
     # https://stackoverflow.com/questions/384076/how-can-i-color-python-logging-output
 
     def format(self, record):
-        s = super().format(record)
+        # Store the original levelname
+        levelname_orig = record.levelname
+        
+        # Color only the levelname based on severity
         if record.levelno == logging.WARNING:
-            s = colorize(s, "yellow", True)
+            record.levelname = colorize(levelname_orig, "yellow", True)
         elif record.levelno == logging.ERROR:
-            s = colorize(s, "red", True, True)
+            record.levelname = colorize(levelname_orig, "red", True)
         elif record.levelno == logging.INFO:
-            s = colorize(s, "green")
+            record.levelname = colorize(levelname_orig, "green")
         elif record.levelno == logging.DEBUG:
-            s = colorize(s, "blue")
+            record.levelname = colorize(levelname_orig, "blue")
+        
+        # Format the entire message (only levelname is colored)
+        s = super().format(record)
+        
+        # Restore original levelname
+        record.levelname = levelname_orig
         return s
 
 
