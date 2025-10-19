@@ -94,7 +94,9 @@ class PDEEPosController(PDJointPosController):
                 raise NotImplementedError(self.config.frame)
         else:
             assert self.config.frame == "root_translation", self.config.frame
-            target_pose = Pose.create(action)
+            # For absolute position control: use target position + CURRENT rotation
+            # action is 3D position, preserve rotation from prev_ee_pose_at_base
+            target_pose = Pose.create_from_pq(p=action, q=prev_ee_pose_at_base.q)
         return target_pose
 
     def set_action(self, action: Array):
@@ -115,9 +117,16 @@ class PDEEPosController(PDJointPosController):
             self._target_pose = self.compute_target_pose(prev_ee_pose_at_base, action)
         pos_only = type(self.config) == PDEEPosControllerConfig
         if pos_only:
-            action = torch.hstack(
-                [action, torch.zeros(action.shape[0], 3, device=self.device)]
+            # For position-only control: preserve current rotation, don't use dummy zeros
+            # Convert current quaternion to euler angles for the action format
+            from mani_skill.utils.geometry.rotation_conversions import (
+                matrix_to_euler_angles,
+                quaternion_to_matrix,
             )
+
+            current_rot_matrix = quaternion_to_matrix(prev_ee_pose_at_base.q)
+            current_euler = matrix_to_euler_angles(current_rot_matrix, "XYZ")
+            action = torch.hstack([action, current_euler])
 
         self._target_qpos = self.kinematics.compute_ik(
             pose=self._target_pose if ik_via_target_pose else action,

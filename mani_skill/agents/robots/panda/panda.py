@@ -138,6 +138,22 @@ class Panda(BaseAgent):
             normalize_action=False,
         )
 
+        # Absolute position-only control (like pd_ee_pose but 3D instead of 6D)
+        arm_pd_ee_pos = PDEEPosControllerConfig(
+            joint_names=self.arm_joint_names,
+            # Large workspace bounds for absolute position control
+            # No action normalization, so bounds are just for safety
+            pos_lower=[-10.0, -10.0, -10.0],
+            pos_upper=[10.0, 10.0, 10.0],
+            stiffness=self.arm_stiffness,
+            damping=self.arm_damping,
+            force_limit=self.arm_force_limit,
+            ee_link=self.ee_link_name,
+            urdf_path=self.urdf_path,
+            use_delta=False,  # Absolute position control (not delta)
+            normalize_action=False,
+        )
+
         arm_pd_ee_target_delta_pos = deepcopy(arm_pd_ee_delta_pos)
         arm_pd_ee_target_delta_pos.use_target = True
         arm_pd_ee_target_delta_pose = deepcopy(arm_pd_ee_delta_pose)
@@ -197,6 +213,9 @@ class Panda(BaseAgent):
                 arm=arm_pd_ee_delta_pose, gripper=gripper_pd_joint_pos
             ),
             pd_ee_pose=dict(arm=arm_pd_ee_pose, gripper=gripper_pd_joint_pos),
+            pd_ee_pos=dict(
+                arm=arm_pd_ee_pos, gripper=gripper_pd_joint_pos
+            ),  # Absolute position-only (3D)
             # TODO(jigu): how to add boundaries for the following controllers
             pd_joint_target_delta_pos=dict(
                 arm=arm_pd_joint_target_delta_pos, gripper=gripper_pd_joint_pos
