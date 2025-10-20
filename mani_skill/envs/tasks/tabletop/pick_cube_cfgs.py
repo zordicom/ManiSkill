@@ -3,13 +3,14 @@ PickCube-v1 is a basic/common task which defaults to using the panda robot. It i
 capabilities can be simulated and trained properly. The configs below set the pick cube task differently to ensure the cube is within reach of the robot tested
 and the camera angles are reasonable.
 """
+
 PICK_CUBE_CONFIGS = {
     "panda": {
         "cube_half_size": 0.02,
         "goal_thresh": 0.025,
-        "cube_spawn_half_size": 0.1,
+        "cube_spawn_half_size": 0.01,
         "cube_spawn_center": (0, 0),
-        "max_goal_height": 0.3,
+        "max_goal_height": 0.16,
         "sensor_cam_eye_pos": [
             0.3,
             0,
