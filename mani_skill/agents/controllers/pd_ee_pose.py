@@ -109,10 +109,19 @@ class PDEEPosController(PDJointPosController):
         else:
             prev_ee_pose_at_base = self.ee_pose_at_base
 
-        # we only need to use the target pose for CPU sim or if a virtual target is enabled
-        # if we have no virtual target and using the gpu sim we can directly use the given action without
-        # having to recompute the new target pose based on the action delta.
-        ik_via_target_pose = self.config.use_target or not self.scene.gpu_sim_enabled
+        # UNIFIED BEHAVIOR: Always use compute_target_pose for CPU/GPU consistency
+        # Previously, GPU mode with use_target=False bypassed compute_target_pose,
+        # causing policies trained on GPU to fail when deployed on CPU.
+        # This fix ensures both backends behave identically.
+        ik_via_target_pose = True
+        
+        # Add warning if old GPU-specific behavior was being relied upon
+        if not self.config.use_target and self.scene.gpu_sim_enabled and self.config.use_delta == False:
+            logger.debug(
+                f"{self.__class__.__name__}: Using unified CPU/GPU behavior. "
+                "GPU-specific IK optimization path has been removed for consistency."
+            )
+        
         if ik_via_target_pose:
             self._target_pose = self.compute_target_pose(prev_ee_pose_at_base, action)
         pos_only = type(self.config) == PDEEPosControllerConfig
