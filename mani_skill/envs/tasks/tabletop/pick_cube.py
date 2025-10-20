@@ -32,7 +32,6 @@ capabilities can be simulated and trained properly. Hence there is extra code fo
 
 @register_env("PickCube-v1", max_episode_steps=50)
 class PickCubeEnv(BaseEnv):
-
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/PickCube-v1_rt.mp4"
     SUPPORTED_ROBOTS = [
         "panda",
@@ -126,7 +125,7 @@ class PickCubeEnv(BaseEnv):
             )
             goal_xyz[:, 0] += self.cube_spawn_center[0]
             goal_xyz[:, 1] += self.cube_spawn_center[1]
-            goal_xyz[:, 2] = torch.rand((b)) * self.max_goal_height + xyz[:, 2]
+            goal_xyz[:, 2] = torch.rand((b)) * self.max_goal_height + xyz[:, 2] + 0.05
             self.goal_site.set_pose(Pose.create_from_pq(goal_xyz))
 
     def _get_obs_extra(self, info: Dict):
