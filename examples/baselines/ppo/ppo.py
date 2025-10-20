@@ -273,15 +273,6 @@ if __name__ == "__main__":
         record_metrics=True,
     )
 
-    # DEBUG: Check actual simulation backend
-    print("\n🔍 Environment backend info:")
-    print(f"  Type: {type(eval_envs._env)}")
-    print(f"  Has GPU sim: {hasattr(eval_envs._env, 'device')}")
-    if hasattr(eval_envs._env, "device"):
-        print(f"  Device: {eval_envs._env.device}")
-    if hasattr(eval_envs._env, "_gpu_sim_enabled"):
-        print(f"  GPU sim enabled: {eval_envs._env._gpu_sim_enabled}")
-
     assert isinstance(envs.single_action_space, gym.spaces.Box), (
         "only continuous action space is supported"
     )
@@ -379,33 +370,14 @@ if __name__ == "__main__":
             eval_obs, _ = eval_envs.reset()
             eval_metrics = defaultdict(list)
             num_episodes = 0
-            eval_step_count = 0
             for _ in range(args.num_eval_steps):
                 with torch.no_grad():
                     eval_action = agent.get_action(eval_obs, deterministic=True)
 
-                    # DEBUG: Print first 3 steps
-                    if eval_step_count < 3:
-                        print(f"\n🔍 DEBUG Eval Step {eval_step_count}")
-                        print(f"  Obs shape: {eval_obs.shape}")
-                        print(f"  Obs[0, :10]: {eval_obs[0, :10]}")
-                        print(f"  Action shape: {eval_action.shape}")
-                        print(f"  Action[0]: {eval_action[0]}")
-                        print(
-                            f"  Action[0] position: [{eval_action[0, 0]:.3f}, {eval_action[0, 1]:.3f}, {eval_action[0, 2]:.3f}]"
-                        )
-                        print(
-                            f"  Action[0] Z: {eval_action[0, 2]:.3f} {'❌ NEGATIVE' if eval_action[0, 2] < 0 else '✅ POSITIVE'}"
-                        )
-                    eval_step_count += 1
-
-                    # BUGFIX: Apply same clipping as training!
+                    # Apply same clipping as training
                     eval_action_clipped = torch.clamp(
                         eval_action, action_space_low, action_space_high
                     )
-                    if eval_step_count <= 3:
-                        print(f"  Action BEFORE clip: {eval_action[0, :3]}")
-                        print(f"  Action AFTER clip:  {eval_action_clipped[0, :3]}")
 
                     (
                         eval_obs,
