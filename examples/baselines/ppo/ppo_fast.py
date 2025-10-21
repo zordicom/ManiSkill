@@ -86,6 +86,10 @@ class Args:
     """frequency to save training videos in terms of iterations"""
     control_mode: Optional[str] = "pd_joint_delta_pos"
     """the control mode to use for the environment"""
+    robot_uids: Optional[str] = None
+    """the robot variant to use for the environment (e.g., 'panda', 'panda_small_bounds')"""
+    max_episode_steps: Optional[int] = None
+    """override the default max episode steps for the environment"""
 
     # Algorithm specific arguments
     total_timesteps: int = 10000000
@@ -165,6 +169,24 @@ class Agent(nn.Module):
 
     def get_value(self, x):
         return self.critic(x)
+
+    def get_action(self, x, deterministic=False):
+        """Get action from policy (for teacher deployment).
+
+        Args:
+            x: Observation tensor
+            deterministic: If True, return mean action (no sampling)
+
+        Returns:
+            Action tensor
+        """
+        action_mean = self.actor_mean(x)
+        if deterministic:
+            return action_mean
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
+        return probs.sample()
 
     def get_action_and_value(self, obs, action=None):
         action_mean = self.actor_mean(obs)
@@ -327,10 +349,32 @@ if __name__ == "__main__":
 
     ####### Environment setup #######
     env_kwargs = dict(obs_mode="state", render_mode="rgb_array", sim_backend="physx_cuda")
+    print("🔧 Environment config:")
+    print(f"  sim_backend: {env_kwargs['sim_backend']}")
+    print(f"  obs_mode: {env_kwargs['obs_mode']}")
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
-    envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
-    eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, human_render_camera_configs=dict(shader_pack="default"), **env_kwargs)
+        print(f"  control_mode: {args.control_mode}")
+    if args.robot_uids is not None:
+        env_kwargs["robot_uids"] = args.robot_uids
+        print(f"  robot_uids: {args.robot_uids}")
+    if args.max_episode_steps is not None:
+        print(f"  max_episode_steps: {args.max_episode_steps} (overriding default)")
+    envs = gym.make(
+        args.env_id,
+        num_envs=args.num_envs if not args.evaluate else 1,
+        reconfiguration_freq=args.reconfiguration_freq,
+        max_episode_steps=args.max_episode_steps,
+        **env_kwargs
+    )
+    eval_envs = gym.make(
+        args.env_id,
+        num_envs=args.num_eval_envs,
+        reconfiguration_freq=args.eval_reconfiguration_freq,
+        max_episode_steps=args.max_episode_steps,
+        human_render_camera_configs=dict(shader_pack="default"),
+        **env_kwargs
+    )
     if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)

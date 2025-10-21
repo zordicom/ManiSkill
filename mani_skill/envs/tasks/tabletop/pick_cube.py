@@ -4,10 +4,10 @@ import numpy as np
 import sapien
 import torch
 
-import mani_skill.envs.utils.randomization as randomization
 from mani_skill.agents.robots import SO100, Fetch, Panda, WidowXAI, XArm6Robotiq
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.tasks.tabletop.pick_cube_cfgs import PICK_CUBE_CONFIGS
+from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.building import actors
@@ -35,6 +35,7 @@ class PickCubeEnv(BaseEnv):
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/PickCube-v1_rt.mp4"
     SUPPORTED_ROBOTS = [
         "panda",
+        "panda_small_bounds",
         "fetch",
         "xarm6_robotiq",
         "so100",

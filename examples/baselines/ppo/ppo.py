@@ -69,8 +69,12 @@ class Args:
     """how often to reconfigure the environment during training"""
     eval_reconfiguration_freq: Optional[int] = 1
     """for benchmarking purposes we want to reconfigure the eval environment each reset to ensure objects are randomized in some tasks"""
+    robot_uids: Optional[str] = None
+    """the robot variant to use for the environment (e.g., 'panda', 'panda_small_bounds')"""
     control_mode: Optional[str] = "pd_joint_delta_pos"
     """the control mode to use for the environment"""
+    max_episode_steps: Optional[int] = None
+    """override the default max episode steps for the environment"""
     anneal_lr: bool = False
     """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.8
@@ -220,16 +224,23 @@ if __name__ == "__main__":
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
         print(f"  control_mode: {args.control_mode}")
+    if args.robot_uids is not None:
+        env_kwargs["robot_uids"] = args.robot_uids
+        print(f"  robot_uids: {args.robot_uids}")
+    if args.max_episode_steps is not None:
+        print(f"  max_episode_steps: {args.max_episode_steps} (overriding default)")
     envs = gym.make(
         args.env_id,
         num_envs=args.num_envs if not args.evaluate else 1,
         reconfiguration_freq=args.reconfiguration_freq,
+        max_episode_steps=args.max_episode_steps,
         **env_kwargs,
     )
     eval_envs = gym.make(
         args.env_id,
         num_envs=args.num_eval_envs,
         reconfiguration_freq=args.eval_reconfiguration_freq,
+        max_episode_steps=args.max_episode_steps,
         **env_kwargs,
     )
     if isinstance(envs.action_space, gym.spaces.Dict):

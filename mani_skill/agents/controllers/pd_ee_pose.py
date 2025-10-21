@@ -7,13 +7,13 @@ from gymnasium import spaces
 
 from mani_skill.agents.controllers.utils.kinematics import Kinematics
 from mani_skill.utils import gym_utils, sapien_utils
-from mani_skill.utils.logging_utils import logger
 from mani_skill.utils.geometry.rotation_conversions import (
     euler_angles_to_matrix,
     matrix_to_quaternion,
     quaternion_apply,
     quaternion_multiply,
 )
+from mani_skill.utils.logging_utils import logger
 from mani_skill.utils.structs import Pose
 from mani_skill.utils.structs.types import Array, DriveMode
 
@@ -114,14 +114,18 @@ class PDEEPosController(PDJointPosController):
         # causing policies trained on GPU to fail when deployed on CPU.
         # This fix ensures both backends behave identically.
         ik_via_target_pose = True
-        
+
         # Add warning if old GPU-specific behavior was being relied upon
-        if not self.config.use_target and self.scene.gpu_sim_enabled and self.config.use_delta == False:
+        if (
+            not self.config.use_target
+            and self.scene.gpu_sim_enabled
+            and self.config.use_delta == False
+        ):
             logger.debug(
                 f"{self.__class__.__name__}: Using unified CPU/GPU behavior. "
                 "GPU-specific IK optimization path has been removed for consistency."
             )
-        
+
         if ik_via_target_pose:
             self._target_pose = self.compute_target_pose(prev_ee_pose_at_base, action)
         pos_only = type(self.config) == PDEEPosControllerConfig
@@ -258,20 +262,16 @@ class PDEEPoseController(PDEEPosController):
 
     def _initialize_action_space(self):
         low = np.float32(
-            np.hstack(
-                [
-                    np.broadcast_to(self.config.pos_lower, 3),
-                    np.broadcast_to(self.config.rot_lower, 3),
-                ]
-            )
+            np.hstack([
+                np.broadcast_to(self.config.pos_lower, 3),
+                np.broadcast_to(self.config.rot_lower, 3),
+            ])
         )
         high = np.float32(
-            np.hstack(
-                [
-                    np.broadcast_to(self.config.pos_upper, 3),
-                    np.broadcast_to(self.config.rot_upper, 3),
-                ]
-            )
+            np.hstack([
+                np.broadcast_to(self.config.pos_upper, 3),
+                np.broadcast_to(self.config.rot_upper, 3),
+            ])
         )
         self.single_action_space = spaces.Box(low, high, dtype=np.float32)
 
