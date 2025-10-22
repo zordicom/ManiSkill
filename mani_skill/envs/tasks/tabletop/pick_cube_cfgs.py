@@ -8,7 +8,7 @@ PICK_CUBE_CONFIGS = {
     "panda": {
         "cube_half_size": 0.02,
         "goal_thresh": 0.025,
-        "cube_spawn_half_size": 0.015,
+        "cube_spawn_half_size": 0.025,
         "cube_spawn_center": (0, 0),
         "max_goal_height": 0.15,
         "sensor_cam_eye_pos": [
