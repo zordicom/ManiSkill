@@ -44,6 +44,7 @@ class PickCubeEnv(BaseEnv):
     goal_thresh = 0.025
     cube_spawn_half_size = 0.05
     cube_spawn_center = (0, 0)
+    height_offset = 0.1  # offset to avoid the cube from being stuck in the table
 
     def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.02, **kwargs):
         self.robot_init_qpos_noise = robot_init_qpos_noise
@@ -125,7 +126,9 @@ class PickCubeEnv(BaseEnv):
             )
             goal_xyz[:, 0] += self.cube_spawn_center[0]
             goal_xyz[:, 1] += self.cube_spawn_center[1]
-            goal_xyz[:, 2] = torch.rand((b)) * self.max_goal_height + xyz[:, 2] + 0.05
+            goal_xyz[:, 2] = (
+                torch.rand((b)) * self.max_goal_height + xyz[:, 2] + self.height_offset
+            )
             self.goal_site.set_pose(Pose.create_from_pq(goal_xyz))
 
     def _get_obs_extra(self, info: Dict):
