@@ -10,19 +10,19 @@ PICK_CUBE_CONFIGS = {
         "goal_thresh": 0.025,
         "cube_spawn_half_size": 0.04,
         "cube_spawn_center": (0, 0),
-        "max_goal_height": 0.16,
+        "max_goal_height": 0.14,
         "sensor_cam_eye_pos": [
             0.3,
-            0,
+            0.0,
             0.6,
         ],  # sensor cam is the camera used for visual observation generation
         "sensor_cam_target_pos": [-0.1, 0, 0.1],
         "human_cam_eye_pos": [
-            0.6,
-            0.7,
-            0.6,
+            0.45,
+            0.0,
+            0.2,
         ],  # human cam is the camera used for human rendering (i.e. eval videos)
-        "human_cam_target_pos": [0.0, 0.0, 0.35],
+        "human_cam_target_pos": [-0.1, 0, 0.1],
     },
     "fetch": {
         "cube_half_size": 0.02,
